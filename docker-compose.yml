@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: bridge # local development only
+      POSTGRES_DB: bridge
+    ports:
+      # Host port 5434 so it never clashes with a Postgres already on 5432.
+      - '5434:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U bridge -d bridge']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # A local chain with Foundry's Anvil. It starts with ten well-known development accounts
+  # (the standard "test test ... junk" mnemonic). Never use those keys on a real network.
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:v1.5.1
+    restart: unless-stopped
+    entrypoint: ['anvil']
+    command: ['--host', '0.0.0.0', '--port', '8545', '--chain-id', '31337']
+    ports:
+      - '8545:8545'
+    healthcheck:
+      test: ['CMD-SHELL', 'cast block-number --rpc-url http://127.0.0.1:8545']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

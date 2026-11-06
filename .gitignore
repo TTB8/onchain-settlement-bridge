@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# Foundry build output
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+# Deployments to a local Anvil are throwaway; testnet deployments are committed deliberately.
+contracts/deployments/31337.json

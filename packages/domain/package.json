@@ -1,0 +1,19 @@
+{
+  "name": "@bridge/domain",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pure bridge rules: ledger balancing, operation state machine, confirmation, reorg detection, reconciliation. No framework, database or chain-library imports.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "test:cov": "jest --coverage"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0"
+  }
+}
