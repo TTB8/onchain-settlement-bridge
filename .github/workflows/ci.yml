@@ -44,3 +44,30 @@ jobs:
 
       - name: Unit tests with coverage
         run: pnpm test:cov
+
+  contracts:
+    name: Contracts (Foundry)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # forge-std and OpenZeppelin are git submodules. Their own nested submodules are not needed.
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # Same Foundry release as the local development stack in docker-compose.yml.
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Check formatting
+        working-directory: contracts
+        run: forge fmt --check
+
+      - name: Build
+        working-directory: contracts
+        run: forge build --sizes
+
+      - name: Test
+        working-directory: contracts
+        run: forge test -vvv
