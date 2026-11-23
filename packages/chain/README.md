@@ -21,16 +21,53 @@ balances, flags, nonces and historical reads all match.
 | `getHeadBlock()`                                            | The newest block number.                                                                                        |
 | `getBlock(n)`                                               | `{ number, hash, parentHash, timestamp }`, or `null` if there is no block `n` (for example after a reorg).      |
 | `signerAddress(signer)`                                     | The lowercase address of `settlement` or `compliance`.                                                          |
-| `getNonce(signer)`                                          | `{ confirmed, pending }`. The next free nonce is `pending`.                                                     |
+| `getNonce(signer, block?)`                                  | `{ confirmed, pending }`. The next free nonce is `pending`. At a block, both are the count mined up to and including it (no pool). |
 | `estimateFees()`                                            | `{ maxFeePerGas, maxPriorityFeePerGas }`: twice the base fee plus the tip.                                      |
-| `submit({ signer, call, nonce, fees })`                     | The tx hash, or a typed `ChainError` (see `src/errors.ts`). A call sent with the wrong signer is rejected.      |
+| `submit({ signer, call, nonce, fees })`                     | The tx hash, or a typed `ChainError` (see `src/errors.ts`). A call sent with the wrong signer is rejected. See "When a submit fails" below. |
 | `getReceipt(hash)`                                          | `{ status, blockNumber, blockHash, revertReason? }`, or `null` while not mined. A revert is a receipt, not an error. |
 | `getTransaction(hash)`                                      | `{ signer, nonce, fees, blockNumber \| null }`, or `null` if the node does not know the hash (or it is not ours). |
 | `getEvents({ fromBlock, toBlock })`                         | `Minted`, `Burned`, `SettledTransfer`, `Transfer`, `VerificationSet` and `FrozenSet` from both contracts, in chain order. |
 | `readBalance` / `readTotalSupply` / `readCompliance`        | Token and registry state at the head, or at a given block number.                                               |
+| `readReferenceUsed(contract, ref, block?)`                  | The contract's own single-use flag (`'token'` or `'registry'`; separate sets), at the head or at a block.      |
 
 The five calls are `mint`, `burn` and `settleTransfer` (sent by `settlement`), and `setVerified`
 and `setFrozen` (sent by `compliance`). `SIGNER_FOR_CALL` maps each call to its signer.
+
+**Is a nonce final?** Read `getNonce(signer, head - depth + 1)`. Every nonce below the
+`confirmed` count it returns was mined at least `depth` blocks deep, so a reorg shallower than
+that cannot free it again.
+
+**Did an operation already happen?** `readReferenceUsed` asks the contract itself. If a submit
+reverts `ReferenceAlreadyUsed` and your event index has no event for that reference, the index is
+incomplete: the operation (and the money) already moved.
+
+## When a submit fails
+
+The gateway fails safe. `SubmissionRejectedError` means the node DEFINITELY did not take the
+transaction, and it is used only for an allowlist of answers: invalid signature or sender,
+intrinsic gas too low, a fee cap below the base fee, more gas than the block allows, a wrong
+chain id, a nonce gap, and a tip above the fee cap. Every other answer the gateway does not
+recognise is a `ChainUnavailableError`: the outcome is unknown. That includes a proxy that
+forwarded the transaction and then failed, a `-32603`, "header not found", and a provider's own
+wording. The transaction may still be mined.
+
+So the engine must keep a record of every transaction it signs (hash, nonce, fees, reference)
+until that nonce is final. After an unknown outcome or a `NonceTooLowError`, it looks up its
+earlier attempts by hash and checks the reference with `readReferenceUsed` before signing
+anything new for that operation.
+
+Errors never carry secrets. Each cause is a scrubbed copy that keeps the error names, codes and
+node messages, with every URL replaced by `<redacted-url>`, because an RPC URL's path or query
+often holds an API key. The viem client is a `#private` field, so `util.inspect` and
+`JSON.stringify` of the gateway do not show the URL either.
+
+**Known limit of revert reasons on a real node:** the viem gateway finds a revert's reason by
+replaying the call with `eth_call` on the state AFTER the transaction's block. If a later
+transaction in the same block changed the outcome, the replay can succeed, and the reason is then
+`undefined`. For example, a mint to an unverified holder that ran just before that holder's
+verification in the same block. The fake always knows the exact reason. The parity test pins this
+difference ("KNOWN DIFFERENCE") instead of hiding it. Treat `revertReason` as best-effort, and
+use `readReferenceUsed` and the event index for decisions.
 
 ## The fake's controls
 
@@ -52,15 +89,30 @@ chain.reorg({ depth: 1 }); // the block vanishes and the tx goes back to the poo
 chain.mine(); // mined again, in a block with a different hash
 chain.reorg({ depth: 1, dropTransactions: [tx] }); // the tx is forgotten and nonce 0 is free again
 chain.dropTransaction(tx); // evicts a pooled transaction (false here: it is already gone)
-chain.injectTransfer(alice, bob, 1n); // a holder-signed transfer: emits Transfer and no reference event
+chain.injectTransfer(alice, bob, 1n); // holder-signed: reverts HolderTransfersDisabled (off by default)
+chain.setHolderTransfersEnabled(true); // the admin switches the holder path on; now it emits only Transfer
 chain.setPaused(true); // the pauser pauses the token in the next block
 chain.failNextSubmit(new ChainUnavailableError('timeout'), { accept: true }); // the node took it, the answer was lost
 chain.setUnavailable(true); // every gateway call now throws ChainUnavailableError
 ```
 
+The other holder-signed calls are `injectApprove(owner, spender, amount)` and
+`injectTransferFrom(spender, from, to, amount)`. Like `injectTransfer`, each is a mined
+transaction that follows the token's exact revert order:
+
+- `transfer`: `HolderTransfersDisabled`, then the transfer checks.
+- `transferFrom`: `HolderTransfersDisabled`, then `NotAllowed` for the spender, then
+  `ERC20InsufficientAllowance`, then the transfer checks.
+- `approve`: `HolderTransfersDisabled`, then `EnforcedPause`, then `NotAllowed` for the owner, then
+  `ERC20InvalidSpender`.
+
+`mint`, `burn` and `settleTransfer` ignore the switch. `settleTransfer` from an account to itself
+reverts `SelfTransfer`, after the reference and amount checks.
+
 The fake also has read-only accessors for test assertions: `balanceOf`, `totalSupply`,
-`complianceOf`, `isPaused`, `tokenReferenceUsed`, `registryReferenceUsed`, `mempoolSize` and
-`mempoolHashes`. To change what the affordability check sees, use `setSignerBalance`.
+`complianceOf`, `isPaused`, `holderTransfersEnabled`, `allowance`, `tokenReferenceUsed`,
+`registryReferenceUsed`, `mempoolSize` and `mempoolHashes`. To change what the affordability
+check sees, use `setSignerBalance`.
 
 These are the rules the fake follows, and the parity test proves each one against Anvil:
 
@@ -89,7 +141,8 @@ pnpm --filter @bridge/chain abi:check  # the committed ABIs match `forge inspect
 The `*.anvil.test.ts` files need Foundry, with `anvil` and `forge` on `PATH` or in `~/.foundry/bin`.
 Each file starts its own `anvil` on a free port and stops it when it finishes. It deploys the
 contracts from `contracts/out/`, running `forge build` first if the artifacts are missing. It
-grants the roles the way `contracts/script/Deploy.s.sol` does.
+grants the roles the way `contracts/script/Deploy.s.sol` does and runs the same wiring checks. The
+holder switch stays off unless a test asks for it.
 
 To regenerate the ABIs after a contract change, run `pnpm --filter @bridge/chain abi:generate`
 and commit the result.

@@ -731,3 +731,101 @@ describe('ViemChainGateway on anvil: lookups', () => {
     expect(carol as Address).toBe(devAddress('carol'));
   });
 });
+
+describe('ViemChainGateway: the RPC URL never leaks', () => {
+  const TOKEN = 'tok3n-path-secret';
+  const everything = (value: unknown): string => {
+    const parts: string[] = [];
+    let current: unknown = value;
+    for (let depth = 0; current && depth < 12; depth += 1) {
+      parts.push(String(current), inspect(current, { depth: 8 }));
+      if (current instanceof Error) parts.push(current.stack ?? '', JSON.stringify(current));
+      current = (current as { cause?: unknown }).cause;
+    }
+    return parts.join('\n');
+  };
+
+  it('not in errors from a closed port, nor in inspect or JSON of the gateway', async () => {
+    const port = await freePort();
+    const dead = gatewayFor(node, deployment, {
+      rpcUrl: `http://127.0.0.1:${port}/v3/${TOKEN}?key=${TOKEN}`,
+      timeoutMs: 2_000,
+    });
+    const failures = await Promise.all(
+      [
+        dead.getChainId(),
+        dead.getHeadBlock(),
+        dead.readBalance(alice),
+        dead.submit({
+          signer: 'settlement',
+          call: { kind: 'mint', to: alice, amount: ONE, ref: nextRef() },
+          nonce: 0,
+          fees: FEES,
+        }),
+      ].map((p) =>
+        p.then(
+          () => new Error('unexpected success'),
+          (e: unknown) => e,
+        ),
+      ),
+    );
+    for (const failure of failures) {
+      expect(failure).toBeInstanceOf(ChainUnavailableError);
+      expect(everything(failure)).not.toContain(TOKEN);
+    }
+    expect(inspect(dead, { depth: 10, showHidden: true })).not.toContain(TOKEN);
+    expect(JSON.stringify(dead)).not.toContain(TOKEN);
+  });
+
+  it('not in errors from a live node that answers on that path', async () => {
+    const live = gatewayFor(node, deployment, { rpcUrl: `${node.url}/v3/${TOKEN}` });
+    // Whether anvil serves the path or refuses it, nothing the gateway throws may carry the URL.
+    const outcomes = await Promise.all(
+      [
+        live.getHeadBlock(),
+        live.readReferenceUsed('token', '0x12'),
+        live.submit({
+          signer: 'settlement',
+          call: { kind: 'mint', to: alice, amount: ONE, ref: nextRef() },
+          nonce: 0,
+          fees: FEES,
+        }),
+      ].map((p) =>
+        p.then(
+          (v) => v,
+          (e: unknown) => e,
+        ),
+      ),
+    );
+    const errors = outcomes.filter((o) => o instanceof Error);
+    expect(errors.length).toBeGreaterThan(0);
+    for (const error of errors) expect(everything(error)).not.toContain(TOKEN);
+  });
+});
+
+describe('ViemChainGateway: the chain-id check retries after an outage', () => {
+  it('a node unreachable on the first call is checked again once it is up', async () => {
+    const port = await freePort();
+    const late = new ViemChainGateway({
+      rpcUrl: `http://127.0.0.1:${port}`,
+      chainId: 31337,
+      registryAddress: deployment.registry,
+      tokenAddress: deployment.token,
+      signers: { settlement: devAccount(1), compliance: devAccount(2) },
+      timeoutMs: 2_000,
+    });
+    await expect(late.getHeadBlock()).rejects.toBeInstanceOf(ChainUnavailableError);
+    const second = await startAnvil([], { port });
+    try {
+      await expect(late.getHeadBlock()).resolves.toBe(0n);
+    } finally {
+      await second.stop();
+    }
+  });
+
+  it('a mismatch found once is remembered even after the node comes back with the same id', async () => {
+    const wrong = gatewayFor(node, deployment, { chainId: 7 });
+    await expect(wrong.getHeadBlock()).rejects.toBeInstanceOf(ChainIdMismatchError);
+    await expect(wrong.readTotalSupply()).rejects.toBeInstanceOf(ChainIdMismatchError);
+  });
+});
