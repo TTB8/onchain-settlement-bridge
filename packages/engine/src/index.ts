@@ -10,3 +10,4 @@ export * from './transaction';
 export * from './ledger-writes';
 export * from './move-operation';
 export * from './operation-service';
+export * from './outbox-dispatcher';
