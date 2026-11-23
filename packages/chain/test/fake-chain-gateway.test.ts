@@ -637,6 +637,33 @@ describe('FakeChainGateway: holder-signed path (switch, approve, transferFrom, t
     expect(await chain.getEvents({ fromBlock: block, toBlock: block })).toEqual([]);
   });
 
+  it('approve of zero (a revocation) is accepted whatever the switch, pause or owner state', async () => {
+    const { chain, d } = await funded();
+    chain.setHolderTransfersEnabled(true);
+    chain.injectApprove(alice, carol, 3n * ONE);
+    chain.setHolderTransfersEnabled(false);
+    chain.setPaused(true);
+    expect(await d.status(chain.injectApprove(alice, carol, 0n))).toEqual({
+      status: 'success',
+      reason: undefined,
+    });
+    expect(chain.allowance(alice, carol)).toBe(0n);
+    // An unverified owner may also revoke, but a non-zero approval is still refused.
+    expect(await d.status(chain.injectApprove(carol, alice, 0n))).toEqual({
+      status: 'success',
+      reason: undefined,
+    });
+    expect(await d.status(chain.injectApprove(alice, carol, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'HolderTransfersDisabled',
+    });
+    // A zero spender is still invalid.
+    expect(await d.status(chain.injectApprove(alice, ZERO_ADDRESS, 0n))).toEqual({
+      status: 'reverted',
+      reason: 'ERC20InvalidSpender',
+    });
+  });
+
   it('transferFrom: switch, then NotAllowed(spender), then allowance, then the transfer checks', async () => {
     const { chain, d } = await funded();
     chain.setHolderTransfersEnabled(true);

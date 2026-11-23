@@ -908,10 +908,14 @@ export class FakeChainGateway implements ChainGateway {
           this.transferInternal(s, action.from, action.to, action.amount, events);
           return events;
         case 'approve':
-          // SettlementToken.approve: switch, pause, owner, then ERC20._approve
-          if (!s.holderTransfersEnabled) throw new Revert('HolderTransfersDisabled');
-          if (s.paused) throw new Revert('EnforcedPause');
-          if (!s.isAllowed(action.owner)) throw new Revert('NotAllowed');
+          // SettlementToken.approve: for a non-zero value the switch, pause and owner checks run
+          // first, then ERC20._approve. A zero value (a revocation) skips them, so an owner can
+          // always take an allowance back, even while the switch is off, paused or frozen.
+          if (action.amount !== 0n) {
+            if (!s.holderTransfersEnabled) throw new Revert('HolderTransfersDisabled');
+            if (s.paused) throw new Revert('EnforcedPause');
+            if (!s.isAllowed(action.owner)) throw new Revert('NotAllowed');
+          }
           this.approveInternal(s, action.owner, action.spender, action.amount);
           return events; // Approval is not a bridge event
       }
