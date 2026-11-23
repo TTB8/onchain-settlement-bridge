@@ -6,7 +6,7 @@
 
 import { inspect } from 'node:util';
 
-import { parseGwei, toHex } from 'viem';
+import { keccak256, parseGwei, toHex } from 'viem';
 
 import {
   AlreadyKnownError,
@@ -827,5 +827,115 @@ describe('ViemChainGateway: the chain-id check retries after an outage', () => {
     const wrong = gatewayFor(node, deployment, { chainId: 7 });
     await expect(wrong.getHeadBlock()).rejects.toBeInstanceOf(ChainIdMismatchError);
     await expect(wrong.readTotalSupply()).rejects.toBeInstanceOf(ChainIdMismatchError);
+  });
+});
+
+describe('ViemChainGateway on anvil: signTransaction and sendRaw', () => {
+  const mintCall = () => ({ kind: 'mint' as const, to: alice, amount: ONE, ref: nextRef() });
+
+  it('signing consumes nothing, sends nothing, is deterministic, and hash = keccak256(raw)', async () => {
+    const { pending } = await gw.getNonce('settlement');
+    const request = { signer: 'settlement' as const, call: mintCall(), nonce: pending, fees: FEES };
+    const a = await gw.signTransaction(request);
+    expect(await gw.signTransaction(request)).toEqual(a);
+    expect(a.hash).toBe(keccak256(a.raw));
+    expect(a.raw).toMatch(/^0x02[0-9a-f]+$/); // an EIP-1559 typed transaction
+    expect(await gw.getNonce('settlement')).toEqual({ confirmed: pending, pending });
+    expect(await gw.getTransaction(a.hash)).toBeNull();
+    // No node needed: a gateway pointing at a closed port signs the same bytes.
+    const dead = gatewayFor(node, deployment, { rpcUrl: `http://127.0.0.1:${await freePort()}` });
+    expect(await dead.signTransaction(request)).toEqual(a);
+    await expect(dead.signTransaction({ ...request, signer: 'compliance' })).rejects.toBeInstanceOf(
+      SubmissionRejectedError,
+    );
+  });
+
+  it('sendRaw mines the bytes; rebroadcasting mined bytes returns the hash and changes nothing', async () => {
+    const { pending } = await gw.getNonce('settlement');
+    const { hash, raw } = await gw.signTransaction({
+      signer: 'settlement',
+      call: mintCall(),
+      nonce: pending,
+      fees: FEES,
+    });
+    expect(await gw.sendRaw(raw)).toBe(hash);
+    expect((await waitForReceipt(gw, hash)).status).toBe('success');
+    const balance = await gw.readBalance(alice);
+    expect(await gw.sendRaw(raw)).toBe(hash);
+    expect(await gw.readBalance(alice)).toBe(balance);
+    expect((await gw.getNonce('settlement')).confirmed).toBe(pending + 1);
+    // submit stays strict: the same request again is NonceTooLowError.
+    await expect(
+      gw.submit({ signer: 'settlement', call: mintCall(), nonce: pending, fees: FEES }),
+    ).rejects.toBeInstanceOf(NonceTooLowError);
+  });
+
+  it('other bytes for a mined nonce stay NonceTooLowError', async () => {
+    const { confirmed } = await gw.getNonce('settlement');
+    const other = await gw.signTransaction({
+      signer: 'settlement',
+      call: mintCall(),
+      nonce: confirmed - 1,
+      fees: FEES,
+    });
+    await expect(gw.sendRaw(other.raw)).rejects.toBeInstanceOf(NonceTooLowError);
+  });
+
+  it('pooled bytes rebroadcast to the hash; a same-fee replacement is underpriced', async () => {
+    await automine(false);
+    try {
+      const { pending } = await gw.getNonce('settlement');
+      const a = await gw.signTransaction({
+        signer: 'settlement',
+        call: mintCall(),
+        nonce: pending,
+        fees: FEES,
+      });
+      expect(await gw.sendRaw(a.raw)).toBe(a.hash);
+      expect(await gw.sendRaw(a.raw)).toBe(a.hash);
+      const b = await gw.signTransaction({
+        signer: 'settlement',
+        call: mintCall(),
+        nonce: pending,
+        fees: FEES,
+      });
+      await expect(gw.sendRaw(b.raw)).rejects.toBeInstanceOf(ReplacementUnderpricedError);
+      await mine();
+      expect((await gw.getReceipt(a.hash))?.status).toBe('success');
+    } finally {
+      await automine(true);
+    }
+  });
+
+  it('garbage, empty and wrong-chain bytes are refused by this node', async () => {
+    await expect(gw.sendRaw('0x1234')).rejects.toBeInstanceOf(SubmissionRejectedError);
+    await expect(gw.sendRaw('0x')).rejects.toBeInstanceOf(SubmissionRejectedError);
+    await expect(gw.sendRaw('nope' as `0x${string}`)).rejects.toBeInstanceOf(
+      SubmissionRejectedError,
+    );
+    const otherChain = gatewayFor(node, deployment, { chainId: 1 });
+    const foreign = await otherChain.signTransaction({
+      signer: 'settlement',
+      call: mintCall(),
+      nonce: 0,
+      fees: FEES,
+    });
+    await expect(gw.sendRaw(foreign.raw)).rejects.toThrow(/invalid chain id for signer/);
+    // The gateway configured for chain 1 refuses to send anything to this node at all.
+    await expect(otherChain.sendRaw(foreign.raw)).rejects.toBeInstanceOf(ChainIdMismatchError);
+  });
+
+  it('a closed port is an unknown outcome', async () => {
+    const dead = gatewayFor(node, deployment, {
+      rpcUrl: `http://127.0.0.1:${await freePort()}`,
+      timeoutMs: 2_000,
+    });
+    const signed = await dead.signTransaction({
+      signer: 'settlement',
+      call: mintCall(),
+      nonce: 0,
+      fees: FEES,
+    });
+    await expect(dead.sendRaw(signed.raw)).rejects.toBeInstanceOf(ChainUnavailableError);
   });
 });
