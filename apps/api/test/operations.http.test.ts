@@ -64,16 +64,34 @@ describe('users', () => {
     ]);
   });
 
-  it('a second user with the same wallet is 409 without naming the owner', async () => {
+  it('registering the same wallet again (any case) returns the same user: 200, replayed, nothing written', async () => {
     const w = wallet();
     const first = await http().post('/v1/users').set(auth).send({ walletAddress: w });
+    expect(first.status).toBe(201);
+    expect(first.headers['idempotent-replayed']).toBeUndefined();
+    const users = await rig.db.prisma.user.count();
+    const accounts = await rig.db.prisma.account.count();
     const res = await http()
       .post('/v1/users')
       .set(auth)
       .send({ walletAddress: w.toUpperCase().replace('0X', '0x') });
-    expect(res.status).toBe(409);
-    expect(res.body.code).toBe('WALLET_ALREADY_REGISTERED');
-    expect(JSON.stringify(res.body)).not.toContain(first.body.id);
+    expect(res.status).toBe(200);
+    expect(res.headers['idempotent-replayed']).toBe('true');
+    expect(res.body).toEqual(first.body);
+    expect(await rig.db.prisma.user.count()).toBe(users);
+    expect(await rig.db.prisma.account.count()).toBe(accounts);
+  });
+
+  it('concurrent registrations of one wallet create exactly one user', async () => {
+    const w = wallet();
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        http().post('/v1/users').set(auth).send({ walletAddress: w }),
+      ),
+    );
+    expect(results.map((r) => r.status).sort()).toEqual([200, 200, 200, 201]);
+    expect(new Set(results.map((r) => r.body.id)).size).toBe(1);
+    expect(await rig.db.prisma.user.count({ where: { walletAddress: w } })).toBe(1);
   });
 
   it('refuses a malformed wallet, unknown properties, and an unknown user', async () => {

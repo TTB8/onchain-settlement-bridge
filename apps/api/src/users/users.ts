@@ -15,12 +15,12 @@ import {
   Body,
   Controller,
   Get,
-  HttpCode,
   Inject,
   Injectable,
   Module,
   Param,
   Post,
+  Res,
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
@@ -32,6 +32,7 @@ import {
 } from '@nestjs/swagger';
 import { Prisma, type PrismaClient } from '@bridge/db';
 import { IsDefined, IsString, Matches } from 'class-validator';
+import type { Response } from 'express';
 
 import { Access } from '../auth/auth';
 import { ApiProblem } from '../core/problem';
@@ -92,11 +93,18 @@ export class UsersService {
   constructor(@Inject(PRISMA) private readonly prisma: PrismaClient) {}
 
   /**
-   * Creates a user and their three ledger accounts in one transaction.
+   * Creates a user and their three ledger accounts in one transaction; registering a wallet
+   * that already has a user returns that user (`replayed: true`, nothing written).
+   *
+   * WHY a replay and not a 409: the request body is the wallet and nothing else, so a second
+   * registration of the same wallet IS the same request (a client retrying a timed-out POST),
+   * and answering it with the stored user makes the route safe to retry without an
+   * Idempotency-Key. Should the body ever gain fields, a registration whose other fields differ
+   * from the stored user must become a 409 instead.
    *
    * @param walletAddress The wallet (validated by the DTO).
    */
-  async create(walletAddress: string): Promise<UserView> {
+  async create(walletAddress: string): Promise<{ view: UserView; replayed: boolean }> {
     const wallet = walletAddress.toLowerCase();
     try {
       const user = await this.prisma.$transaction(async (tx) => {
@@ -109,11 +117,14 @@ export class UsersService {
         });
         return u;
       });
-      return toView(user);
+      return { view: toView(user), replayed: false };
     } catch (err) {
-      // The unique wallet index: answered without naming the user who owns it.
-      if (isWalletTaken(err)) throw new ApiProblem('WALLET_ALREADY_REGISTERED');
-      throw err;
+      // The unique wallet index (also the race of two concurrent registrations): the stored user.
+      if (!isWalletTaken(err)) throw err;
+      const existing = await this.prisma.user.findUniqueOrThrow({
+        where: { walletAddress: wallet },
+      });
+      return { view: toView(existing), replayed: true };
     }
   }
 
@@ -142,20 +153,24 @@ export class UsersController {
   /** @param users The service. */
   constructor(private readonly users: UsersService) {}
 
-  /** Creates a user. */
+  /** Creates a user, or returns the one that already holds the wallet. */
   @Post()
-  @HttpCode(201)
-  @ApiOperation({ summary: 'Create a user with their wallet (and their three ledger accounts)' })
-  @ApiCreatedResponse({ type: UserDto })
-  @ApiProblems(
-    'VALIDATION_FAILED',
-    'MALFORMED_JSON',
-    'UNAUTHENTICATED',
-    'FORBIDDEN',
-    'WALLET_ALREADY_REGISTERED',
-  )
-  create(@Body() body: CreateUserDto): Promise<UserView> {
-    return this.users.create(String(body.walletAddress));
+  @ApiOperation({
+    summary: 'Create a user with their wallet (and their three ledger accounts)',
+    description:
+      'Registering a wallet that already has a user returns that user with 200 and Idempotent-Replayed: true (nothing written), so the call is safe to retry.',
+  })
+  @ApiCreatedResponse({ type: UserDto, description: 'New user.' })
+  @ApiOkResponse({ type: UserDto, description: 'The wallet was already registered: its user.' })
+  @ApiProblems('VALIDATION_FAILED', 'MALFORMED_JSON', 'UNAUTHENTICATED', 'FORBIDDEN')
+  async create(
+    @Body() body: CreateUserDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<UserView> {
+    const { view, replayed } = await this.users.create(String(body.walletAddress));
+    res.status(replayed ? 200 : 201);
+    if (replayed) res.setHeader('Idempotent-Replayed', 'true');
+    return view;
   }
 
   /** Reads a user. */

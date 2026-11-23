@@ -34,7 +34,6 @@ export type ProblemCode =
   | 'USER_NOT_FOUND'
   | 'OPERATION_NOT_FOUND'
   | 'COMPLIANCE_CHANGE_NOT_FOUND'
-  | 'WALLET_ALREADY_REGISTERED'
   | 'IDEMPOTENCY_CONFLICT'
   | 'INSUFFICIENT_FUNDS'
   | 'NO_ACTIVE_DEPLOYMENT'
@@ -131,11 +130,6 @@ export const PROBLEMS: Readonly<Record<ProblemCode, ProblemSpec>> = Object.freez
     status: 404,
     title: 'Compliance change not found',
     detail: 'No compliance change has this id.',
-  },
-  WALLET_ALREADY_REGISTERED: {
-    status: 409,
-    title: 'Wallet already registered',
-    detail: 'This wallet address already belongs to a user.',
   },
   IDEMPOTENCY_CONFLICT: {
     status: 409,

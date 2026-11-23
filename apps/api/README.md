@@ -65,6 +65,13 @@ characters). Same key + same body: the stored result, **200** and `Idempotent-Re
 nothing written. Same key + another body: **409** naming only the caller's own operation. New:
 **201**. Keys are scoped per user (operations) and per operator (compliance), by the engine.
 
+### Users
+
+`POST /v1/users` with a wallet that already has a user returns that user with **200** and
+`Idempotent-Replayed: true` (nothing written; concurrent registrations create one user). The body
+is the wallet and nothing else, so a repeat IS the same request and the route is safe to retry
+without a key; if the body ever gains fields, a repeat whose other fields differ must be a 409.
+
 ### Balances
 
 Derived from the ledger on every read, never stored. `incoming` is a pending deposit (not minted
@@ -108,7 +115,7 @@ and are logged redacted, without the stack.
 | 401    | UNAUTHENTICATED                                                                        |
 | 403    | FORBIDDEN                                                                              |
 | 404    | NOT_FOUND, USER_NOT_FOUND, OPERATION_NOT_FOUND, COMPLIANCE_CHANGE_NOT_FOUND            |
-| 409    | IDEMPOTENCY_CONFLICT, WALLET_ALREADY_REGISTERED                                        |
+| 409    | IDEMPOTENCY_CONFLICT                                                                   |
 | 413    | PAYLOAD_TOO_LARGE                                                                      |
 | 415    | UNSUPPORTED_MEDIA_TYPE (charset or content encoding the body parser refuses)           |
 | 422    | INSUFFICIENT_FUNDS                                                                     |
