@@ -19,6 +19,12 @@
  * on a `confirm` verdict from `lateConfirmation` (a final event that matches exactly). Funds stay
  * held while an operation is failed and not reversed, so the ordinary settle entry is still valid.
  * Nothing leaves `confirmed` or `reversed`.
+ *
+ * Escalations: a failure with reason `duplicate_reference` or `reference_conflict` means the
+ * reference may already have settled on chain. Such an operation stays `failed` until a person
+ * decides; it is NEVER reversed automatically (`mayReverse` refuses both reasons). REVERSE is the
+ * only step that can pay a user twice, so it needs final evidence (see `ReversalEvidence`), never
+ * an absence of evidence.
  */
 
 import { type Finality, isFinal } from './confirmation';
@@ -226,7 +232,10 @@ export type RevertResolution =
    * event can still vanish in a reorg, and so can a conflicting one.
    */
   | { readonly verdict: 'wait' }
-  /** A real failure: apply FAIL with `reason`. Reversal is still gated by `mayReverse`. */
+  /**
+   * A failure: apply FAIL with `reason`. Reversal is still gated by `mayReverse`; for
+   * `duplicate_reference` it is never automatic (escalate: the money most likely moved).
+   */
   | { readonly verdict: 'failed'; readonly event: 'FAIL'; readonly reason: FailureReason }
   /**
    * The reference was consumed by an event that is NOT this operation's settlement. Never CONFIRM.
