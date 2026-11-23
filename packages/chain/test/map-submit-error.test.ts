@@ -258,6 +258,14 @@ describe('configured-URL redaction (review N-6)', () => {
     }
   });
 
+  it('the generic pattern catches escaped and percent-encoded URLs it was not configured with', () => {
+    expect(redactUrls('x https:\\/\\/other.example\\/k\\/SECRETZ y')).toBe('x <redacted-url> y');
+    expect(redactUrls(`x ${encodeURIComponent('https://other.example/k/SECRETZ')} y`)).toBe(
+      'x <redacted-url> y',
+    );
+    expect(redactUrls('x HTTPS%3a%2f%2fother.example%2fSECRETZ y')).toBe('x <redacted-url> y');
+  });
+
   it('makeRedactor handles an unparseable URL, no URL, and short pieces', () => {
     expect(makeRedactor('not a url but secret-ish')('x not a url but secret-ish y')).toBe(
       'x <redacted> y',
