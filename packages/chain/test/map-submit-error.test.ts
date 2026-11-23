@@ -266,6 +266,26 @@ describe('configured-URL redaction (review N-6)', () => {
     expect(redactUrls('x HTTPS%3a%2f%2fother.example%2fSECRETZ y')).toBe('x <redacted-url> y');
   });
 
+  it('a base64 key with + / = is removed in its JSON-escaped and percent-encoded forms', () => {
+    // The key as configured is percent-encoded in the URL; nodes may echo it decoded, decoded and
+    // JSON-escaped, or encoded. Only the escaped and encoded variants catch the last two.
+    const b64 = 'Zm9vYmFy+YmF6/cXV4==';
+    const redactB64 = makeRedactor(`https://h.example/v2?token=${encodeURIComponent(b64)}`);
+    for (const echoed of [b64, b64.replace(/\//g, '\\/'), encodeURIComponent(b64)]) {
+      const out = redactB64(`nonce too high (${echoed})`);
+      expect(out).not.toContain('Zm9vYmFy');
+      expect(out).not.toContain('cXV4');
+    }
+  });
+
+  it('a stack read before sanitising (as a logger would) is still redacted', () => {
+    const own = new NonceTooLowError(`ours mentions ${KEY}`);
+    expect(own.stack).toContain(KEY); // reading it fixes the header line with the raw message
+    const mapped = mapSubmitError(own, HASH, redact);
+    expect(mapped.stack).not.toContain(KEY);
+    expect(mapped.message).not.toContain(KEY);
+  });
+
   it('makeRedactor handles an unparseable URL, no URL, and short pieces', () => {
     expect(makeRedactor('not a url but secret-ish')('x not a url but secret-ish y')).toBe(
       'x <redacted> y',
