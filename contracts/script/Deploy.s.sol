@@ -23,7 +23,8 @@ import {SettlementToken} from "../src/SettlementToken.sol";
 /// Refuses to run on a known mainnet unless ALLOW_MAINNET=true, and on a chain it does not
 /// recognize unless ALLOW_UNKNOWN_CHAIN=true. Local and the two documented testnets always work.
 /// Off Anvil it also requires an admin with code (a multisig) unless ALLOW_EOA_ADMIN=true, a
-/// compliance address different from the minter, and no service role held by the deployer.
+/// compliance address different from the minter, the settler and the pauser, and no service role
+/// held by the deployer.
 ///
 /// A dry run writes nothing; a broadcast writes the PENDING record, because forge writes it while
 /// the transactions are still being sent. `script/promote-deployment.sh` checks the record against
@@ -62,6 +63,14 @@ contract Deploy is Script {
     /// @notice The compliance address is also the minter: one key could then verify an address
     /// and mint to it.
     error ComplianceIsMinter(address account);
+
+    /// @notice The compliance address is also the settler: one key could then verify an attacker's
+    /// address and settle any holder's balance to it.
+    error ComplianceIsSettler(address account);
+
+    /// @notice The compliance address is also the pauser: the key that decides who may hold the
+    /// token could also halt it.
+    error ComplianceIsPauser(address account);
 
     /// @notice The deployer would keep a service role on a chain other than local Anvil.
     error DeployerHoldsServiceRole(string role);
@@ -124,7 +133,8 @@ contract Deploy is Script {
     }
 
     /// @dev Off local Anvil: a real admin is required and must have code unless ALLOW_EOA_ADMIN is
-    /// set, compliance and minter are different keys, and the deployer keeps no service role.
+    /// set, the compliance key is not also the minter, settler or pauser, and the deployer keeps no
+    /// service role.
     /// Minter and settler may be the same address (one settlement signer can hold both). On Anvil
     /// nothing here applies, so local development works with a single account.
     function _assertRoleSeparation(uint256 chainId, address deployer, Config memory cfg)
@@ -135,6 +145,8 @@ contract Deploy is Script {
         if (cfg.admin == address(0)) revert AdminRequired(chainId);
         if (!cfg.allowEoaAdmin && cfg.admin.code.length == 0) revert AdminHasNoCode(cfg.admin);
         if (cfg.compliance == cfg.minter) revert ComplianceIsMinter(cfg.compliance);
+        if (cfg.compliance == cfg.settler) revert ComplianceIsSettler(cfg.compliance);
+        if (cfg.compliance == cfg.pauser) revert ComplianceIsPauser(cfg.compliance);
         if (cfg.compliance == deployer) revert DeployerHoldsServiceRole("compliance");
         if (cfg.minter == deployer) revert DeployerHoldsServiceRole("minter");
         if (cfg.settler == deployer) revert DeployerHoldsServiceRole("settler");
