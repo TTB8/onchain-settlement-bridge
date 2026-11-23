@@ -163,7 +163,10 @@ model Deployment {
   @@map("deployment")
 }
 
-/// A platform user, identified on chain by one wallet address.
+/// A platform user, identified on chain by one wallet address (immutable: a SQL guard).
+/// `verified` / `frozen` are a NON-AUTHORITATIVE cache: the engine never updates them and nothing
+/// may decide on them. The registry (read at a final block) and the confirmed compliance changes
+/// are the truth; the API must read those.
 model User {
   id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   walletAddress String   @unique @map("wallet_address")
@@ -364,6 +367,9 @@ model ComplianceChange {
   confirmedBlock BigInt?                @map("confirmed_block")
   /// Why it failed (kept after a late confirmation).
   failureReason  FailureReason?         @map("failure_reason")
+  /// The order of the bridge's DECISIONS, assigned by the database at insert (never by a client
+  /// or the app clock); immutable and unique. The reconciler's "latest confirmed decision" uses it.
+  decisionSeq    BigInt                 @unique @default(autoincrement()) @map("decision_seq")
   updatedAt      DateTime               @default(now()) @map("updated_at") @db.Timestamptz(6)
 
   deployment     Deployment      @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
