@@ -326,7 +326,7 @@ describe('operation CHECKs', () => {
     });
   });
 
-  it('idempotency key is unique', async () => {
+  it('idempotency key is unique per user, and two users may use the same key', async () => {
     await insertOperation(c, {
       deploymentId,
       type: 'deposit',
@@ -342,8 +342,15 @@ describe('operation CHECKs', () => {
         amount: 1n,
         idempotencyKey: 'k-1',
       }),
-      'operation_idempotency_key_key',
+      'operation_user_id_idempotency_key_key',
     );
+    await insertOperation(c, {
+      deploymentId,
+      type: 'deposit',
+      userId: bob.id,
+      amount: 1n,
+      idempotencyKey: 'k-1',
+    });
   });
 
   it('parties: transfer needs a different counterparty; deposit and withdrawal have none', async () => {

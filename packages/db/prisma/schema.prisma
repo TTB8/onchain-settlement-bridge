@@ -207,7 +207,8 @@ model Operation {
   confirmedBlock     BigInt?         @map("confirmed_block")
   failureReason      FailureReason?  @map("failure_reason")
   resubmitsSoFar     Int             @default(0) @map("resubmits_so_far")
-  idempotencyKey     String?         @unique @map("idempotency_key")
+  /// Scoped to the user: unique per (user_id, idempotency_key).
+  idempotencyKey     String?         @map("idempotency_key")
   version            Int             @default(0)
   createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt          DateTime        @default(now()) @map("updated_at") @db.Timestamptz(6)
@@ -220,6 +221,7 @@ model Operation {
 
   @@unique([deploymentId, ref])
   @@unique([id, deploymentId, ref])
+  @@unique([userId, idempotencyKey])
   @@index([userId])
   @@index([counterpartyUserId])
   @@index([deploymentId, status])
@@ -279,6 +281,10 @@ model OutboxMessage {
   lockedBy           String?      @map("locked_by")
   createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
   processedAt        DateTime?    @map("processed_at") @db.Timestamptz(6)
+  /// Why the last attempt did not finish: redacted (no URLs), at most 1000 characters.
+  lastError          String?      @map("last_error")
+  /// When `lastError` was written; set together with it.
+  lastErrorAt        DateTime?    @map("last_error_at") @db.Timestamptz(6)
 
   deployment       Deployment        @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   operation        Operation?        @relation(fields: [operationId, deploymentId, ref], references: [id, deploymentId, ref], onDelete: Restrict, onUpdate: Restrict)

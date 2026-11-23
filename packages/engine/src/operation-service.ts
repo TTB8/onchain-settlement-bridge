@@ -300,7 +300,7 @@ export class OperationService {
 
   /**
    * Reserves funds for a request and enqueues its chain call, in one transaction (see the file
-   * comment for the steps). Idempotent on `idempotencyKey`. Throws a typed `EngineError` for every
+   * comment for the steps). Idempotent on (`owner`, `idempotencyKey`). Throws a typed `EngineError` for every
    * refusal: `InvalidRequestError`, `SelfTransferRequestError`, `UnknownUserError`,
    * `NoActiveDeploymentError`, `DeploymentMismatchError`, `IdempotencyConflictError`,
    * `InsufficientFundsError`, `RetriesExhaustedError`.
@@ -349,12 +349,13 @@ export class OperationService {
 
         // 4. Idempotency, after the lock: a concurrent duplicate has committed by now.
         const existing = await tx.operation.findUnique({
-          where: { idempotencyKey: req.idempotencyKey },
+          // Scoped to the owner: another user's key never matches (and is never revealed).
+          where: { userId_idempotencyKey: { userId: owner, idempotencyKey: req.idempotencyKey } },
           include: { deployment: true },
         });
         if (existing !== null) {
           if (!sameContent(existing, ledgerOp)) {
-            throw new IdempotencyConflictError(req.idempotencyKey, existing.id);
+            throw new IdempotencyConflictError(existing.id);
           }
           return { operation: toRecord(existing, existing.deployment), replayed: true };
         }

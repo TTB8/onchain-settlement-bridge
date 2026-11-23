@@ -91,21 +91,19 @@ export class DeploymentMismatchError extends EngineError {
   readonly code = 'DEPLOYMENT_MISMATCH' as const;
 }
 
-/** The idempotency key was already used for a request with different content. */
+/**
+ * The caller's idempotency key was already used, BY THE SAME USER, for a request with different
+ * content. Keys are scoped per user (unique on (user_id, idempotency_key)), so the operation named
+ * here always belongs to the requesting user; the key itself is not echoed (it is the caller's
+ * input and may be logged by the API layer).
+ */
 export class IdempotencyConflictError extends EngineError {
   readonly code = 'IDEMPOTENCY_CONFLICT' as const;
 
-  /**
-   * @param idempotencyKey The reused key.
-   * @param existingOperationId The operation that already owns it.
-   */
-  constructor(
-    readonly idempotencyKey: string,
-    readonly existingOperationId: string,
-  ) {
+  /** @param existingOperationId The requesting user's operation that already owns the key. */
+  constructor(readonly existingOperationId: string) {
     super(
-      `idempotency key ${JSON.stringify(idempotencyKey)} was used for operation ` +
-        `${existingOperationId} with different content`,
+      `the idempotency key was already used for operation ${existingOperationId} with different content`,
     );
   }
 }

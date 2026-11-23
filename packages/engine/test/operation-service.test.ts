@@ -320,7 +320,6 @@ describe('idempotency', () => {
       () => service.requestWithdrawal(u.id, 11n, 'idem-4'),
       () => service.requestDeposit(u.id, 10n, 'idem-4'),
       () => service.requestTransfer(u.id, v.id, 10n, 'idem-4'),
-      () => service.requestWithdrawal(v.id, 10n, 'idem-4'),
     ]) {
       const err = await attempt().catch((e: unknown) => e);
       expect(err).toBeInstanceOf(IdempotencyConflictError);
@@ -329,12 +328,40 @@ describe('idempotency', () => {
     expect(await counts(db.prisma)).toEqual(before);
   });
 
-  it('same key for two different users at once: one wins, the other is a conflict', async () => {
+  it('keys are per user: two users with one key at once get two operations', async () => {
     const a = await insertUser(db.prisma);
     const b = await insertUser(db.prisma);
-    const results = await Promise.allSettled([
+    const [ra, rb] = await Promise.all([
       service.requestDeposit(a.id, 5n, 'idem-5'),
       service.requestDeposit(b.id, 5n, 'idem-5'),
+    ]);
+    expect(ra.replayed || rb.replayed).toBe(false);
+    expect(ra.operation.id).not.toBe(rb.operation.id);
+    expect(ra.operation.userId).toBe(a.id);
+    expect(rb.operation.userId).toBe(b.id);
+  });
+
+  it("a conflict names only the requester's own operation, never the key", async () => {
+    const a = await insertUser(db.prisma);
+    const b = await insertUser(db.prisma);
+    await service.requestDeposit(b.id, 5n, 'shared-secret-key');
+    const mine = await service.requestDeposit(a.id, 5n, 'shared-secret-key');
+    const err = await service
+      .requestDeposit(a.id, 6n, 'shared-secret-key')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(IdempotencyConflictError);
+    expect(err).toMatchObject({ existingOperationId: mine.operation.id });
+    expect(String((err as Error).message)).not.toContain('shared-secret-key');
+  });
+
+  it('same key, same user, racing requests with different lock sets: one wins, one conflicts', async () => {
+    const a = await insertUser(db.prisma);
+    await fund(service, a, 50n);
+    // A deposit locks incoming; a withdrawal locks available+held: no common lock, so the loser
+    // meets the unique index at INSERT and the retry answers with a conflict.
+    const results = await Promise.allSettled([
+      service.requestDeposit(a.id, 5n, 'idem-6'),
+      service.requestWithdrawal(a.id, 5n, 'idem-6'),
     ]);
     expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
     const lost = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
