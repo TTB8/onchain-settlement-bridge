@@ -1,17 +1,11 @@
-# Harness lessons
+# Engineering lessons
 
-One line per lesson: date, what happened, which guide or check now prevents it.
-A lesson that recurs becomes a check; one that applies to other repos goes up into harness-kit.
+Things that surprised us while building this repository, one line each: what happened and what now prevents it.
+Several came from mutation testing (breaking the code on purpose to see whether a test notices) and from independent reviews.
 
-- 2026-11-23: a jest `roots` entry pointed at an empty directory git does not track, so a fresh clone failed before running a single test. `verify.py full` in a fresh worktree caught it; always run it there right after installing. Fixed by tracking the directory.
-- 2026-11-23: the guard's credential rule matches credential documents, SSH keys, git/AWS stores and Foundry keystores. A `.env` file is not one of them, so reading it is allowed. Keep `.env` values to local development only (Anvil dev keys), which is the repo rule anyway.
-- 2026-11-23: a test command that merely spells out a credential file name or a key-shaped string trips the user-level guard before it runs, even when it is only a payload. Test guards with payload files, not literals on the command line, and do not rewrite the text to slip past it.
-- 2026-11-23: a stack whose package does not exist yet only gives a "no checks ran" WARN, and `validate.py` insists every zone path sit under a declared stack, so declare the planned packages up front and the harness covers each one from its first file.
-- 2026-11-23: the harness checks do not run Prettier, so a hand-written `harness.json` failed `pnpm format:check` and would have gone red in CI. Run `pnpm lint && pnpm format:check` before committing config and docs-adjacent files, not only `verify.py`.
+- 2026-11-23: a jest `roots` entry pointed at an empty directory git does not track, so a fresh clone failed before running a single test. A fresh-clone run of the full checks caught it; run them in a fresh clone before publishing. Fixed by tracking the directory.
 - 2026-11-23: a mutant that matched transfers on sender and receiver only (ignoring the amount) survived 260 domain tests, because the amount-mismatch tests changed both events together. When a rule compares several fields, mutate each field's comparison on its own.
-- 2026-11-23: both team workers reported the wrong number of commits (14 for 13, 8 for 7). Count commits and files with git; treat every number in a hand-back as a claim.
 - 2026-11-23: Jest cannot ship an assertion failure containing a BigInt between its parallel workers, so a failing anvil suite shows as "failed to run". Re-run with `--runInBand` to see which test failed.
-- 2026-11-23: the contracts' invariant and fuzz suites grew the fast check from 10s to 50s; the budget was raised to 90s from that measurement, not guessed. If it grows again, split the suites (a fast profile with fewer campaigns locally, the full one in CI) instead of weakening them.
 - 2026-11-23: in a forge test, a `run()` that reverts leaves its broadcast open, so the test must call `vm.stopBroadcast()`; and `vm.mockCall` on an empty address gives it stub code, so a later CREATE at that address fails unless the test first calls `vm.etch(addr, "")`.
 - 2026-11-23: allowances set while holder transfers were switched on can be spent again if the switch is later turned back on, and while it is off nobody can revoke them. This is by design (custodial default is off) and is documented in the token's NatSpec and the decision records.
 - 2026-11-23: a mutant that removed a stage check survived the unit tests because a second guard (the negative-balance rule) rejected the same journals, so the test passed for the wrong reason. When two guards reject the same input, make each test assert the specific error of the guard it is about, then mutate each guard on its own.

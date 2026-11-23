@@ -29,24 +29,21 @@ chain. Never commit a `.env`, a real key, an RPC URL that carries an API key, or
   message: `feat(engine): ...`, `fix(api): ...`, `docs: ...`, `test(db): ...`, `chore(ci): ...`.
   The scope is the package or app (`domain`, `chain`, `db`, `engine`, `api`, `worker`,
   `contracts`, `e2e`, `dev`).
-- Do not skip hooks (`--no-verify`) and do not force-push a shared branch.
+- Do not force-push a shared branch.
 
-## The harness
+## Checks
 
-The repository carries its own checks, driven by `harness.json`, and the git hooks in
-`.githooks/` run them for you:
+Run these before you push; CI (`.github/workflows/ci.yml`) runs all of them:
 
-| Command                                  | When                                                          |
-| ---------------------------------------- | ------------------------------------------------------------- |
-| `python3 scripts/harness/verify.py fast` | Before every commit (the pre-commit hook runs it on staged files): typecheck, lint and the related tests for what you changed; a change in a risk zone runs that package's whole suite |
-| `python3 scripts/harness/verify.py full` | Before opening a pull request: every stack, every package     |
+| Command                                                    | What it covers                                              |
+| ---------------------------------------------------------- | ----------------------------------------------------------- |
+| `pnpm lint && pnpm format:check && pnpm typecheck`         | ESLint, `forge fmt --check`, Prettier, TypeScript           |
+| `pnpm test:cov`                                            | Every package's tests with its coverage thresholds          |
+| `pnpm contracts:test` and `pnpm contracts:snapshot:check`  | Foundry unit, fuzz and invariant tests; the gas snapshot    |
 
-Prettier and `forge fmt` are not part of the harness checks, so also run
-`pnpm lint && pnpm format:check` before you push. CI (`.github/workflows/ci.yml`) runs all of it.
-
-A check is never weakened to make a change pass: no `--fix` in a check, no test edited only so
-that it passes. When a check or a review catches something surprising, add one line to
-[harness-lessons.md](harness-lessons.md).
+A check is never weakened to make a change pass: no auto-fixing inside a check, no test edited only
+so that it passes. When a check or a review catches something surprising, add one line to
+[docs/engineering-lessons.md](docs/engineering-lessons.md).
 
 ## Tests are required
 
@@ -63,16 +60,14 @@ How to run each suite is in the README's "Testing" section.
 
 ## Money and on-chain zones need an independent review
 
-`harness.json` declares two risk zones:
+The repository has two risk zones:
 
 - **money**: `packages/domain/src`, `packages/engine/src`, `packages/db/prisma`, `packages/db/src`,
   `apps/api/src/operations`, `apps/api/src/balances`
 - **onchain**: `contracts/src`, `contracts/script`, `packages/chain/src`
 
-A pull request that touches either one needs an independent review (a reviewer who did not write
-the change, working from the audit methodology), its findings addressed, and then the
-`independent-review` label. The `Harness gate` workflow fails the pull request until the label is
-there.
+A pull request that touches either one needs an independent review: a reviewer who did not write
+the change, working from an audit methodology, with every finding addressed before merge.
 
 ## Adding a design decision (ADR)
 

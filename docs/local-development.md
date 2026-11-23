@@ -160,7 +160,6 @@ are observations; the operation's `confirmed` status and block are what count.
 | `pnpm test:e2e:hermetic`                  | The e2e suite twice, next to planted stale deployment files and a held port 3000          |
 | `pnpm --filter @bridge/api test`          | One package                                                                               |
 | `pnpm lint && pnpm format:check && pnpm typecheck` | Static checks                                                                    |
-| `python3 scripts/harness/verify.py fast`  | The repo's harness checks for what you changed                                            |
 | `pnpm contracts:test`                     | Foundry unit, fuzz and invariant tests                                                    |
 
 The end-to-end suite (`e2e/test/*.e2e.test.ts`) needs the compose Postgres on `localhost:5434`,

@@ -250,7 +250,7 @@ READMEs.
 | Anything the ledger did not authorise is reported | Reconciler at the final block, every run persisted                                    | engine `reconciler`: rogue mint, rogue holder transfer, rogue registry freeze; reconciler on Anvil; `pnpm demo --rogue`            |
 
 **Mutation evidence.** Tests were also checked by breaking the code on purpose. Two mutants
-survived at first and led to stronger tests, recorded in [harness-lessons.md](harness-lessons.md):
+survived at first and led to stronger tests, recorded in [docs/engineering-lessons.md](docs/engineering-lessons.md):
 a transfer matched on sender and receiver while ignoring the amount (it survived the domain tests,
 because the amount tests changed both events together), and a removed stage check that a second
 guard hid (so each db test now asserts the specific guard's error tag).
@@ -363,7 +363,7 @@ prints ledger and on-chain balances side by side, and ends with `CLEAN: 0 mismat
 │   ├── api/              NestJS HTTP API: users, money operations, balances, compliance, reconciliation
 │   └── worker/           NestJS standalone process that runs the engine loop and holds the signer keys
 ├── e2e/                  End-to-end suite on a real chain, plus unit tests of the local scripts
-├── scripts/              setup:local, demo, dev runner, coverage summary, harness checks
+├── scripts/              setup:local, demo, dev runner, coverage summary
 ├── docs/                 Local development guide and design decision records
 └── docker-compose.yml    Postgres 16 and Anvil for local development
 ```
@@ -385,10 +385,10 @@ live. The chain suites start their own Anvil on a free port. Neither touches you
 | Domain                     | `pnpm --filter @bridge/domain test`       | Every rule as a table of cases, plus a seeded conservation property test                        | 364 |
 | Chain                      | `pnpm --filter @bridge/chain test`        | Gateway behaviour, error mapping and URL redaction; the fake and Anvil agree (parity)           | 223 |
 | Database                   | `pnpm --filter @bridge/db test`           | Each SQL guard attacked directly, asserting its own error tag                                   | 212 |
-| Engine                     | `pnpm --filter @bridge/engine test`       | The 18 obligations: crashes, races, reorgs, drops, unknown outcomes, reconciliation; and on Anvil | 393 |
+| Engine                     | `pnpm --filter @bridge/engine test`       | The 18 obligations: crashes, races, reorgs, drops, unknown outcomes, reconciliation; and on Anvil | 401 |
 | API                        | `pnpm --filter @bridge/api test`          | Routes, idempotency, amounts, the 401/403 matrix, problem+json without leaks, startup refusals  | 155 |
 | Worker                     | `pnpm --filter @bridge/worker test`       | Startup refusals, fatal alarms, the real engine loop, clean and bounded shutdown                | 32 |
-| End to end                 | `pnpm test:e2e`                           | `setup:local` and the demo on a real chain; ledger equals chain at every step; rogue mint caught | 61 |
+| End to end                 | `pnpm test:e2e`                           | `setup:local` and the demo on a real chain; ledger equals chain at every step; rogue mint caught | 64 |
 
 `pnpm test` runs every package's suite, the end-to-end suite included. `pnpm test:cov` does the same
 with coverage thresholds, and `node scripts/coverage-summary.mjs` prints this table from its output:
@@ -405,12 +405,11 @@ with coverage thresholds, and `node scripts/coverage-summary.mjs` prints this ta
 Contracts (`pnpm contracts:coverage`): 100% of lines, statements, branches and functions in both
 `ComplianceRegistry.sol` and `SettlementToken.sol`.
 
-In total: 145 Foundry tests and 1,440 Jest tests (1,379 package tests and 61 end-to-end), all
+In total: 145 Foundry tests and 1,451 Jest tests (1,387 package tests and 64 end-to-end), all
 passing at the commit this README was written against. Numbers move with the code; CI prints the
 current coverage table in every run's summary.
 
-Static checks: `pnpm lint && pnpm format:check && pnpm typecheck`. Before saying a change is done:
-`python3 scripts/harness/verify.py fast`.
+Static checks: `pnpm lint && pnpm format:check && pnpm typecheck`.
 
 ## CI
 
@@ -423,9 +422,7 @@ Static checks: `pnpm lint && pnpm format:check && pnpm typecheck`. Before saying
 - **Contracts**: `forge fmt --check`, build with contract sizes, `forge test`, the deployment
   promotion script against its own Anvil, the gas snapshot, and coverage.
 
-A second workflow, [`harness-gate.yml`](.github/workflows/harness-gate.yml), fails a pull request
-that touches the money or on-chain zones until it carries the `independent-review` label. Dependabot
-proposes npm and GitHub Actions updates weekly.
+Dependabot proposes npm and GitHub Actions updates weekly.
 
 ## Roadmap
 
