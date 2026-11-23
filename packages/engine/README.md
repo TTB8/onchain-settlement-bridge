@@ -40,6 +40,14 @@ dispatcher. Piece B (submitter, confirmer, indexer, reconciler) builds on it.
    domain's reserve entry and postings, ONE outbox row (signer `settlement`, the `ContractCall`
    with amounts as decimal strings), and an audit row. All or nothing.
 
+### Transient `NoActiveDeploymentError` during a switch
+
+A deployment switch (deactivate the old row, activate the new one) is atomic in the database, but
+a request that reads the deployment while the switch transaction holds the row waits for it and
+then sees the old row inactive. Such a request fails with `NoActiveDeploymentError` even though a
+new deployment is active a moment later. The error is retryable: the API should map it to 503
+with `Retry-After` and the caller should retry with the same idempotency key (nothing was written).
+
 ### Replays after a reconfiguration (review I-3)
 
 Step 1 runs before the idempotency lookup, so a replay is answered only while the engine's
@@ -77,6 +85,14 @@ configured deployment is the chain's active one:
   (`pending` / `processing` -> `dead`, lease dropped, `last_error` says why), so nothing is ever
   signed for an operation whose funds are released;
 - appends an audit row.
+
+**Accepted risk: evidence is self-attested at this API level.** `moveOperation` checks that a
+judgement says `confirm` and that `mayReverse` accepts the `ReversalEvidence`, but it cannot tell
+whether those values were really produced by the domain functions from real chain observations;
+a caller can build the literals by hand. This is an internal API: the only callers are the
+engine's own components (piece B), and they must pass only values returned by `lateConfirmation` /
+`resolveRevert` and evidence gathered as ADR 0012 items 5-8 require. Review that code path, not
+this one, for the provenance of the evidence.
 
 It takes the caller's transaction, so piece B can write its chain attempt in the same commit.
 `OperationService.move(input)` wraps it in its own transaction for callers with nothing else to
