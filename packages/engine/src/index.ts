@@ -1,7 +1,8 @@
 /**
  * @file Public API of `@bridge/engine`: piece A (the operation service, the single status-move
- * helper, the outbox dispatcher) and piece B (the settlement submitter, the transaction monitor,
- * the indexer and the `BridgeEngine` composition root).
+ * helper, the outbox dispatcher), piece B (the settlement submitter, the transaction monitor,
+ * the indexer and the `BridgeEngine` composition root) and piece C (compliance sending and
+ * monitoring, the signer router, the reconciler).
  * Framework-free: plain classes and functions taking a Prisma client, a clock and an id source.
  */
 
@@ -20,4 +21,10 @@ export * from './alarms';
 export * from './settlement-submitter';
 export * from './tx-monitor';
 export * from './indexer';
+export * from './compliance-move';
+export * from './compliance-service';
+export * from './compliance-submitter';
+export * from './compliance-monitor';
+export * from './signer-router';
+export * from './reconciler';
 export * from './bridge-engine';

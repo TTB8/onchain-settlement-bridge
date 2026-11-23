@@ -101,29 +101,33 @@ export async function signingExpectationFor(
 }
 
 /**
- * Throws `SignerMismatchError` (after `onMismatch`) unless the gateway's settlement signer is the
- * address recorded in `signer_state` for the deployment (review M-1).
+ * Throws `SignerMismatchError` (after `onMismatch`) unless the gateway's address for `signer` is
+ * the address recorded in `signer_state` for the deployment (review M-1). The settlement sender
+ * checks `settlement`; the compliance sender checks `compliance` (each signer has its own nonce
+ * sequence, so a rotated compliance key would make every compliance nonce look free).
  *
  * @param prisma The database.
  * @param gateway The gateway.
  * @param deploymentId The deployment.
  * @param onMismatch Called with a description before throwing (raise the alarm here).
+ * @param signer Which signer to check. Default `settlement`.
  */
 export async function assertSignerBound(
   prisma: PrismaClient,
   gateway: ChainGateway,
   deploymentId: string,
   onMismatch: (detail: string) => void,
+  signer: SignerName = 'settlement',
 ): Promise<void> {
   const row = await prisma.signerState.findUnique({
-    where: { deploymentId_signer: { deploymentId, signer: 'settlement' } },
+    where: { deploymentId_signer: { deploymentId, signer } },
   });
-  const ours = gateway.signerAddress('settlement').toLowerCase();
+  const ours = gateway.signerAddress(signer).toLowerCase();
   if (row === null || row.address !== ours) {
     const detail =
       row === null
-        ? `deployment ${deploymentId} has no settlement signer row`
-        : `gateway signs as ${ours}, deployment ${deploymentId} records ${row.address}`;
+        ? `deployment ${deploymentId} has no ${signer} signer row`
+        : `gateway signs ${signer} as ${ours}, deployment ${deploymentId} records ${row.address}`;
     onMismatch(detail);
     throw new SignerMismatchError(detail);
   }

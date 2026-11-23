@@ -87,8 +87,6 @@ export interface SigningExpectation {
   readonly registry: Address;
   /** The deployment's recorded address for the request's signer (`signer_state`). */
   readonly signerAddress: Address;
-  /** The gas limit the gateway is configured with, when the caller knows it: then compared. */
-  readonly gasLimit?: bigint;
 }
 
 const lower = (a: string): Address => a.toLowerCase() as Address;
@@ -130,7 +128,10 @@ export function signedTransactionDifferences(
   }
   if (lower(decoded.from) !== lower(expected.signerAddress)) out.push('from');
   if (decoded.value !== 0n) out.push('value');
-  if (expected.gasLimit !== undefined && decoded.gas !== expected.gasLimit) out.push('gas');
+  // The gas limit is NOT compared (review piece B, quick item): the gateway chooses it, no caller
+  // knew it, and a wrong limit can only make the transaction revert out of gas (a receipt the
+  // monitor already handles), never move other funds or spend another nonce. `decoded.gas` stays
+  // in the decoded view for logs and tests.
   return out;
 }
 

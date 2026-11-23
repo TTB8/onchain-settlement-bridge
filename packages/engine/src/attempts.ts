@@ -51,6 +51,7 @@ import {
   UnsafeIsolationError,
 } from './errors';
 import { writeAudit } from './ledger-writes';
+import type { HandlerContext, OutboxOutcome } from './outbox-dispatcher';
 import { describeError, type SanitizeOptions } from './redact';
 import { type RawTransactionInspector, signAndVerify, type SigningExpectation } from './signing';
 import { runTransaction, type TransactionOptions, type Tx } from './transaction';
@@ -470,4 +471,58 @@ export async function recordBroadcast(
       );
     }
   });
+}
+
+/** What `sendForOutbox` needs. */
+export interface OutboxSend {
+  /** The chain. */
+  readonly gateway: ChainGateway;
+  /** The database. */
+  readonly prisma: PrismaClient;
+  /** The recorded attempt to broadcast. */
+  readonly attempt: ChainAttempt;
+  /** The dispatcher's lease check and abort signal. */
+  readonly context: HandlerContext;
+  /** The audited subject (an operation or a compliance change) and its state. */
+  readonly subject: { readonly entity: AuditEntity; readonly id: string; readonly state: string };
+  /** When (from the injected clock). */
+  readonly at: () => Date;
+  /** Literal secrets removed from the audited error text. */
+  readonly redaction: SanitizeOptions;
+}
+
+/**
+ * The last two steps of every outbox-driven send (README requirements 2 and 6): only after the
+ * attempt's commit, and right before sending, the abort signal must not have fired and the lease
+ * must still be ours (else `LeaseLostError`, nothing sent); then broadcast the recorded bytes,
+ * record the answer, and map it to an outbox outcome: sent or nonce already used is `done` (the
+ * monitor decides from receipts and the reference), a definite refusal by this node is
+ * `{ failed: 'submission_rejected' }` (the attempt is kept and still counted), and an unknown
+ * outcome is THROWN so the dispatcher retries, which rebroadcasts the same bytes.
+ *
+ * @param s See `OutboxSend`.
+ */
+export async function sendForOutbox(s: OutboxSend): Promise<OutboxOutcome> {
+  if (s.context.signal.aborted) throw new LeaseLostError('handler time limit reached');
+  if (!(await s.context.stillHolds())) {
+    throw new LeaseLostError('lease lost before broadcast');
+  }
+  if (s.context.signal.aborted) throw new LeaseLostError('handler time limit reached');
+  const result = await broadcastAttempt(s.gateway, s.attempt);
+  await recordBroadcast(s.prisma, s.attempt, result, s.subject, s.at(), s.redaction);
+  switch (result.kind) {
+    case 'sent':
+    case 'nonce_used':
+      return 'done';
+    case 'rejected':
+      return {
+        failed: 'submission_rejected',
+        detail: describeError(result.error, s.redaction),
+      };
+    case 'unknown':
+      // Unknown outcome: retried by the dispatcher, which rebroadcasts these same bytes.
+      throw result.error instanceof Error
+        ? result.error
+        : new InvalidRequestError('broadcast failed with a non-error value');
+  }
 }

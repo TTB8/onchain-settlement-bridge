@@ -1,5 +1,6 @@
 /**
- * @file Alarms: conditions a person must look at, raised by the monitor and the indexer.
+ * @file Alarms: conditions a person must look at, raised by the monitors, the indexer and the
+ * reconciler.
  *
  * Why a port and not a log line: an alarm is a page for an operator (a stalled node, an escalated
  * operation, a reorg deeper than the window). The production wiring sends them to monitoring; the
@@ -45,7 +46,35 @@ export type AlarmKind =
   /** The gateway's deployment is not the database's active deployment: the engine refuses to run. */
   | 'deployment_mismatch'
   /** An operation's evidence read failed for the configured number of passes in a row. */
-  | 'operation_skipped';
+  | 'operation_skipped'
+  /**
+   * A compliance change met a registry event carrying its reference that writes something else
+   * (another account, flag or value: a front-run or a compromised key), or its reference was
+   * consumed with no matching event. Never confirmed automatically; a person decides.
+   */
+  | 'compliance_escalation'
+  /** A reconciliation run could not compare (a read failed, the index is behind, bad input). */
+  | 'reconciliation_unknown'
+  /** Reconciliation: the ledger settled an operation the chain shows no event for. */
+  | 'reconciliation_missing_onchain'
+  /** Reconciliation: a settling event moved another amount than the ledger says. */
+  | 'reconciliation_amount_mismatch'
+  /** Reconciliation: a settling event moved between other addresses than the ledger says. */
+  | 'reconciliation_address_mismatch'
+  /** Reconciliation: the settling event is in another block than the ledger recorded. */
+  | 'reconciliation_confirmed_block_mismatch'
+  /** Reconciliation: a reference event the ledger cannot explain (or from a stale block). */
+  | 'reconciliation_unexpected_onchain_event'
+  /** Reconciliation: tokens moved with no bridge reference event (a rogue transfer). */
+  | 'reconciliation_unexplained_transfer'
+  /** Reconciliation: an address holds another balance on chain than the ledger implies. */
+  | 'reconciliation_balance_mismatch'
+  /** Reconciliation: the total supply differs from the ledger's. */
+  | 'reconciliation_supply_mismatch'
+  /** Reconciliation: a registry event the bridge did not make, or that writes something else. */
+  | 'reconciliation_compliance_event_mismatch'
+  /** Reconciliation: registry flags differ from what the bridge believes. */
+  | 'reconciliation_compliance_mismatch';
 
 /** One raised alarm. */
 export interface EngineAlarm {
@@ -55,6 +84,10 @@ export interface EngineAlarm {
   readonly detail: string;
   /** The operation concerned, when there is one. */
   readonly operationId?: string;
+  /** The compliance change concerned, when there is one. */
+  readonly complianceChangeId?: string;
+  /** The reconciliation run concerned, when there is one. */
+  readonly reconciliationRunId?: string;
   /** When (from the injected clock). */
   readonly at: Date;
 }

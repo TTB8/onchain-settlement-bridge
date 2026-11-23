@@ -266,12 +266,11 @@ describe('signAndVerify (review M-3): the signed bytes are checked before anythi
     ).rejects.toThrow(/decoded/);
   });
 
-  it('compares the gas limit when the caller knows it', async () => {
+  it('does not compare the gas limit: the gateway chooses it (SigningExpectation.gasLimit removed)', async () => {
     const g = lying(() => rawSign({ gas: 21_000n }));
     await expect(signAndVerify(g, inspector, request(), expected)).resolves.toBeDefined();
-    await expect(
-      signAndVerify(g, inspector, request(), { ...expected, gasLimit: 300_000n }),
-    ).rejects.toThrow(/gas/);
+    const decoded = await inspector.decode((await g.signTransaction(request())).raw);
+    expect(decoded.gas).toBe(21_000n);
   });
 
   it('the fake inspector checks the fake encoding the same way', async () => {

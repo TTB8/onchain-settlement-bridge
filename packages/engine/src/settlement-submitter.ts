@@ -28,15 +28,14 @@ import type { ChainAttempt, Operation, OutboxMessage, PrismaClient } from '@brid
 import { FeeCapExceededError, initialFees } from '@bridge/domain';
 
 import {
-  broadcastAttempt,
   commitWithFreshNonce,
   contractCallFromJson,
   fenceOutboxLease,
   insertAttempt,
-  recordBroadcast,
+  sendForOutbox,
 } from './attempts';
 import type { AlarmSink } from './alarms';
-import { InvalidRequestError, LeaseLostError, SignerMismatchError } from './errors';
+import { SignerMismatchError } from './errors';
 import { moveOperation } from './move-operation';
 import type { HandlerContext, OutboxHandler, OutboxOutcome } from './outbox-dispatcher';
 import type { Clock } from './ports';
@@ -136,7 +135,7 @@ export class SettlementSubmitter implements OutboxHandler {
     if (existing !== undefined) {
       // Settled, failed or reversed since: nothing left to send for this row.
       if (op.status !== 'submitted') return 'done';
-      return this.send(op, existing, call, context);
+      return this.send(op, existing, context);
     }
     // Failed (or reversed) before anything was signed: nothing may ever be sent.
     if (op.status !== 'ledger_reserved') return 'done';
@@ -212,44 +211,23 @@ export class SettlementSubmitter implements OutboxHandler {
       },
       transactions: this.transactions,
     });
-    return this.send(op, attempt, call, context);
+    return this.send(op, attempt, context);
   }
 
   /** Broadcasts a recorded attempt, after the lease and abort checks (steps 4 and 5). */
-  private async send(
+  private send(
     op: Operation,
     attempt: ChainAttempt,
-    call: ContractCall,
     context: HandlerContext,
   ): Promise<OutboxOutcome> {
-    if (context.signal.aborted) throw new LeaseLostError('handler time limit reached');
-    if (!(await context.stillHolds())) {
-      throw new LeaseLostError('lease lost before broadcast');
-    }
-    if (context.signal.aborted) throw new LeaseLostError('handler time limit reached');
-    const result = await broadcastAttempt(this.gateway, attempt);
-    await recordBroadcast(
-      this.prisma,
+    return sendForOutbox({
+      gateway: this.gateway,
+      prisma: this.prisma,
       attempt,
-      result,
-      { entity: 'operation', id: op.id, state: 'submitted' },
-      this.clock.now(),
-      this.redaction,
-    );
-    switch (result.kind) {
-      case 'sent':
-      case 'nonce_used':
-        return 'done';
-      case 'rejected':
-        return {
-          failed: 'submission_rejected',
-          detail: describeError(result.error, this.redaction),
-        };
-      case 'unknown':
-        // Unknown outcome: retried by the dispatcher, which rebroadcasts these same bytes.
-        throw result.error instanceof Error
-          ? result.error
-          : new InvalidRequestError('broadcast failed with a non-error value');
-    }
+      context,
+      subject: { entity: 'operation', id: op.id, state: 'submitted' },
+      at: () => this.clock.now(),
+      redaction: this.redaction,
+    });
   }
 }

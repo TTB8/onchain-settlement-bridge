@@ -33,7 +33,8 @@ export type EngineErrorCode =
   | 'LEASE_LOST'
   | 'SIGNED_TX_MISMATCH'
   | 'SIGNER_MISMATCH'
-  | 'UNSAFE_ISOLATION';
+  | 'UNSAFE_ISOLATION'
+  | 'COMPLIANCE_CHANGE_NOT_FOUND';
 
 /** Base class of every error the engine throws on purpose. */
 export abstract class EngineError extends Error {
@@ -111,6 +112,46 @@ export class IdempotencyConflictError extends EngineError {
     super(
       `the idempotency key was already used for operation ${existingOperationId} with different content`,
     );
+  }
+}
+
+/**
+ * The requester's idempotency key was already used, BY THE SAME REQUESTER, for a compliance
+ * request with different content (another address, action or reason). Keys are scoped per
+ * requester (unique on (requested_by, idempotency_key)); the key itself is not echoed.
+ */
+export class ComplianceIdempotencyConflictError extends EngineError {
+  readonly code = 'IDEMPOTENCY_CONFLICT' as const;
+
+  /** @param existingChangeId The requester's compliance change that already owns the key. */
+  constructor(readonly existingChangeId: string) {
+    super(
+      `the idempotency key was already used for compliance change ${existingChangeId} with different content`,
+    );
+  }
+}
+
+/** No compliance change has the given id. */
+export class ComplianceChangeNotFoundError extends EngineError {
+  readonly code = 'COMPLIANCE_CHANGE_NOT_FOUND' as const;
+}
+
+/**
+ * The compliance change is not at the version (or status) the caller read: another worker moved
+ * it first. The caller re-reads and decides again on fresh evidence.
+ */
+export class ComplianceVersionConflictError extends EngineError {
+  readonly code = 'VERSION_CONFLICT' as const;
+
+  /**
+   * @param changeId The compliance change.
+   * @param expectedVersion The version the caller read.
+   */
+  constructor(
+    readonly changeId: string,
+    readonly expectedVersion: number,
+  ) {
+    super(`compliance change ${changeId} is no longer at version ${expectedVersion}`);
   }
 }
 

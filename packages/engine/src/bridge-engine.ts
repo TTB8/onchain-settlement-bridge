@@ -1,25 +1,38 @@
 /**
- * @file The composition root: one `BridgeEngine` wires the operation service, the outbox
- * dispatcher with the settlement submitter, the transaction monitor and the indexer to one
- * database, one gateway (one deployment), one signer, one clock and one id source.
+ * @file The composition root: one `BridgeEngine` wires the operation and compliance services,
+ * the outbox dispatcher (routing each row to the settlement or the compliance submitter), the
+ * transaction and compliance monitors, the indexer and the reconciler to one database, one
+ * gateway (one deployment), one clock and one id source.
  *
- * `tick()` runs one pass of each, in the order that lets a pass finish an operation: dispatch
- * (sign, record, broadcast), index (copy the new events), monitor (decide on final evidence). It
- * holds no timer, so tests drive the engine deterministically. `start()` / `stop()` are a thin
- * loop around `tick()` for the worker process; the loop never overlaps two ticks.
+ * `tick()` runs one pass of each, in the order that lets a pass finish its work: dispatch (sign,
+ * record, broadcast), index (copy the new events), monitor operations, monitor compliance changes
+ * (decide on final evidence), and every `reconcileEveryTicks` ticks a reconciliation run (after
+ * the monitors, so the ledger has caught up with what is final). Each component is isolated: one
+ * that throws raises `component_failed` and the others still run. It holds no timer, so tests
+ * drive the engine deterministically. `start()` / `stop()` are a thin loop around `tick()` for
+ * the worker process; the loop never overlaps two ticks.
  */
 
 import type { ChainGateway } from '@bridge/chain';
 import type { PrismaClient } from '@bridge/db';
 
 import { AlarmLog, type AlarmSink } from './alarms';
-import { DeploymentMismatchError, InvalidRequestError } from './errors';
+import {
+  ComplianceMonitor,
+  type ComplianceMonitorSummary,
+  EMPTY_COMPLIANCE_SUMMARY,
+} from './compliance-monitor';
+import { ComplianceService } from './compliance-service';
+import { ComplianceSubmitter } from './compliance-submitter';
+import { DeploymentMismatchError, InvalidRequestError, UnsafeIsolationError } from './errors';
 import { Indexer, type IndexerResult } from './indexer';
 import { OperationService } from './operation-service';
 import { type BackoffPolicy, type DispatchSummary, OutboxDispatcher } from './outbox-dispatcher';
 import type { Clock, IdSource } from './ports';
+import { Reconciler, type ReconciliationRunRecord } from './reconciler';
 import { describeError, type SanitizeOptions } from './redact';
 import { SettlementSubmitter } from './settlement-submitter';
+import { SignerRouter } from './signer-router';
 import type { RawTransactionInspector } from './signing';
 import { bindingOf, type DeploymentBinding, isBound } from './signer-binding';
 import type { TransactionOptions } from './transaction';
@@ -63,6 +76,14 @@ export const DEFAULT_ORPHAN_AFTER_SECONDS = 900;
 
 /** Default fee bumps per nonce: 5 (each >= 12.5%, so the last pays about 1.8x the first). */
 export const DEFAULT_MAX_BUMPS = 5;
+
+/**
+ * Default ticks between reconciliation runs: 10. WHY: a run reads every relevant balance and flag
+ * at the final block, so it costs far more node calls than a monitor pass; at the default 2 s poll
+ * that is a run every ~20 s, often enough that a rogue mint or registry change is seen within a
+ * minute, rare enough not to multiply the node load. An admin can always `reconcileNow()`.
+ */
+export const DEFAULT_RECONCILE_EVERY_TICKS = 10;
 
 /** Engine settings. */
 export interface BridgeEngineConfig {
@@ -117,8 +138,14 @@ export interface BridgeEngineConfig {
   readonly handlerTimeoutMs?: number;
   /** Dispatcher backoff. */
   readonly backoff?: BackoffPolicy;
-  /** Transaction settings for every component. */
+  /**
+   * Transaction settings for every component. The isolation level, when given, must be
+   * `ReadCommitted` (`UnsafeIsolationError` otherwise): nonce allocation is only correct there
+   * (review round 2, L-B), and the database refuses attempts at any other level anyway.
+   */
   readonly transactions?: TransactionOptions;
+  /** Ticks between reconciliation runs (>= 1). Default `DEFAULT_RECONCILE_EVERY_TICKS`. */
+  readonly reconcileEveryTicks?: number;
   /**
    * Literal secrets (the RPC URL, its API key, its host) removed from every error text the engine
    * writes (outbox `last_error`, audit notes, alarms). The gateway scrubs its own errors too; this
@@ -146,6 +173,9 @@ export interface BridgeEngineDeps {
   readonly alarms?: AlarmSink;
 }
 
+/** The components of one tick. */
+export type TickComponent = 'dispatch' | 'index' | 'monitor' | 'compliance' | 'reconcile';
+
 /** What one tick did. */
 export interface TickSummary {
   /** The dispatcher pass. */
@@ -154,8 +184,12 @@ export interface TickSummary {
   readonly index: IndexerResult;
   /** The monitor pass. */
   readonly monitor: MonitorSummary;
+  /** The compliance monitor pass. */
+  readonly compliance: ComplianceMonitorSummary;
+  /** The reconciliation run of this tick, or null when none was due (or it failed). */
+  readonly reconciliation: ReconciliationRunRecord | null;
   /** Components that threw this tick (each raised `component_failed`); the others still ran. */
-  readonly failed: readonly ('dispatch' | 'index' | 'monitor')[];
+  readonly failed: readonly TickComponent[];
 }
 
 const EMPTY_DISPATCH: DispatchSummary = Object.freeze({
@@ -186,8 +220,16 @@ const EMPTY_MONITOR: MonitorSummary = Object.freeze({
 export class BridgeEngine {
   /** Requests (reserve + enqueue). */
   readonly operations: OperationService;
+  /** Compliance requests (record + enqueue). */
+  readonly compliance: ComplianceService;
   /** The settlement outbox handler. */
   readonly submitter: SettlementSubmitter;
+  /** The compliance outbox handler. */
+  readonly complianceSubmitter: ComplianceSubmitter;
+  /** Decides on submitted and failed compliance changes. */
+  readonly complianceMonitor: ComplianceMonitor;
+  /** Compares the ledger with the chain at the final block. */
+  readonly reconciler: Reconciler;
   /** Claims outbox rows and runs the submitter. */
   readonly dispatcher: OutboxDispatcher;
   /** Decides on submitted and failed operations. */
@@ -205,6 +247,8 @@ export class BridgeEngine {
   private readonly redaction: SanitizeOptions;
   private readonly binding: DeploymentBinding;
   private readonly prisma: PrismaClient;
+  private readonly reconcileEveryTicks: number;
+  private ticks = 0;
 
   /**
    * @param deps Database, gateway, signer, clock, ids and alarm sink.
@@ -218,6 +262,17 @@ export class BridgeEngine {
     if (typeof config.feeCap !== 'bigint' || config.feeCap <= 0n) {
       throw new InvalidRequestError('feeCap must be a positive bigint');
     }
+    const level = config.transactions?.isolationLevel;
+    if (level !== undefined && level !== 'ReadCommitted') {
+      // Refused at construction rather than at the first nonce: a misconfigured worker must not
+      // start at all (review round 2 quick item).
+      throw new UnsafeIsolationError(`the engine runs at READ COMMITTED only, not ${level}`);
+    }
+    const reconcileEveryTicks = config.reconcileEveryTicks ?? DEFAULT_RECONCILE_EVERY_TICKS;
+    if (!Number.isSafeInteger(reconcileEveryTicks) || reconcileEveryTicks < 1) {
+      throw new InvalidRequestError('reconcileEveryTicks must be an integer >= 1');
+    }
+    this.reconcileEveryTicks = reconcileEveryTicks;
     const binding = bindingOf(deps.gateway);
     for (const [label, value] of [
       ['gateway token', binding.tokenAddress],
@@ -254,16 +309,34 @@ export class BridgeEngine {
       tokenAddress: binding.tokenAddress,
       transactions,
     });
+    this.compliance = new ComplianceService({
+      prisma: deps.prisma,
+      clock: deps.clock,
+      ids: deps.ids,
+      binding,
+      transactions,
+    });
+    const fees = {
+      marginBps: config.initialFeeMarginBps ?? 2_000,
+      feeCap: config.feeCap,
+      feeWaitMs: config.feeWaitMs ?? 60_000,
+    };
     this.submitter = new SettlementSubmitter({
       prisma: deps.prisma,
       gateway: deps.gateway,
       inspector: deps.inspector,
       clock: deps.clock,
-      fees: {
-        marginBps: config.initialFeeMarginBps ?? 2_000,
-        feeCap: config.feeCap,
-        feeWaitMs: config.feeWaitMs ?? 60_000,
-      },
+      fees,
+      transactions,
+      secrets,
+      alarms: this.alarms,
+    });
+    this.complianceSubmitter = new ComplianceSubmitter({
+      prisma: deps.prisma,
+      gateway: deps.gateway,
+      inspector: deps.inspector,
+      clock: deps.clock,
+      fees,
       transactions,
       secrets,
       alarms: this.alarms,
@@ -273,7 +346,10 @@ export class BridgeEngine {
       clock: deps.clock,
       ids: deps.ids,
       workerId: config.workerId,
-      handler: this.submitter,
+      handler: new SignerRouter({
+        settlement: this.submitter,
+        compliance: this.complianceSubmitter,
+      }),
       ...(config.batchSize !== undefined ? { batchSize: config.batchSize } : {}),
       ...(config.lockTimeoutMs !== undefined ? { lockTimeoutMs: config.lockTimeoutMs } : {}),
       ...(config.handlerTimeoutMs !== undefined
@@ -282,29 +358,47 @@ export class BridgeEngine {
       ...(config.backoff !== undefined ? { backoff: config.backoff } : {}),
       secrets,
     });
+    const policy = {
+      confirmationDepth: depth,
+      stuckAfterSeconds: config.stuckAfterSeconds ?? 120,
+      maxBumps: config.maxBumps ?? DEFAULT_MAX_BUMPS,
+      maxResubmits: config.maxResubmits ?? DEFAULT_MAX_RESUBMITS,
+      bumpFeeBps: config.bumpFeeBps ?? 1_250,
+      feeCap: config.feeCap,
+      initialFeeMarginBps: config.initialFeeMarginBps ?? 2_000,
+      headStallTicks: config.headStallTicks ?? 10,
+      dropRetrySeconds: config.dropRetrySeconds ?? DEFAULT_DROP_RETRY_SECONDS,
+      giveUpAfterSeconds: config.giveUpAfterSeconds ?? DEFAULT_GIVE_UP_AFTER_SECONDS,
+      failedAlarmAfterSeconds: config.failedAlarmAfterSeconds ?? DEFAULT_FAILED_ALARM_AFTER_SECONDS,
+      orphanAfterSeconds: config.orphanAfterSeconds ?? DEFAULT_ORPHAN_AFTER_SECONDS,
+      skipAlarmPasses: config.skipAlarmPasses ?? 10,
+    };
     this.monitor = new TxMonitor({
       prisma: deps.prisma,
       gateway: deps.gateway,
       inspector: deps.inspector,
       clock: deps.clock,
-      policy: {
-        confirmationDepth: depth,
-        stuckAfterSeconds: config.stuckAfterSeconds ?? 120,
-        maxBumps: config.maxBumps ?? DEFAULT_MAX_BUMPS,
-        maxResubmits: config.maxResubmits ?? DEFAULT_MAX_RESUBMITS,
-        bumpFeeBps: config.bumpFeeBps ?? 1_250,
-        feeCap: config.feeCap,
-        initialFeeMarginBps: config.initialFeeMarginBps ?? 2_000,
-        headStallTicks: config.headStallTicks ?? 10,
-        dropRetrySeconds: config.dropRetrySeconds ?? DEFAULT_DROP_RETRY_SECONDS,
-        giveUpAfterSeconds: config.giveUpAfterSeconds ?? DEFAULT_GIVE_UP_AFTER_SECONDS,
-        failedAlarmAfterSeconds:
-          config.failedAlarmAfterSeconds ?? DEFAULT_FAILED_ALARM_AFTER_SECONDS,
-        orphanAfterSeconds: config.orphanAfterSeconds ?? DEFAULT_ORPHAN_AFTER_SECONDS,
-        skipAlarmPasses: config.skipAlarmPasses ?? 10,
-      },
+      policy,
       alarms: this.alarms,
       transactions,
+      secrets,
+    });
+    this.complianceMonitor = new ComplianceMonitor({
+      prisma: deps.prisma,
+      gateway: deps.gateway,
+      inspector: deps.inspector,
+      clock: deps.clock,
+      policy,
+      alarms: this.alarms,
+      transactions,
+      secrets,
+    });
+    this.reconciler = new Reconciler({
+      prisma: deps.prisma,
+      gateway: deps.gateway,
+      clock: deps.clock,
+      policy: { confirmationDepth: depth },
+      alarms: this.alarms,
       secrets,
     });
     this.indexer = new Indexer({
@@ -349,18 +443,16 @@ export class BridgeEngine {
 
   /**
    * One pass: the deployment check, then one dispatcher pass, one indexer pass, one monitor pass,
+   * one compliance monitor pass and, every `reconcileEveryTicks` ticks, one reconciliation run,
    * in that order, each isolated from the others' failures.
    */
   async tick(): Promise<TickSummary> {
     await this.assertDeployment();
+    this.ticks += 1;
     // Each component is isolated (review L-2): an indexer that throws must not stop the monitor
     // from reversing or confirming, nor the dispatcher from sending.
-    const failed: ('dispatch' | 'index' | 'monitor')[] = [];
-    const guard = async <T>(
-      name: 'dispatch' | 'index' | 'monitor',
-      fn: () => Promise<T>,
-      empty: T,
-    ) => {
+    const failed: TickComponent[] = [];
+    const guard = async <T>(name: TickComponent, fn: () => Promise<T>, empty: T) => {
       try {
         return await fn();
       } catch (err) {
@@ -378,7 +470,16 @@ export class BridgeEngine {
       status: 'unknown',
     } as IndexerResult);
     const monitor = await guard('monitor', () => this.monitor.runOnce(), EMPTY_MONITOR);
-    return { dispatch, index, monitor, failed };
+    const compliance = await guard(
+      'compliance',
+      () => this.complianceMonitor.runOnce(),
+      EMPTY_COMPLIANCE_SUMMARY,
+    );
+    const due = this.ticks % this.reconcileEveryTicks === 0;
+    const reconciliation = due
+      ? await guard('reconcile', () => this.reconciler.runOnce(), null)
+      : null;
+    return { dispatch, index, monitor, compliance, reconciliation, failed };
   }
 
   /** Starts ticking every `pollIntervalMs` (never two ticks at once). Idempotent. */

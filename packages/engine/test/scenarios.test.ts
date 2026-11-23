@@ -15,6 +15,9 @@ import {
   InvalidRequestError,
   LeaseLostError,
   moveOperation,
+  OutboxDispatcher,
+  SettlementSubmitter,
+  UnsafeIsolationError,
 } from '../src';
 import { createTestDatabase, type TestDatabase } from './support/database';
 import { balanceOf, FakeClock, insertUser, RecordingIds, type TestUser } from './support/fixtures';
@@ -1387,13 +1390,45 @@ describe('review round 2, L-A: an operation skipped pass after pass is alarmed',
 });
 
 describe('review round 2, L-B: nonce allocation runs at READ COMMITTED only', () => {
-  it('an engine configured for REPEATABLE READ refuses to allocate a nonce (UnsafeIsolationError), nothing stored', async () => {
-    const rig = await makeRig(db.prisma, { transactions: { isolationLevel: 'RepeatableRead' } });
+  // Piece C quick item: the ENGINE now refuses a non-READ COMMITTED config at construction, so the
+  // inner guard (commitWithFreshNonce) is exercised through a submitter built directly; the
+  // property is unchanged: UnsafeIsolationError, nothing stored.
+  it('nonce allocation below the engine still refuses REPEATABLE READ (UnsafeIsolationError), nothing stored', async () => {
+    const rig = await makeRig(db.prisma);
     const alice = await verifiedUser(rig);
     const dep = await deposit(rig, alice, 3n);
-    await rig.engine.dispatcher.runOnce();
+    const submitter = new SettlementSubmitter({
+      prisma: db.prisma,
+      gateway: rig.chain,
+      inspector: new FakeTransactionInspector(rig.chain),
+      clock: rig.clock,
+      fees: { marginBps: 2_000, feeCap: 10n ** 12n, feeWaitMs: 1_000 },
+      transactions: { isolationLevel: 'RepeatableRead' },
+    });
+    const dispatcher = new OutboxDispatcher({
+      prisma: db.prisma,
+      clock: rig.clock,
+      ids: new RecordingIds(),
+      workerId: 'rr-worker',
+      handler: submitter,
+      lockTimeoutMs: 60_000,
+      handlerTimeoutMs: 20_000,
+    });
+    await dispatcher.runOnce();
     const row = await db.prisma.outboxMessage.findFirstOrThrow({ where: { operationId: dep.id } });
     expect(row.lastError).toContain('UnsafeIsolationError');
     expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(0);
+  });
+
+  it('the engine refuses any isolation level but READ COMMITTED at construction (UnsafeIsolationError)', async () => {
+    const rig = await makeRig(db.prisma);
+    for (const isolationLevel of ['RepeatableRead', 'Serializable'] as const) {
+      expect(() => rig.makeEngine({ transactions: { isolationLevel } })).toThrow(
+        UnsafeIsolationError,
+      );
+    }
+    expect(() =>
+      rig.makeEngine({ transactions: { isolationLevel: 'ReadCommitted' } }),
+    ).not.toThrow();
   });
 });

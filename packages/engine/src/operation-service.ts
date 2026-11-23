@@ -228,27 +228,46 @@ function accountsToLock(
 }
 
 /** The deployment fields a request binds to. */
-interface BoundDeployment {
+export interface BoundDeployment {
+  /** The deployment id. */
   readonly id: string;
+  /** Its chain id. */
   readonly chainId: bigint;
+  /** Its token (lowercase hex). */
   readonly tokenAddress: string;
+  /** Its compliance registry (lowercase hex). */
+  readonly registryAddress: string;
 }
 
 /**
  * The active deployment of `chainId`, locked FOR SHARE until the transaction ends, or null.
  * A plain read is not enough: the foreign key from operation only takes FOR KEY SHARE, which does
- * not conflict with an UPDATE of `active`.
+ * not conflict with an UPDATE of `active`. Shared by every writer of new work (operations and
+ * compliance changes), so a deactivation never commits alongside one (review M-1).
+ *
+ * @param tx The caller's transaction; the share lock is held until it ends.
+ * @param chainId The chain.
  */
-async function lockActiveDeployment(tx: Tx, chainId: bigint): Promise<BoundDeployment | null> {
-  const rows = await tx.$queryRaw<{ id: string; chain_id: bigint; token_address: string }[]>`
-    SELECT id::text AS id, chain_id, token_address
+export async function lockActiveDeployment(
+  tx: Tx,
+  chainId: bigint,
+): Promise<BoundDeployment | null> {
+  const rows = await tx.$queryRaw<
+    { id: string; chain_id: bigint; token_address: string; registry_address: string }[]
+  >`
+    SELECT id::text AS id, chain_id, token_address, registry_address
       FROM deployment
      WHERE chain_id = ${chainId} AND active
        FOR SHARE`;
   const row = rows[0];
   return row === undefined
     ? null
-    : { id: row.id, chainId: BigInt(row.chain_id), tokenAddress: row.token_address };
+    : {
+        id: row.id,
+        chainId: BigInt(row.chain_id),
+        tokenAddress: row.token_address,
+        registryAddress: row.registry_address,
+      };
 }
 
 /** Whether a stored operation is the same request as `op` (same type, parties and amount). */
