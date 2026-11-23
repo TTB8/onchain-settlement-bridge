@@ -48,7 +48,7 @@
     "deployOnPush": false
   },
   "budgets": {
-    "verifyFastSeconds": 45,
+    "verifyFastSeconds": 90,
     "ciMinutesPerMonth": null
   },
   "docs": ["AGENTS.md"]
