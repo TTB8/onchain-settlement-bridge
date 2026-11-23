@@ -41,6 +41,7 @@ describe('assessAttempt', () => {
     confirmations: 12,
     stuckAfterSeconds: 60,
     maxBumps: 3,
+    maxResubmits: 2,
     bumpFeeBps: 1250,
     feeCap: 10_000n,
   };
@@ -49,6 +50,7 @@ describe('assessAttempt', () => {
     fees: { maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n },
     submittedAt: T0,
     bumpsSoFar: 0,
+    resubmitsSoFar: 0,
   };
   const pending: AttemptObservation = {
     receipt: null,
@@ -170,6 +172,43 @@ describe('assessAttempt', () => {
   });
 
   describe('not mined', () => {
+    it('resubmits a drop one below the limit and gives up exactly at it', () => {
+      const forgotten = { ...pending, nodeKnowsTx: false };
+      expect(assessAttempt({ ...attempt, resubmitsSoFar: 1 }, forgotten, at(5), policy)).toEqual({
+        verdict: 'dropped',
+      });
+      expect(assessAttempt({ ...attempt, resubmitsSoFar: 2 }, forgotten, at(5), policy)).toEqual({
+        verdict: 'give_up',
+        why: 'max_resubmits',
+      });
+      expect(assessAttempt({ ...attempt, resubmitsSoFar: 9 }, forgotten, at(5), policy)).toEqual({
+        verdict: 'give_up',
+        why: 'max_resubmits',
+      });
+    });
+
+    it('maxResubmits 0 means a drop is never resubmitted', () => {
+      expect(
+        assessAttempt(attempt, { ...pending, nodeKnowsTx: false }, at(5), {
+          ...policy,
+          maxResubmits: 0,
+        }),
+      ).toEqual({ verdict: 'give_up', why: 'max_resubmits' });
+    });
+
+    it('the resubmit limit does not affect a pending or replaced attempt', () => {
+      const exhausted = { ...attempt, resubmitsSoFar: 2 };
+      expect(assessAttempt(exhausted, pending, at(5), policy)).toEqual({ verdict: 'wait' });
+      expect(
+        assessAttempt(
+          exhausted,
+          { ...pending, nodeKnowsTx: false, confirmedNonce: 6 },
+          at(5),
+          policy,
+        ),
+      ).toEqual({ verdict: 'replaced_or_lost' });
+    });
+
     it('dropped: the node forgot it and the nonce is still free', () => {
       expect(assessAttempt(attempt, { ...pending, nodeKnowsTx: false }, at(5), policy)).toEqual({
         verdict: 'dropped',
@@ -235,6 +274,26 @@ describe('assessAttempt', () => {
       [
         'negative confirmed nonce',
         () => assessAttempt(attempt, { ...pending, confirmedNonce: -1 }, at(1), policy),
+      ],
+      [
+        'negative resubmitsSoFar',
+        () => assessAttempt({ ...attempt, resubmitsSoFar: -1 }, pending, at(1), policy),
+      ],
+      [
+        'fractional resubmitsSoFar',
+        () => assessAttempt({ ...attempt, resubmitsSoFar: 1.5 }, pending, at(1), policy),
+      ],
+      [
+        'negative maxResubmits',
+        () => assessAttempt(attempt, pending, at(1), { ...policy, maxResubmits: -1 }),
+      ],
+      [
+        'missing maxResubmits',
+        () =>
+          assessAttempt(attempt, pending, at(1), {
+            ...policy,
+            maxResubmits: undefined as unknown as number,
+          }),
       ],
       [
         'negative maxBumps',

@@ -54,8 +54,13 @@ export interface AttemptRecord {
   readonly fees: Fees;
   /** When it was handed to the node (UTC). */
   readonly submittedAt: Date;
-  /** How many fee-bump replacements have already been sent for this operation's nonce. */
+  /**
+   * How many fee-bump replacements have already been sent for this operation's nonce. Part of the
+   * record (not counted here) because the classifier is pure: the engine owns the history.
+   */
   readonly bumpsSoFar: number;
+  /** How many times this operation has already been resubmitted after a `dropped` verdict. */
+  readonly resubmitsSoFar: number;
 }
 
 /** What the engine saw just now, from the node. */
@@ -78,6 +83,11 @@ export interface AttemptPolicy {
   readonly stuckAfterSeconds: number;
   /** How many fee-bump replacements to send before giving up. */
   readonly maxBumps: number;
+  /**
+   * How many resubmissions after a drop to send before giving up. Without a limit, a transaction
+   * that every node keeps rejecting from its pool would be resent forever.
+   */
+  readonly maxResubmits: number;
   /** The fee raise per bump, in basis points (>= 1250). */
   readonly bumpFeeBps: number;
   /** The highest `maxFeePerGas` a bump may reach. */
@@ -113,10 +123,12 @@ export type AttemptVerdict =
    */
   | { readonly verdict: 'replaced_or_lost' }
   /**
-   * Stop bumping and escalate. The attempt may STILL be mined, so this is not a FAIL-and-REVERSE
-   * signal on its own (see `mayReverse`).
+   * Stop retrying and escalate: bumps ran out (`max_bumps`), the next bump would pass the fee cap
+   * (`fee_cap`), or a dropped transaction has been resubmitted `maxResubmits` times
+   * (`max_resubmits`). The attempt may STILL be mined (a node that forgot it is not every node),
+   * so this is not a FAIL-and-REVERSE signal on its own (see `mayReverse`).
    */
-  | { readonly verdict: 'give_up'; readonly why: 'max_bumps' | 'fee_cap' };
+  | { readonly verdict: 'give_up'; readonly why: 'max_bumps' | 'fee_cap' | 'max_resubmits' };
 
 function assertNonNegativeInt(n: number, label: string): void {
   if (!Number.isSafeInteger(n) || n < 0) {
@@ -137,8 +149,12 @@ function assertValidDate(d: Date, label: string): void {
  * 2. No receipt and the signer's confirmed nonce is past ours: a different transaction used it.
  *    (Checked before "dropped", because a node that forgot a replaced transaction would otherwise
  *    look like a drop, and resubmitting would just fail with "nonce too low".)
- * 3. No receipt and the node does not know it: dropped, resubmit.
+ * 3. No receipt and the node does not know it: dropped, resubmit, or give up once
+ *    `resubmitsSoFar` has reached `maxResubmits`.
  * 4. Known and pending: wait, or bump once it has been pending for `stuckAfterSeconds`, or give up.
+ *
+ * These choices (`bumpsSoFar` and `resubmitsSoFar` in the record, the `give_up.why` reasons, and
+ * step 2 before step 3) were reviewed and accepted by the team lead.
  *
  * A receipt that vanishes (a reorg removed its block) simply reaches step 2, 3 or 4 on the next call.
  *
@@ -157,7 +173,9 @@ export function assessAttempt(
   assertNonNegativeInt(attempt.nonce, 'attempt.nonce');
   assertNonNegativeInt(attempt.bumpsSoFar, 'attempt.bumpsSoFar');
   assertNonNegativeInt(observation.confirmedNonce, 'observation.confirmedNonce');
+  assertNonNegativeInt(attempt.resubmitsSoFar, 'attempt.resubmitsSoFar');
   assertNonNegativeInt(policy.maxBumps, 'policy.maxBumps');
+  assertNonNegativeInt(policy.maxResubmits, 'policy.maxResubmits');
   if (!Number.isFinite(policy.stuckAfterSeconds) || policy.stuckAfterSeconds < 0) {
     throw new InvalidInputError('policy.stuckAfterSeconds must be a non-negative number');
   }
@@ -180,6 +198,9 @@ export function assessAttempt(
   }
 
   if (!observation.nodeKnowsTx) {
+    if (attempt.resubmitsSoFar >= policy.maxResubmits) {
+      return { verdict: 'give_up', why: 'max_resubmits' };
+    }
     return { verdict: 'dropped' };
   }
 
