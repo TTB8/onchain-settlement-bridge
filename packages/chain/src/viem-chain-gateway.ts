@@ -61,6 +61,7 @@ import {
   type ChainGateway,
   type ComplianceStatus,
   type ContractCall,
+  type Deployment,
   type Fees,
   type Hex,
   type Receipt,
@@ -448,6 +449,11 @@ export class ViemChainGateway implements ChainGateway {
         throw error;
       }
     });
+  }
+
+  /** What this gateway was constructed with: the configured chain id, token and registry. */
+  deployment(): Deployment {
+    return { chainId: this.chainId, token: this.token, registry: this.registry };
   }
 
   signerAddress(signer: SignerName): Address {

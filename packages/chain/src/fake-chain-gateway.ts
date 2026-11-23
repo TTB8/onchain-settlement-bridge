@@ -47,6 +47,7 @@ import {
   type ChainGateway,
   type ComplianceStatus,
   type ContractCall,
+  type Deployment,
   type Fees,
   type Hex,
   type Receipt,
@@ -390,6 +391,11 @@ export class FakeChainGateway implements ChainGateway {
     this.ensureAvailable();
     const block = this.blockAt(number);
     return block ? { ...block.ref } : null;
+  }
+
+  /** The fake's own contracts and chain id. Local: it works while the fake is unavailable. */
+  deployment(): Deployment {
+    return { chainId: this.chainId, token: this.tokenAddress, registry: this.registryAddress };
   }
 
   signerAddress(signer: SignerName): Address {

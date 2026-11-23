@@ -66,6 +66,17 @@ export interface SubmitRequest {
 }
 
 /**
+ * The contracts a gateway reads and writes, and the chain they live on. Addresses are lowercase.
+ * An operation must stay bound to the `(chainId, token)` it was created for: reference flags are
+ * per contract, so following a redeployed token would lose the duplicate-reference guard.
+ */
+export interface Deployment {
+  chainId: number;
+  token: Address;
+  registry: Address;
+}
+
+/**
  * A transaction signed but not sent: the exact bytes to broadcast, and their hash
  * (`hash === keccak256(raw)`). The engine persists both BEFORE broadcasting, so after a crash it
  * can rebroadcast exactly the same bytes, and look the transaction up by hash.
@@ -162,6 +173,14 @@ export interface ChainGateway {
   /** The block with this number, or `null` if the chain has none (for example after a reorg). */
   getBlock(number: bigint): Promise<BlockRef | null>;
 
+  /**
+   * The deployment this gateway is bound to: the chain id it signs for and checks, and the token
+   * and registry it reads and writes (lowercase). Local: it never contacts the node and never
+   * changes for the life of the gateway. The engine compares it with the deployment an operation
+   * is bound to before it signs, sends or reads anything for that operation.
+   */
+  deployment(): Deployment;
+
   /** The address a signer sends from. Lowercase. */
   signerAddress(signer: SignerName): Address;
 
@@ -203,7 +222,8 @@ export interface ChainGateway {
    * Signs a transaction with the named signer's key and returns its bytes and hash, WITHOUT
    * sending it and without consuming anything: the nonce and fees are used exactly as given (no
    * nonce is allocated or reserved), and the node is not contacted, so it works during an outage.
-   * The same request always yields the same bytes and hash. Validates like `submit`: throws
+   * Stable: an identical request always yields byte-identical `raw` and the same `hash`, so
+   * re-signing after a crash reproduces what was persisted. Validates like `submit`: throws
    * `SubmissionRejectedError` for a call sent with the wrong signer or for arguments that cannot be
    * encoded, before signing.
    *
@@ -214,8 +234,9 @@ export interface ChainGateway {
 
   /**
    * Broadcasts exactly these signed bytes and returns their hash. Idempotent: bytes the node
-   * already knows (waiting in its pool, or already mined) return the hash successfully, so a
-   * rebroadcast after a crash or a timeout is always safe. Every other failure follows the same
+   * already knows (waiting in its pool, or already mined) return the hash successfully, so the
+   * SAME bytes can always be re-sent, any number of times, after a crash or a timeout. That is
+   * always safe, and it never creates a second transaction. Every other failure follows the same
    * fail-safe discipline as `submit`: `NonceTooLowError` (the nonce was used by OTHER bytes),
    * `ReplacementUnderpricedError`, `InsufficientFundsError`, `SubmissionRejectedError` (THIS node
    * refused; the attempt still counts until its nonce is final) or `ChainUnavailableError`

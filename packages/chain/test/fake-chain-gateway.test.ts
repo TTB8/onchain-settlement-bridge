@@ -1546,3 +1546,56 @@ describe('FakeChainGateway: signTransaction and sendRaw', () => {
     expect(await chain.sendRaw(raw)).toBe(hash);
   });
 });
+
+describe('FakeChainGateway: deployment()', () => {
+  it('reports its own contracts and chain id, lowercase, and never changes', () => {
+    const chain = new FakeChainGateway({
+      chainId: 5,
+      registryAddress: '0x00000000000000000000000000000000000000AA',
+      tokenAddress: '0x00000000000000000000000000000000000000BB',
+    });
+    expect(chain.deployment()).toEqual({
+      chainId: 5,
+      token: '0x00000000000000000000000000000000000000bb',
+      registry: '0x00000000000000000000000000000000000000aa',
+    });
+    // A copy: mutating it does not move the gateway.
+    const copy = chain.deployment();
+    copy.token = '0x00000000000000000000000000000000000000cc';
+    expect(chain.deployment().token).toBe('0x00000000000000000000000000000000000000bb');
+    // Defaults are distinct and lowercase; local, so it works while unavailable.
+    const plain = new FakeChainGateway();
+    plain.setUnavailable(true);
+    const d = plain.deployment();
+    expect(d.chainId).toBe(31337);
+    expect(d.token).toBe(plain.tokenAddress);
+    expect(d.registry).toBe(plain.registryAddress);
+    expect(d.token).not.toBe(d.registry);
+    expect(d.token).toMatch(/^0x[0-9a-f]{40}$/);
+  });
+});
+
+describe('FakeChainGateway: the same bytes can always be re-sent', () => {
+  it('in every state (pooled, mined, dropped, reorged out, reorged back in), any number of times', async () => {
+    const { chain } = setup({ automine: false });
+    const request = mintRequest(0);
+    const { hash, raw } = await chain.signTransaction(request);
+    const resend = async (times: number) => {
+      for (let i = 0; i < times; i += 1) expect(await chain.sendRaw(raw)).toBe(hash);
+      expect((await chain.signTransaction(request)).raw).toBe(raw); // stable for identical input
+    };
+    await resend(3); // pooled
+    expect(chain.mempoolSize()).toBe(1);
+    chain.mine();
+    await resend(3); // mined
+    chain.reorg({ depth: 1 }); // back in the pool
+    await resend(2);
+    expect(chain.mempoolSize()).toBe(1);
+    chain.dropTransaction(hash);
+    await resend(2); // dropped, then re-added by the first resend
+    chain.mine();
+    expect(await chain.getReceipt(hash)).not.toBeNull();
+    expect(chain.totalSupply()).toBe(0n); // alice unverified: reverted, and only ONE transaction
+    expect(await chain.getNonce('settlement')).toEqual({ confirmed: 1, pending: 1 });
+  });
+});

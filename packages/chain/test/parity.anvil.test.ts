@@ -706,6 +706,7 @@ async function runScenarios(rig: Rig) {
     sameBlock,
     signedRaw,
     rawLooksEip1559,
+    deployment: gw.deployment(),
     referenceFlags: await referenceFlags(),
     referenceFlagsAtCheckpoint: await referenceFlags(checkpoint),
     noncesAtCheckpoint: {
@@ -916,6 +917,11 @@ describe('parity: fake vs viem gateway on anvil', () => {
       wrongChain: 'SubmissionRejectedError',
       outage: { signedWhileDown: true, send: 'ChainUnavailableError' },
     });
+  });
+
+  it('deployment() is the same contracts and chain id on both', () => {
+    expect(fakeResult.deployment).toEqual(anvilResult.deployment);
+    expect(anvilResult.deployment.chainId).toBe(31337);
   });
 
   it('KNOWN DIFFERENCE: the fake signs no real transaction, so its bytes and hashes differ', () => {

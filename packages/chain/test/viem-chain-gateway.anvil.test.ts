@@ -939,3 +939,45 @@ describe('ViemChainGateway on anvil: signTransaction and sendRaw', () => {
     await expect(dead.sendRaw(signed.raw)).rejects.toBeInstanceOf(ChainUnavailableError);
   });
 });
+
+describe('ViemChainGateway: deployment()', () => {
+  it('returns what it was constructed with, lowercase, without contacting the node', async () => {
+    const mixed = (a: string) => `0x${a.slice(2).toUpperCase()}` as `0x${string}`;
+    const dead = new ViemChainGateway({
+      rpcUrl: `http://127.0.0.1:${await freePort()}`,
+      chainId: 31337,
+      registryAddress: mixed(deployment.registry),
+      tokenAddress: mixed(deployment.token),
+      signers: { settlement: devAccount(1), compliance: devAccount(2) },
+    });
+    expect(dead.deployment()).toEqual({
+      chainId: 31337,
+      token: deployment.token,
+      registry: deployment.registry,
+    });
+    const copy = dead.deployment();
+    copy.chainId = 1;
+    expect(dead.deployment().chainId).toBe(31337);
+    expect(gw.deployment()).toEqual({
+      chainId: 31337,
+      token: deployment.token,
+      registry: deployment.registry,
+    });
+    // The configured chain id is what it reports, even when the node disagrees.
+    expect(gatewayFor(node, deployment, { chainId: 1 }).deployment().chainId).toBe(1);
+  });
+
+  it('the token it reports is the one it writes to: events come from that address', async () => {
+    const hash = await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
+    const receipt = await node.client.getTransactionReceipt({ hash });
+    expect(receipt.to?.toLowerCase()).toBe(gw.deployment().token);
+    const registryHash = await sendOk({
+      kind: 'setFrozen',
+      account: carol,
+      frozen: false,
+      ref: nextRef(),
+    });
+    const registryReceipt = await node.client.getTransactionReceipt({ hash: registryHash });
+    expect(registryReceipt.to?.toLowerCase()).toBe(gw.deployment().registry);
+  });
+});
