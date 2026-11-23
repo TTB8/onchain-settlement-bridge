@@ -106,8 +106,16 @@ write.
      `now + baseMs`; a row older than `maxWaitAgeMs` (since creation) is dead-lettered with an
      audit row instead of waiting again;
    - `{ failed: code, detail? }`: dead + audit row;
-   - a thrown error, a timeout, an Invalid Date or an unknown outcome is an UNKNOWN outcome
-     (ADR 0009): retried after `baseMs * 2^(attempts-1)` capped at `maxMs`, dead at `maxAttempts`.
+   - a thrown error, an Invalid Date or an unknown outcome is an UNKNOWN outcome (ADR 0009):
+     retried after `baseMs * 2^(attempts-1)` capped at `maxMs`, dead at `maxAttempts`;
+   - a **timeout** is unknown too, but the abort signal is only a request and the handler may
+     still be running. Releasing the row would let another worker claim it after `baseMs`, long
+     before the lease goes stale: two handlers on one row. So the row stays `processing` under
+     the same lease, only `last_error` is written (`timedOut` in the summary), and it comes back
+     solely through the stale-lease path `lockTimeoutMs` after its renewal (where the claim counts
+     the attempt and the reaper dead-letters it at the cap). Waiting for the handler to settle
+     instead was rejected: a hung handler never settles. A handler still running after that is
+     fenced by `stillHolds()`.
 6. **Finish** fenced by the lease token: a worker whose lease was taken over changes nothing.
 
 Every error text written to `outbox_message.last_error` and to audit notes is
@@ -163,7 +171,7 @@ pnpm --filter @bridge/engine test:cov    # with thresholds (90% statements/lines
 | Outbox cancelled on FAIL-before-send / REVERSE | move-operation: "FAIL records the reason ...", "a FAIL after sending leaves the outbox row alone ...", "a processing (claimed) outbox row is cancelled too ..." |
 | SKIP LOCKED, no double processing         | outbox-dispatcher: "skips a row another transaction has locked ...", "two dispatchers racing ..."         |
 | No transaction across the handler         | outbox-dispatcher: "claims due rows, commits the claim before the handler runs ..."                        |
-| Per-row renewal, stillHolds, timeout      | outbox-dispatcher: "leases are renewed per row and re-checkable (review M-2)" (4 tests)                    |
+| Per-row renewal, stillHolds, timeout      | outbox-dispatcher: "leases are renewed per row and re-checkable (review M-2)" (5 tests, incl. "a timed-out handler keeps the row ...") |
 | Backoff, cap, unknown outcome = retry     | outbox-dispatcher: "doubles from baseMs ...", "a thrown error is a retry ... then dead at the cap"         |
 | Redacted, bounded last_error              | outbox-dispatcher: "error text is recorded redacted and bounded"; units: "sanitizeText / describeError"   |
 | Bounded waits                             | outbox-dispatcher: "deliberate waits are bounded (review L-3)"                                             |
