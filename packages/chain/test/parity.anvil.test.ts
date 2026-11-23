@@ -6,7 +6,7 @@
  * submission. This is what makes the fake trustworthy for every other package's tests.
  */
 
-import { parseGwei, toHex } from 'viem';
+import { keccak256, parseGwei, toHex } from 'viem';
 
 import {
   FakeChainGateway,
@@ -21,6 +21,7 @@ import {
 } from '../src';
 import {
   deployBridge,
+  freePort,
   gatewayFor,
   holderTransferOnChain,
   setHolderTransfersOnChain,
@@ -51,6 +52,10 @@ interface Rig {
   approve(owner: Holder, spender: Address, amount: bigint): Promise<TxHash>;
   transferFrom(spender: Holder, from: Address, to: Address, amount: bigint): Promise<TxHash>;
   setAutomine(on: boolean): Promise<void>;
+  /** A gateway with the same signers configured for chain id 1, to sign foreign-chain bytes. */
+  foreign: ChainGateway;
+  /** Runs `fn` against this chain's gateway while the node cannot be reached. */
+  outage<T>(fn: (gateway: ChainGateway) => Promise<T>): Promise<T>;
   mine(): Promise<void>;
 }
 
@@ -589,6 +594,75 @@ async function runScenarios(rig: Rig) {
       ).length === 1, // only VerificationSet: the mint emitted nothing
   };
 
+  // signTransaction and sendRaw: the persist-before-broadcast pair.
+  const errName = (p: Promise<unknown>) =>
+    p.then(
+      () => 'ok',
+      (e: unknown) => (e as Error).constructor.name,
+    );
+  const mintReq = (nonce: number, r: number): SubmitRequest => ({
+    signer: 'settlement',
+    call: { kind: 'mint', to: at('bob'), amount: ONE, ref: R(15, r) },
+    nonce,
+    fees: FEES,
+  });
+  const p0 = (await gw.getNonce('settlement')).pending;
+  const s1 = await gw.signTransaction(mintReq(p0, 1));
+  const s1again = await gw.signTransaction(mintReq(p0, 1));
+  const afterSign = await gw.getNonce('settlement');
+  const knownBeforeSend = (await gw.getTransaction(s1.hash)) !== null;
+  const sentHash = await gw.sendRaw(s1.raw);
+  stepOf.set(s1.hash, ++stepIndex);
+  const s1Receipt = await waitForReceipt(gw, s1.hash);
+  const s1Events = (
+    await gw.getEvents({ fromBlock: s1Receipt.blockNumber, toBlock: s1Receipt.blockNumber })
+  )
+    .filter((e) => e.txHash === s1.hash)
+    .map((e) => strip(e, stepOf));
+  const rebroadcastMined = (await gw.sendRaw(s1.raw)) === s1.hash;
+  const otherBytesUsedNonce = await errName(
+    gw.sendRaw((await gw.signTransaction(mintReq(p0, 2))).raw),
+  );
+  await rig.setAutomine(false);
+  const pn = (await gw.getNonce('settlement')).pending;
+  const pooledA = await gw.signTransaction(mintReq(pn, 3));
+  await gw.sendRaw(pooledA.raw);
+  const rebroadcastPooled = (await gw.sendRaw(pooledA.raw)) === pooledA.hash;
+  const sameFeeReplacement = await errName(
+    gw.sendRaw((await gw.signTransaction(mintReq(pn, 4))).raw),
+  );
+  await rig.mine();
+  await rig.setAutomine(true);
+  stepOf.set(pooledA.hash, ++stepIndex);
+  const pooledStatus2 = (await waitForReceipt(gw, pooledA.hash)).status;
+  const nextNonce = (await gw.getNonce('settlement')).pending;
+  const foreignRaw = (await rig.foreign.signTransaction(mintReq(nextNonce, 5))).raw;
+  const signedRaw = {
+    deterministic: s1.hash === s1again.hash && s1.raw === s1again.raw,
+    hashIsKeccak: s1.hash === keccak256(s1.raw),
+    signConsumedNothing: afterSign.pending === p0 && afterSign.confirmed <= p0,
+    knownBeforeSend,
+    sendReturnsHash: sentHash === s1.hash,
+    status: s1Receipt.status,
+    events: s1Events,
+    rebroadcastMined,
+    otherBytesUsedNonce,
+    rebroadcastPooled,
+    sameFeeReplacement,
+    pooledStatus: pooledStatus2,
+    garbage: await errName(gw.sendRaw('0x1234')),
+    empty: await errName(gw.sendRaw('0x')),
+    wrongChain: await errName(gw.sendRaw(foreignRaw)),
+    outage: await rig.outage(async (g) => {
+      const signed = await g.signTransaction(mintReq(nextNonce, 6));
+      return {
+        signedWhileDown: signed.hash === keccak256(signed.raw),
+        send: await errName(g.sendRaw(signed.raw)),
+      };
+    }),
+  };
+  const rawLooksEip1559 = s1.raw.startsWith('0x02');
+
   const refs = [
     ZERO_REF,
     ...new Set(
@@ -600,6 +674,10 @@ async function runScenarios(rig: Rig) {
     R(10, 2),
     R(14, 1),
     R(14, 2),
+    R(15, 1),
+    R(15, 2),
+    R(15, 3),
+    R(15, 4),
   ];
   const referenceFlags = async (at?: bigint) =>
     Promise.all(
@@ -626,6 +704,8 @@ async function runScenarios(rig: Rig) {
     supplyAtCheckpoint: await gw.readTotalSupply(checkpoint),
     complianceAtCheckpoint: await Promise.all(holders.map((h) => gw.readCompliance(h, checkpoint))),
     sameBlock,
+    signedRaw,
+    rawLooksEip1559,
     referenceFlags: await referenceFlags(),
     referenceFlagsAtCheckpoint: await referenceFlags(checkpoint),
     noncesAtCheckpoint: {
@@ -671,6 +751,14 @@ beforeAll(async () => {
     mine: async () => {
       await node.rpc('anvil_mine', [toHex(1)]);
     },
+    foreign: gatewayFor(node, deployment, { chainId: 1 }),
+    outage: async (fn) =>
+      fn(
+        gatewayFor(node, deployment, {
+          rpcUrl: `http://127.0.0.1:${await freePort()}`,
+          timeoutMs: 2_000,
+        }),
+      ),
   };
 
   const fake = new FakeChainGateway({
@@ -690,6 +778,20 @@ beforeAll(async () => {
     setAutomine: async (on) => fake.setAutomine(on),
     mine: async () => {
       fake.mine();
+    },
+    foreign: new FakeChainGateway({
+      chainId: 1,
+      registryAddress: deployment.registry,
+      tokenAddress: deployment.token,
+      signers: { settlement: devAddress('settlement'), compliance: devAddress('compliance') },
+    }),
+    outage: async (fn) => {
+      fake.setUnavailable(true);
+      try {
+        return await fn(fake);
+      } finally {
+        fake.setUnavailable(false);
+      }
     },
   };
 
@@ -792,6 +894,35 @@ describe('parity: fake vs viem gateway on anvil', () => {
     expect(fakeResult.noncesAtCheckpoint).toEqual(anvilResult.noncesAtCheckpoint);
     expect(anvilResult.noncesAtCheckpoint.settlement.confirmed).toBe(3);
     expect(anvilResult.noncesAtCheckpoint.compliance.confirmed).toBe(4);
+  });
+
+  it('signTransaction and sendRaw behave the same: stable bytes, idempotent rebroadcast, same errors', () => {
+    expect(fakeResult.signedRaw).toEqual(anvilResult.signedRaw);
+    expect(anvilResult.signedRaw).toEqual({
+      deterministic: true,
+      hashIsKeccak: true,
+      signConsumedNothing: true,
+      knownBeforeSend: false,
+      sendReturnsHash: true,
+      status: 'success',
+      events: expect.arrayContaining([expect.objectContaining({ kind: 'Minted' })]),
+      rebroadcastMined: true,
+      otherBytesUsedNonce: 'NonceTooLowError',
+      rebroadcastPooled: true,
+      sameFeeReplacement: 'ReplacementUnderpricedError',
+      pooledStatus: 'success',
+      garbage: 'SubmissionRejectedError',
+      empty: 'SubmissionRejectedError',
+      wrongChain: 'SubmissionRejectedError',
+      outage: { signedWhileDown: true, send: 'ChainUnavailableError' },
+    });
+  });
+
+  it('KNOWN DIFFERENCE: the fake signs no real transaction, so its bytes and hashes differ', () => {
+    // Behaviour is the same (above); the bytes are not. Anvil gets a real EIP-1559 transaction
+    // signed by the dev key; the fake has no keys and encodes the request canonically.
+    expect(anvilResult.rawLooksEip1559).toBe(true);
+    expect(fakeResult.rawLooksEip1559).toBe(false);
   });
 
   it('KNOWN DIFFERENCE: a revert caused by state a later transaction in the same block changed', () => {
