@@ -12,15 +12,15 @@ contract ComplianceRegistryTest is BridgeTest {
     // --- roles ---------------------------------------------------------------------------------
 
     function test_adminHoldsAdminRoleOnly() public view {
-        assertTrue(registry.hasRole(DEFAULT_ADMIN_ROLE, admin));
-        assertFalse(registry.hasRole(COMPLIANCE_ROLE, admin));
+        assertTrue(registry.hasRole(defaultAdminRole, admin));
+        assertFalse(registry.hasRole(complianceRole, admin));
     }
 
     function test_onlyComplianceRoleCanVerify() public {
         bytes32 ref = _nextRef();
         vm.expectRevert(
             abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector, mallory, COMPLIANCE_ROLE
+                IAccessControl.AccessControlUnauthorizedAccount.selector, mallory, complianceRole
             )
         );
         vm.prank(mallory);
@@ -31,7 +31,7 @@ contract ComplianceRegistryTest is BridgeTest {
         bytes32 ref = _nextRef();
         vm.expectRevert(
             abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector, admin, COMPLIANCE_ROLE
+                IAccessControl.AccessControlUnauthorizedAccount.selector, admin, complianceRole
             )
         );
         vm.prank(admin);
@@ -40,14 +40,12 @@ contract ComplianceRegistryTest is BridgeTest {
 
     function test_adminCanRevokeComplianceRole() public {
         vm.prank(admin);
-        registry.revokeRole(COMPLIANCE_ROLE, compliance);
+        registry.revokeRole(complianceRole, compliance);
 
         bytes32 ref = _nextRef();
         vm.expectRevert(
             abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector,
-                compliance,
-                COMPLIANCE_ROLE
+                IAccessControl.AccessControlUnauthorizedAccount.selector, compliance, complianceRole
             )
         );
         vm.prank(compliance);
@@ -57,13 +55,11 @@ contract ComplianceRegistryTest is BridgeTest {
     function test_nonAdminCannotGrantRoles() public {
         vm.expectRevert(
             abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector,
-                mallory,
-                DEFAULT_ADMIN_ROLE
+                IAccessControl.AccessControlUnauthorizedAccount.selector, mallory, defaultAdminRole
             )
         );
         vm.prank(mallory);
-        registry.grantRole(COMPLIANCE_ROLE, mallory);
+        registry.grantRole(complianceRole, mallory);
     }
 
     // --- verification --------------------------------------------------------------------------

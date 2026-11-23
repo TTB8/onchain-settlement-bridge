@@ -22,11 +22,11 @@ abstract contract BridgeTest is Test {
     address internal mallory = makeAddr("mallory");
 
     // Role identifiers are read once, so a `vm.expectRevert` is never consumed by a getter call.
-    bytes32 internal COMPLIANCE_ROLE;
-    bytes32 internal MINTER_ROLE;
-    bytes32 internal SETTLER_ROLE;
-    bytes32 internal PAUSER_ROLE;
-    bytes32 internal DEFAULT_ADMIN_ROLE;
+    bytes32 internal complianceRole;
+    bytes32 internal minterRole;
+    bytes32 internal settlerRole;
+    bytes32 internal pauserRole;
+    bytes32 internal defaultAdminRole;
 
     uint256 internal refCounter;
 
@@ -34,15 +34,15 @@ abstract contract BridgeTest is Test {
         vm.startPrank(admin);
         registry = new ComplianceRegistry(admin);
         token = new SettlementToken("Settlement Token", "STK", registry, admin);
-        COMPLIANCE_ROLE = registry.COMPLIANCE_ROLE();
-        MINTER_ROLE = token.MINTER_ROLE();
-        SETTLER_ROLE = token.SETTLER_ROLE();
-        PAUSER_ROLE = token.PAUSER_ROLE();
-        DEFAULT_ADMIN_ROLE = registry.DEFAULT_ADMIN_ROLE();
-        registry.grantRole(COMPLIANCE_ROLE, compliance);
-        token.grantRole(MINTER_ROLE, minter);
-        token.grantRole(SETTLER_ROLE, settler);
-        token.grantRole(PAUSER_ROLE, pauser);
+        complianceRole = registry.COMPLIANCE_ROLE();
+        minterRole = token.MINTER_ROLE();
+        settlerRole = token.SETTLER_ROLE();
+        pauserRole = token.PAUSER_ROLE();
+        defaultAdminRole = registry.DEFAULT_ADMIN_ROLE();
+        registry.grantRole(complianceRole, compliance);
+        token.grantRole(minterRole, minter);
+        token.grantRole(settlerRole, settler);
+        token.grantRole(pauserRole, pauser);
         vm.stopPrank();
     }
 

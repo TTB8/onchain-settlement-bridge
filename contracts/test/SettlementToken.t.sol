@@ -45,10 +45,10 @@ contract SettlementTokenTest is BridgeTest {
     }
 
     function test_adminHoldsOnlyTheAdminRole() public view {
-        assertTrue(token.hasRole(DEFAULT_ADMIN_ROLE, admin));
-        assertFalse(token.hasRole(MINTER_ROLE, admin));
-        assertFalse(token.hasRole(SETTLER_ROLE, admin));
-        assertFalse(token.hasRole(PAUSER_ROLE, admin));
+        assertTrue(token.hasRole(defaultAdminRole, admin));
+        assertFalse(token.hasRole(minterRole, admin));
+        assertFalse(token.hasRole(settlerRole, admin));
+        assertFalse(token.hasRole(pauserRole, admin));
     }
 
     // --- mint ----------------------------------------------------------------------------------
@@ -69,7 +69,7 @@ contract SettlementTokenTest is BridgeTest {
 
     function test_mintRequiresMinterRole() public {
         bytes32 ref = _nextRef();
-        vm.expectRevert(_unauthorized(settler, MINTER_ROLE));
+        vm.expectRevert(_unauthorized(settler, minterRole));
         vm.prank(settler);
         token.mint(alice, ONE, ref);
     }
@@ -145,7 +145,7 @@ contract SettlementTokenTest is BridgeTest {
     function test_burnRequiresMinterRole() public {
         _mint(alice, ONE);
         bytes32 ref = _nextRef();
-        vm.expectRevert(_unauthorized(mallory, MINTER_ROLE));
+        vm.expectRevert(_unauthorized(mallory, minterRole));
         vm.prank(mallory);
         token.burn(alice, ONE, ref);
     }
@@ -240,7 +240,7 @@ contract SettlementTokenTest is BridgeTest {
     function test_settleTransferRequiresSettlerRole() public {
         _mint(alice, ONE);
         bytes32 ref = _nextRef();
-        vm.expectRevert(_unauthorized(minter, SETTLER_ROLE));
+        vm.expectRevert(_unauthorized(minter, settlerRole));
         vm.prank(minter);
         token.settleTransfer(alice, bob, ONE, ref);
     }
@@ -390,13 +390,13 @@ contract SettlementTokenTest is BridgeTest {
     }
 
     function test_pauseRequiresPauserRole() public {
-        vm.expectRevert(_unauthorized(minter, PAUSER_ROLE));
+        vm.expectRevert(_unauthorized(minter, pauserRole));
         vm.prank(minter);
         token.pause();
 
         vm.prank(pauser);
         token.pause();
-        vm.expectRevert(_unauthorized(admin, PAUSER_ROLE));
+        vm.expectRevert(_unauthorized(admin, pauserRole));
         vm.prank(admin);
         token.unpause();
     }

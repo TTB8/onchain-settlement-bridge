@@ -32,5 +32,11 @@ int_types = "long"
 quote_style = "double"
 number_underscore = "thousands"
 
+[lint]
+# Two rules are excluded because they only fire on test code, where they are intentional: tests call
+# token.transfer without reading the return value (they assert on balances), and tests and scripts
+# use cheatcodes by design. Every other rule stays on, for src as well.
+exclude_lints = ["erc20-unchecked-transfer", "unsafe-cheatcode"]
+
 [rpc_endpoints]
 anvil = "http://127.0.0.1:8545"
