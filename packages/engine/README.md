@@ -367,28 +367,54 @@ anything was signed is FAILed `rejected` after `orphanAfterSeconds`.
 `Reconciler.runOnce()` / `reconcileNow()` (the admin entry point; returns the persisted run with
 its mismatches) and `latestRuns(limit)`:
 
-1. DB snapshot in one short read-only REPEATABLE READ transaction (operations, ledger balances
-   with `readBalances` (available + held per user), compliance changes, indexed events, the
-   indexer cursor). No node call inside.
-2. Head from the node, then `finalBlock = head - depth + 1` (checklist 15).
-3. All node reads at `finalBlock`: the canonical hash of every block that holds an indexed event
+1. Chain id and head from the node, then `finalBlock = head - depth + 1` (checklist 15).
+2. DB snapshot in one short read-only REPEATABLE READ transaction: operations, ledger balances
+   with `readBalances` (available + held per user), compliance changes with `decision_seq`,
+   indexed events, the indexer cursor, the indexed hash AT `finalBlock` (the anchor), and whether
+   a ledger user has operations on another deployment. No node call inside.
+3. Anchor (review L-1): the node's hash at `finalBlock` must equal the indexed one.
+4. All node reads at `finalBlock`: the canonical hash of every block that holds an indexed event
    up to `finalBlock`; balances for exactly the ledger addresses plus both sides of every indexed
    `Transfer`, and the supply; registry flags for that set plus every account a registry event or
    a known change touched (checklist 16).
-4. Expected flags: `deriveExpectedCompliance` applies final canonical registry events in (block,
-   log index) order, only those matching a known change, then lets the latest CONFIRMED decision
-   per account and flag win where it disagrees (a late-landing old change becomes a
-   `compliance_mismatch`). Never the database's confirmation order (checklist 13).
-5. Domain `reconcile`, then one transaction: `reconciliation_run`, one `reconciliation_mismatch`
-   row per mismatch, an audit row; then one alarm per kind (`reconciliation_<kind>`).
+5. Expected flags (`deriveExpectedCompliance`, checklist 13, review M-1): per account and flag,
+   the latest APPLIED decision by `decision_seq`. Applied = `confirmed`, or matched by a final
+   canonical registry event (the monitor may simply not have caught up). The filter comes BEFORE
+   the choice: a newer failed or in-flight decision never hides an older applied one. The
+   registry already holds the chain-ordered result (what is observed), so an old decision landing
+   after a newer one becomes a `compliance_mismatch`. Never the database's confirmation order,
+   never the app clock (`decision_seq` is assigned by the database at insert).
+6. Domain `reconcile`, then one transaction: `reconciliation_run`, one `reconciliation_mismatch`
+   row per mismatch, an audit row; then one alarm per kind (`reconciliation_<kind>`). A failing
+   alarm sink after the commit is recorded as an audit row (`alarm_failed`), never as a second run.
 
-Unknown, never clean: a read error, an index behind `finalBlock`, a ledger behind the chain (an
-in-flight operation whose settling event is already final), a node missing a block, or input the
-domain refuses: an `unknown` run with the redacted reason and `reconciliation_unknown`.
-`BridgeEngine.tick()` runs it every `reconcileEveryTicks` ticks (default 10), after the monitors.
+Unknown, never clean: a read error, an index behind `finalBlock`, an anchor mismatch, a ledger
+behind the chain (an in-flight operation whose settling event is already final), a node missing a
+block, a ledger user with operations on another deployment (`multi_deployment_user`), or input
+the domain refuses (for example a confirmation newer than this run's final block): an `unknown`
+run with the redacted reason and `reconciliation_unknown`. `BridgeEngine.tick()` runs it every
+`reconcileEveryTicks` ticks (default 10), after the monitors.
 
-**Deviation (documented):** canonical hashes are read for every block that holds an indexed event
-up to `finalBlock` (all the domain needs), not for every block since the deployment block.
+**Deviation (documented):** besides the anchor, canonical hashes are read for every block that
+holds an indexed event up to `finalBlock` (all the domain needs), not for every block since the
+deployment block.
+
+### Known limits and rules for callers
+
+- **Ledger balances are per user, not per deployment.** Until accounts become per deployment, a
+  run is `unknown` (`multi_deployment_user`) when a ledger user of the bound deployment also has
+  operations on another one: the expected balances would mix in that deployment's money.
+- **`app_user.verified` / `app_user.frozen` are a NON-AUTHORITATIVE cache.** The engine never
+  writes them and nothing may decide on them. The API must read the confirmed compliance changes
+  (latest by `decision_seq`) or the registry at a final block.
+- **Compliance alarms.** `compliance_pending` (a change still requested / submitted after
+  `compliancePendingAlarmSeconds`, default 15 min) lists freezes first: page on a pending FREEZE
+  before anything else, it is the change that stops a sanctioned account from moving funds.
+  `compliance_out_of_order` (an applied change landed out of decision order) always needs a
+  person: the registry holds the older decision's value.
+- **Failed compliance changes** are re-examined only within `complianceFailedLookbackSeconds`
+  (default 7 days) of their last update, or while an indexed event carries their reference (the
+  only thing that can late-confirm one or show a conflict).
 
 ### Quick items from the piece B review
 
@@ -444,7 +470,8 @@ pnpm --filter @bridge/engine test:cov    # with thresholds (90% statements/lines
 | C / 1-4: unknown, rejected                | compliance: "unknown outcome, then mined ...", "unknown outcome and NOT taken ...", "rejected by our node but mined elsewhere ..." |
 | C / 8, 9, 12: event-only confirmation     | compliance: "a stale event from an orphaned block never confirms ...", "... under ANOTHER reference never confirms ...", "a front-run under OUR reference ..."; compliance-paths: "a final successful receipt without an indexed event is NOT a confirmation ..." |
 | C / attempt paths, orphans, refusals      | compliance-paths: 11 monitor tests, "ComplianceSubmitter refusals", "moveComplianceChange: ...", "SignerRouter" |
-| 13: expected flags from chain order       | reconciler: "deriveExpectedCompliance" (3), "the bridge's latest confirmed decision disagrees ..."         |
+| 13: expected flags, decision order (M-1)  | reconciler: "deriveExpectedCompliance" (6, incl. "Patrick's PoC ..."), "review M-1: ..." (3, Patrick's scenario end to end with failed and in-flight F3), "the bridge's latest confirmed decision disagrees ..." |
+| C review L-1..L-3, run integrity          | reconciler: "review L-1: an index on another fork AT the final block ...", "a ledger user with operations on another deployment ...", "a failing alarm sink after the commit ..."; compliance-paths: "compliance_pending ...", "a failed change is re-examined only within the look-back ..." |
 | 15: final block, node hashes              | reconciler: "a reorg of NOT-final blocks leaves the run stable ...", "a stale index ...: stale_block from the NODE hashes ..." |
 | 16: exact address set                     | reconciler: "a rogue transfer to an OUTSIDER: its balance is read because it appears in a Transfer"         |
 | C / every mismatch kind, persisted, alarmed | reconciler: "a rogue holder transfer ...", "a rogue registry freeze ...", "a rogue mint ...", "a confirmation the chain never made ...", "... at another block ..." |

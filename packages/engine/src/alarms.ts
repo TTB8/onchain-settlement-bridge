@@ -53,6 +53,13 @@ export type AlarmKind =
    * consumed with no matching event. Never confirmed automatically; a person decides.
    */
   | 'compliance_escalation'
+  /**
+   * A compliance change was applied out of decision order with another confirmed change for the
+   * same account and flag: the registry holds the OLDER decision's value. A person decides.
+   */
+  | 'compliance_out_of_order'
+  /** A compliance change is still requested / submitted after the configured time. */
+  | 'compliance_pending'
   /** A reconciliation run could not compare (a read failed, the index is behind, bad input). */
   | 'reconciliation_unknown'
   /** Reconciliation: the ledger settled an operation the chain shows no event for. */

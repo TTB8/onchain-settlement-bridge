@@ -346,6 +346,68 @@ describe('attempt paths of the compliance monitor', () => {
   });
 });
 
+describe('review L-2 / L-3: pending alarm and the failed look-back', () => {
+  it('compliance_pending after the configured time, freezes listed first', async () => {
+    const rig = await makeRig(
+      db.prisma,
+      { compliancePendingAlarmSeconds: 600 },
+      { automine: false },
+    );
+    rig.chain.mine();
+    const allow = (
+      await rig.engine.compliance.requestAllow({
+        address: (await insertUser(db.prisma)).wallet,
+        reason: 'kyc',
+        idempotencyKey: randomUUID(),
+        requestedBy: 'ops',
+      })
+    ).change;
+    const f = await freeze(rig, await insertUser(db.prisma));
+    await rig.engine.tick(); // both pooled, never mined
+    expect(rig.alarms.ofKind('compliance_pending')).toHaveLength(0);
+    rig.clock.advance(601_000);
+    await rig.engine.complianceMonitor.runOnce();
+    const pending = rig.alarms.ofKind('compliance_pending');
+    expect(pending.map((a) => a.complianceChangeId)).toEqual([f.id, allow.id]);
+    expect(pending[0]?.detail).toMatch(/FREEZE: page first/);
+  });
+
+  it('a failed change is re-examined only within the look-back, or when an indexed event carries its reference', async () => {
+    const rig = await makeRig(
+      db.prisma,
+      { complianceFailedLookbackSeconds: 3_600 },
+      { automine: false },
+    );
+    const u = await insertUser(db.prisma);
+    rig.chain.mine();
+    const change = await freeze(rig, u);
+    await rig.engine.tick(); // pooled
+    const c = await changeRow(change.id);
+    await db.prisma.complianceChange.update({
+      where: { id: change.id },
+      data: { status: 'failed', failureReason: 'retries_exhausted', version: c.version + 1 },
+    });
+    const getReceipt = rig.chain.getReceipt.bind(rig.chain);
+    let reads = 0;
+    rig.chain.getReceipt = async (h) => {
+      reads += 1;
+      return getReceipt(h);
+    };
+    await rig.engine.complianceMonitor.runOnce();
+    expect(reads).toBeGreaterThan(0); // within the look-back: looked at
+    rig.clock.advance(3_601_000);
+    reads = 0;
+    await rig.engine.complianceMonitor.runOnce();
+    expect(reads).toBe(0); // past it, nothing on chain: history
+    rig.chain.mine(); // the pooled attempt lands after all
+    await rig.engine.indexer.runOnce();
+    const late = await rig.engine.complianceMonitor.runOnce();
+    rig.chain.getReceipt = getReceipt;
+    expect(late.lateConfirmed).toBe(1); // an event carries its reference: back in view
+    expect((await changeRow(change.id)).status).toBe('confirmed');
+  });
+});
+
 describe('ComplianceSubmitter refusals', () => {
   it('refuses a non-compliance row, a call that is not the change, an undecodable call; waits on a signer mismatch or the fee cap', async () => {
     const rig = await makeRig(db.prisma);

@@ -147,6 +147,16 @@ export interface BridgeEngineConfig {
   /** Ticks between reconciliation runs (>= 1). Default `DEFAULT_RECONCILE_EVERY_TICKS`. */
   readonly reconcileEveryTicks?: number;
   /**
+   * Seconds a compliance change may stay requested / submitted before `compliance_pending`
+   * (freezes are listed first). Default `DEFAULT_COMPLIANCE_PENDING_ALARM_SECONDS` (15 min).
+   */
+  readonly compliancePendingAlarmSeconds?: number;
+  /**
+   * Look-back for re-examining FAILED compliance changes without a new event. Default
+   * `DEFAULT_COMPLIANCE_FAILED_LOOKBACK_SECONDS` (7 days).
+   */
+  readonly complianceFailedLookbackSeconds?: number;
+  /**
    * Literal secrets (the RPC URL, its API key, its host) removed from every error text the engine
    * writes (outbox `last_error`, audit notes, alarms). The gateway scrubs its own errors too; this
    * is the second layer.
@@ -392,6 +402,12 @@ export class BridgeEngine {
       alarms: this.alarms,
       transactions,
       secrets,
+      ...(config.compliancePendingAlarmSeconds !== undefined
+        ? { pendingAlarmAfterSeconds: config.compliancePendingAlarmSeconds }
+        : {}),
+      ...(config.complianceFailedLookbackSeconds !== undefined
+        ? { failedLookbackSeconds: config.complianceFailedLookbackSeconds }
+        : {}),
     });
     this.reconciler = new Reconciler({
       prisma: deps.prisma,

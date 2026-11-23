@@ -5,39 +5,42 @@
  *
  * A run (`runOnce` / `reconcileNow`), never holding a transaction across a node read:
  *
- * 1. DB snapshot, in one short read-only REPEATABLE READ transaction (so every table is read at
+ * 1. Chain id and head from the NODE, then `finalBlock = max(0, head - depth + 1)`
+ *    (checklist 15).
+ * 2. DB snapshot, in one short read-only REPEATABLE READ transaction (so every table is read at
  *    one instant): every operation of the bound deployment with its parties' wallets, those users'
  *    ledger balances (`readBalances`: available + held is what the chain must hold for them),
- *    every compliance change with its account, the indexed events, and the indexer's cursor.
- * 2. Head from the NODE, then `finalBlock = max(0, head - depth + 1)` (checklist 15). Taken after
- *    the snapshot, so every ledger confirmation in it is at or below this final block.
- * 3. Node reads, ALL at `finalBlock` (never the head): the canonical hash of every block that
+ *    every compliance change with its account and `decision_seq`, the indexed events, the
+ *    indexer's cursor, the indexer's hash AT `finalBlock` (the anchor), and whether a ledger user
+ *    also has operations on another deployment.
+ * 3. Anchor (review L-1): the node's hash at `finalBlock` must equal the indexed one, else the
+ *    index is on another fork at or below the final block.
+ * 4. Node reads, ALL at `finalBlock` (never the head): the canonical hash of every block that
  *    holds an indexed event up to `finalBlock` (from the node, never from `indexed_block`:
  *    checklist 15); balances of EXACTLY the relevant set (every ledger address, plus both sides of
  *    every indexed `Transfer`: checklist 16) and the total supply; registry flags for that set plus
  *    every account a registry event or a known change touched (checklist 16).
- * 4. Expected flags from FINAL canonical registry events in (block, log index) order, applying
- *    only events that match a known change exactly, cross-checked with the bridge's latest
- *    decision per account and flag (checklist 13; `deriveExpectedCompliance`). Never from the
- *    order in which the database confirmed changes.
- * 5. `reconcile` from `@bridge/domain`, then ONE transaction: the run, one row per mismatch, an
- *    audit row. Then one alarm per mismatch kind present (`reconciliation_<kind>`).
+ * 5. Expected flags: per account and flag, the latest APPLIED decision by `decision_seq`
+ *    (`deriveExpectedCompliance`, checklist 13, review M-1). Never the database's confirmation
+ *    order, never the app clock.
+ * 6. `reconcile` from `@bridge/domain`, then ONE transaction: the run, one row per mismatch, an
+ *    audit row. Then one alarm per mismatch kind present (`reconciliation_<kind>`); a failing
+ *    alarm sink is recorded as an audit row, never as a second run.
  *
- * UNKNOWN, never clean: any read error, an index behind the final block, a ledger behind the
- * chain (an in-flight operation whose settling event is already final: the monitor has not caught
- * up, so the balances would disagree for a reason that is not a finding), or inputs the domain
- * refuses, record an `unknown` run with the redacted reason and raise `reconciliation_unknown`.
+ * UNKNOWN, never clean: any read error, an index behind the final block, an anchor mismatch, a
+ * ledger behind the chain (an in-flight operation whose settling event is already final: the
+ * monitor has not caught up), a ledger user with operations on another deployment
+ * (`multi_deployment_user`: ledger balances are per user, not per deployment), or inputs the
+ * domain refuses (for example a confirmation newer than this run's final block, when another
+ * worker confirmed between the head read and the snapshot) record an `unknown` run with the
+ * redacted reason and raise `reconciliation_unknown`.
  *
  * What a run catches, by construction: a rogue transfer (a `Transfer` with no reference event in
  * the transaction: `unexplained_transfer`, and the balances it moved: `balance_mismatch`); a rogue
  * mint/burn (an unknown reference, a supply and balance mismatch); a rogue or front-run registry
- * change (`compliance_event_mismatch`, and the flag it changed: `compliance_mismatch`); a
- * confirmation the chain never made (`missing_onchain`) or made elsewhere
- * (`confirmed_block_mismatch`).
- *
- * Known limit: a user's ledger balance is not per deployment. A user with operations on two
- * deployments would show the sum on both; the engine binds to one deployment, and a deployment
- * switch is a migration (ADR 0011) that must account for this.
+ * change (`compliance_event_mismatch`, and the flag it changed: `compliance_mismatch`); an old
+ * decision landing after a newer one (`compliance_mismatch`); a confirmation the chain never made
+ * (`missing_onchain`) or made elsewhere (`confirmed_block_mismatch`).
  */
 
 import type { ChainGateway } from '@bridge/chain';
@@ -146,17 +149,18 @@ export interface KnownComplianceChange {
   readonly content: ComplianceChangeContent;
   /** Its status (only a `confirmed` change is a settled decision). */
   readonly status: ComplianceChangeStatus;
-  /** When the bridge DECIDED it (the request time): the order of decisions, not confirmations. */
-  readonly createdAt: Date;
-  /** Tie-break for equal times. */
-  readonly id: string;
+  /**
+   * The order of the bridge's DECISIONS (`compliance_change.decision_seq`, assigned by the
+   * database at insert; review M-1): never the app clock, never the order of confirmations.
+   */
+  readonly decisionSeq: bigint;
 }
 
 /** Inputs to `deriveExpectedCompliance`. */
 export interface ExpectedComplianceInput {
   /** Addresses that need an expectation (holders, ledger parties, touched accounts). */
   readonly addresses: Iterable<Address>;
-  /** FINAL events on CANONICAL blocks (others are ignored by the caller). Any order. */
+  /** FINAL events on CANONICAL blocks (the caller filters). Any order. */
   readonly events: readonly ObservedEvent[];
   /** Every compliance change the bridge recorded, in any order. */
   readonly changes: readonly KnownComplianceChange[];
@@ -164,30 +168,30 @@ export interface ExpectedComplianceInput {
 
 const NOT_SET: ComplianceState = Object.freeze({ verified: false, frozen: false });
 
-function chainOrder(a: ObservedEvent, b: ObservedEvent): number {
-  if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? -1 : 1;
-  return a.logIndex - b.logIndex;
-}
-
 function isRegistryEvent(e: ObservedEvent): e is RegistryEvent {
   return e.kind === 'VerificationSet' || e.kind === 'FrozenSet';
 }
 
 /**
- * The flags the bridge expects each address to have (checklist 13, review N-7). Pure.
+ * The flags the bridge expects each address to have (checklist 13, reviews N-7 and C/M-1). Pure.
  *
  * 1. Every address starts as the registry's default (not verified, not frozen).
- * 2. The registry events are applied in CHAIN order (block, then log index), and only those that
- *    match a known change exactly (reference, account, flag, value): a rogue or front-run event is
- *    not something the bridge believes, so it never moves an expectation (reconcile reports it,
- *    and the flag it changed, separately).
- * 3. Cross-check: for each (account, flag), the bridge's LATEST decision (by request time) that is
- *    `confirmed` wins if it disagrees with the chain-ordered result. A late-landing old change
- *    then shows up as a `compliance_mismatch` (the chain holds the old value, the bridge's newest
- *    decision says otherwise): a finding for a person, never silently accepted. A latest decision
- *    still in flight or failed is not settled, so the chain-ordered result stands.
+ * 2. A decision is APPLIED when it is `confirmed`, or when a final event on a canonical block
+ *    matches it exactly (reference, account, flag, value): the chain has applied it even if the
+ *    monitor has not recorded that yet. A failed or in-flight decision with no such event has
+ *    changed nothing, so it is not applied. Rogue or front-run events match no decision and never
+ *    move an expectation (reconcile reports them, and the flag they changed, separately).
+ * 3. Per (account, flag), the APPLIED decision with the highest `decisionSeq` (assigned by the
+ *    database at insert: the order of DECISIONS) is the expectation. The filter comes BEFORE the
+ *    choice (review M-1): a newer decision that failed or is still in flight must not hide an
+ *    older applied one.
  *
- * The order in which the database confirmed changes plays no part.
+ * Why the chain's own order does not pick the value: the registry ALREADY holds the chain-ordered
+ * result, and that is what `observedCompliance` reads at the final block. Expecting the newest
+ * decision and observing the chain-ordered state is exactly what turns an old decision landing
+ * late into a `compliance_mismatch` (a finding for a person). The compliance monitor also raises
+ * `compliance_out_of_order` when it confirms such a change. Neither the order in which the
+ * database confirmed changes nor the app clock plays any part.
  *
  * @param input The addresses, the final canonical events and the known changes.
  */
@@ -200,38 +204,27 @@ export function deriveExpectedCompliance(
   };
   for (const a of input.addresses) touch(a);
   for (const c of input.changes) touch(c.content.account);
+
+  const onChain = new Set<Bytes32>();
   const byRef = new Map<Bytes32, ComplianceChangeContent>();
   for (const c of input.changes) byRef.set(c.content.ref, c.content);
-
-  const registry = input.events.filter(isRegistryEvent).sort(chainOrder);
-  for (const e of registry) {
+  for (const e of input.events) {
+    if (!isRegistryEvent(e)) continue;
     touch(e.account);
     const known = byRef.get(e.ref);
-    if (known === undefined || !complianceEventMatches(known, e)) continue;
-    const state = out.get(e.account) ?? NOT_SET;
-    out.set(
-      e.account,
-      e.kind === 'VerificationSet'
-        ? { verified: e.verified, frozen: state.frozen }
-        : { verified: state.verified, frozen: e.frozen },
-    );
+    if (known !== undefined && complianceEventMatches(known, e)) onChain.add(e.ref);
   }
 
   const latest = new Map<string, KnownComplianceChange>();
   for (const c of input.changes) {
+    if (c.status !== 'confirmed' && !onChain.has(c.content.ref)) continue;
     const key = `${c.content.account}:${c.content.flag}`;
     const prev = latest.get(key);
-    const newer =
-      prev === undefined ||
-      c.createdAt.getTime() > prev.createdAt.getTime() ||
-      (c.createdAt.getTime() === prev.createdAt.getTime() && c.id > prev.id);
-    if (newer) latest.set(key, c);
+    if (prev === undefined || c.decisionSeq > prev.decisionSeq) latest.set(key, c);
   }
   for (const c of latest.values()) {
-    if (c.status !== 'confirmed') continue;
     const { account, flag, value } = c.content;
     const state = out.get(account) ?? NOT_SET;
-    if (state[flag] === value) continue;
     out.set(
       account,
       flag === 'verified' ? { ...state, verified: value } : { ...state, frozen: value },
@@ -319,6 +312,10 @@ interface Snapshot {
   readonly changes: readonly KnownComplianceChange[];
   readonly events: readonly ObservedEvent[];
   readonly lastIndexed: bigint | null;
+  /** The indexer's hash at `finalBlock` (the anchor), or null when it has none. */
+  readonly anchorHash: string | null;
+  /** Ledger users of this deployment that also have operations on another deployment. */
+  readonly multiDeploymentUsers: number;
 }
 
 const IN_FLIGHT = new Set(['ledger_reserved', 'submitted']);
@@ -379,8 +376,9 @@ export class Reconciler {
     const startedAt = this.clock.now();
     let head: bigint | null = null;
     let finalBlock: bigint | null = null;
+    let report: ReconciliationReport | null = null;
+    let error: string | null = null;
     try {
-      const snapshot = await this.snapshot(deployment);
       const chainId = await this.gateway.getChainId();
       if (BigInt(chainId) !== this.binding.chainId) {
         throw new UnknownRun(`chain_mismatch: node reports chain ${chainId}`);
@@ -388,22 +386,50 @@ export class Reconciler {
       head = await this.gateway.getHeadBlock();
       const lag = head - BigInt(this.depth) + 1n;
       finalBlock = lag > 0n ? lag : 0n;
+      const snapshot = await this.snapshot(deployment, finalBlock);
+      if (snapshot.multiDeploymentUsers > 0) {
+        // Ledger balances are per user, not per deployment: the expected balances would mix in
+        // another deployment's money (README "Known limits").
+        throw new UnknownRun(
+          `multi_deployment_user: ${snapshot.multiDeploymentUsers} user(s) also have operations on another deployment`,
+        );
+      }
       if (snapshot.lastIndexed === null || snapshot.lastIndexed < finalBlock) {
         throw new UnknownRun(
           `index_behind: indexed up to ${String(snapshot.lastIndexed)}, final block is ${finalBlock}`,
         );
       }
-      const report = await this.compare(snapshot, finalBlock);
-      return await this.persist(deployment, startedAt, { head, finalBlock, report, error: null });
+      await this.checkAnchor(deployment, snapshot, finalBlock);
+      report = await this.compare(snapshot, finalBlock);
     } catch (err) {
       // Bounded and redacted again as a whole: the stored error is at most 1000 characters.
-      const error = sanitizeText(
+      error = sanitizeText(
         err instanceof UnknownRun
           ? err.message
           : `read_failed: ${describeError(err, this.redaction)}`,
         this.redaction,
       );
-      return this.persist(deployment, startedAt, { head, finalBlock, report: null, error });
+      report = null;
+    }
+    // Outside the try: a failure AFTER the outcome is known (persisting, alarming) must never be
+    // recorded as a second, `unknown` run.
+    return this.persist(deployment, startedAt, { head, finalBlock, report, error });
+  }
+
+  /**
+   * Review L-1: the index must be on the node's chain AT the final block. The indexer's stored
+   * hash at `finalBlock` (read in the snapshot) must equal the node's hash there; a fork below or
+   * at the final block changes it. Missing or different: `unknown` (`anchor_mismatch`). A final
+   * block below the deployment block has nothing indexed yet and no event to vouch for.
+   */
+  private async checkAnchor(d: Deployment, s: Snapshot, finalBlock: bigint): Promise<void> {
+    if (finalBlock < d.deploymentBlock) return;
+    const block = await this.gateway.getBlock(finalBlock);
+    if (block === null || s.anchorHash === null || block.hash.toLowerCase() !== s.anchorHash) {
+      throw new UnknownRun(
+        `anchor_mismatch: at final block ${finalBlock} the index holds ${String(s.anchorHash)}, ` +
+          `the node ${block === null ? 'has no block' : block.hash}`,
+      );
     }
   }
 
@@ -428,7 +454,7 @@ export class Reconciler {
   }
 
   /** Step 1: one consistent read of everything the ledger says. No node call inside. */
-  private async snapshot(d: Deployment): Promise<Snapshot> {
+  private async snapshot(d: Deployment, finalBlock: bigint): Promise<Snapshot> {
     const { value } = await runTransaction(
       this.prisma,
       async (tx) => {
@@ -470,6 +496,16 @@ export class Reconciler {
           orderBy: [{ blockNumber: 'asc' }, { logIndex: 'asc' }],
         });
         const cursor = await tx.indexerState.findUnique({ where: { deploymentId: d.id } });
+        const anchor = await tx.indexedBlock.findUnique({
+          where: { deploymentId_number: { deploymentId: d.id, number: finalBlock } },
+          select: { hash: true },
+        });
+        const multiDeploymentUsers = await tx.operation.count({
+          where: {
+            deploymentId: { not: d.id },
+            OR: [{ userId: { in: [...userIds] } }, { counterpartyUserId: { in: [...userIds] } }],
+          },
+        });
         return {
           operations: ops.map((o): LedgerOperationView => {
             const from = o.user.walletAddress as Address;
@@ -495,11 +531,12 @@ export class Reconciler {
           changes: changes.map((c) => ({
             content: complianceContentOf(c, c.user.walletAddress),
             status: c.status,
-            createdAt: c.createdAt,
-            id: c.id,
+            decisionSeq: c.decisionSeq,
           })),
           events: events.map(observedEventOf),
           lastIndexed: cursor?.lastIndexedBlock ?? null,
+          anchorHash: anchor?.hash ?? null,
+          multiDeploymentUsers,
         };
       },
       // One instant for every table; read-only, so it never conflicts with a writer.
@@ -661,8 +698,35 @@ export class Reconciler {
         include: { mismatchRows: { orderBy: { ordinal: 'asc' } } },
       });
     });
-    this.raiseAlarms(run.id, status, r.error, r.report?.mismatches ?? []);
+    try {
+      this.raiseAlarms(run.id, status, r.error, r.report?.mismatches ?? []);
+    } catch (err) {
+      // The run is committed: a failing sink must not turn it into a second (unknown) run. Record
+      // the failure next to the run instead (best effort: the database may be the problem too).
+      await this.recordAlarmFailure(run.id, err);
+    }
     return toRecord(run, run.mismatchRows);
+  }
+
+  /** An audit row saying the run's alarms could not be raised. Never throws. */
+  private async recordAlarmFailure(runId: string, err: unknown): Promise<void> {
+    try {
+      await this.prisma.$transaction((tx) =>
+        writeAudit(
+          tx,
+          auditEntryFor({
+            entity: 'reconciliation',
+            entityId: runId,
+            fromState: null,
+            toState: 'alarm_failed',
+            detail: `alarm sink failed: ${describeError(err, this.redaction)}`,
+            at: this.clock.now(),
+          }),
+        ),
+      );
+    } catch {
+      // Nothing left to tell: the run itself is stored and readable via latestRuns.
+    }
   }
 
   /** One alarm per mismatch kind present, or `reconciliation_unknown`. */

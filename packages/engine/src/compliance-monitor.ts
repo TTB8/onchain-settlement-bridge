@@ -34,6 +34,17 @@
  * 6. A `requested` change older than `orphanAfterSeconds` with no attempt and no live outbox row
  *    (its row died before anything was signed) is FAILed (`rejected`), so the deployment can be
  *    retired and the operator sees it.
+ * 7. Review piece C:
+ *    - a CONFIRM (or CONFIRM_LATE) whose event block is out of DECISION order with another
+ *      confirmed change for the same account and flag (an older decision landing after a newer
+ *      one, or the reverse) raises `compliance_out_of_order`: the registry now holds the older
+ *      decision's value, which the reconciler reports as `compliance_mismatch` (M-1);
+ *    - a change still `requested` / `submitted` after `pendingAlarmAfterSeconds` raises
+ *      `compliance_pending`, freezes first (a freeze that has not landed is the one that lets a
+ *      sanctioned account keep moving funds; page those first) (L-2);
+ *    - a FAILED change is re-examined only within `failedLookbackSeconds` of its last update, or
+ *      while an indexed event carries its reference (the only thing that can late-confirm it or
+ *      show a conflict); anything else is history (L-3).
  */
 
 import type { ChainGateway, ContractCall, Fees, Receipt } from '@bridge/chain';
@@ -106,7 +117,31 @@ export interface ComplianceMonitorOptions {
   readonly transactions?: TransactionOptions;
   /** Literal secrets removed from every error text written. */
   readonly secrets?: readonly string[];
+  /**
+   * Seconds a change may stay requested / submitted before `compliance_pending`. Default
+   * `DEFAULT_COMPLIANCE_PENDING_ALARM_SECONDS`.
+   */
+  readonly pendingAlarmAfterSeconds?: number;
+  /**
+   * Seconds after its last update during which a FAILED change is re-examined without a new
+   * event. Default `DEFAULT_COMPLIANCE_FAILED_LOOKBACK_SECONDS`.
+   */
+  readonly failedLookbackSeconds?: number;
 }
+
+/**
+ * Default seconds before `compliance_pending`: 900 (15 min). WHY: a registry call is one small
+ * transaction; a quarter of an hour outlasts fee spikes and a node restart, and a freeze that has
+ * not landed by then is a compliance incident that needs a person now, not at the next audit.
+ */
+export const DEFAULT_COMPLIANCE_PENDING_ALARM_SECONDS = 900;
+
+/**
+ * Default look-back for failed changes: 7 days. WHY: a failed attempt can only land while its
+ * nonce is not final, which takes minutes; a week covers any manual resubmission or operator
+ * investigation, and any later event carrying the reference still brings the change back.
+ */
+export const DEFAULT_COMPLIANCE_FAILED_LOOKBACK_SECONDS = 7 * 24 * 3600;
 
 /** What one pass did. */
 export interface ComplianceMonitorSummary {
@@ -215,12 +250,25 @@ export class ComplianceMonitor {
   private readonly transactions: TransactionOptions;
   private readonly redaction: SanitizeOptions;
   private readonly skips = new Map<string, number>();
+  private readonly pendingAlarmAfterSeconds: number;
+  private readonly failedLookbackSeconds: number;
 
   /** @param options Database, gateway, inspector, clock, policy and alarm sink. */
   constructor(options: ComplianceMonitorOptions) {
     const p = options.policy;
     if (!Number.isSafeInteger(p.confirmationDepth) || p.confirmationDepth < 1) {
       throw new RangeError('confirmationDepth must be an integer >= 1');
+    }
+    this.pendingAlarmAfterSeconds =
+      options.pendingAlarmAfterSeconds ?? DEFAULT_COMPLIANCE_PENDING_ALARM_SECONDS;
+    this.failedLookbackSeconds =
+      options.failedLookbackSeconds ?? DEFAULT_COMPLIANCE_FAILED_LOOKBACK_SECONDS;
+    for (const [name, v] of [
+      ['pendingAlarmAfterSeconds', this.pendingAlarmAfterSeconds],
+      ['failedLookbackSeconds', this.failedLookbackSeconds],
+    ] as const) {
+      if (!Number.isSafeInteger(v) || v < 0)
+        throw new RangeError(`${name} must be an integer >= 0`);
     }
     this.prisma = options.prisma;
     this.gateway = options.gateway;
@@ -252,11 +300,7 @@ export class ComplianceMonitor {
       // counts unreachable passes and raises node_unreachable for the shared node.
       return EMPTY_COMPLIANCE_SUMMARY;
     }
-    const changes = await this.prisma.complianceChange.findMany({
-      where: { deploymentId: deployment.id, status: { in: ['submitted', 'failed'] } },
-      include: { user: { select: { walletAddress: true } } },
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-    });
+    const changes = await this.changesToExamine(deployment);
     let skipped = 0;
     let examined = 0;
     for (const change of changes) {
@@ -288,6 +332,7 @@ export class ComplianceMonitor {
         this.alarm('examine_error', describeError(err, this.redaction), change.id);
       }
     }
+    await this.alarmPending(deployment);
     try {
       counts.failed += await this.sweepOrphans(deployment);
     } catch (err) {
@@ -296,6 +341,89 @@ export class ComplianceMonitor {
       }
     }
     return { ran: true, head: view.head, examined, skipped, ...counts };
+  }
+
+  /**
+   * Submitted changes, plus FAILED changes updated within the look-back or whose reference an
+   * indexed event carries (step 7, L-3), in decision order.
+   */
+  private async changesToExamine(d: Deployment): Promise<ChangeWithWallet[]> {
+    const cutoff = new Date(this.clock.now().getTime() - this.failedLookbackSeconds * 1000);
+    const withEvents = await this.prisma.$queryRaw<{ id: string }[]>`
+      SELECT c.id::text AS id FROM compliance_change c
+       WHERE c.deployment_id = ${d.id}::uuid AND c.status = 'failed' AND c.updated_at < ${cutoff}
+         AND EXISTS (SELECT 1 FROM chain_event e
+                      WHERE e.deployment_id = c.deployment_id AND e.ref = c.ref)`;
+    return this.prisma.complianceChange.findMany({
+      where: {
+        deploymentId: d.id,
+        OR: [
+          { status: 'submitted' },
+          { status: 'failed', updatedAt: { gte: cutoff } },
+          { id: { in: withEvents.map((r) => r.id) } },
+        ],
+      },
+      include: { user: { select: { walletAddress: true } } },
+      orderBy: [{ decisionSeq: 'asc' }],
+    });
+  }
+
+  /** `compliance_pending` for every change still not applied after the limit, freezes first. */
+  private async alarmPending(d: Deployment): Promise<void> {
+    const before = new Date(this.clock.now().getTime() - this.pendingAlarmAfterSeconds * 1000);
+    const pending = await this.prisma.complianceChange.findMany({
+      where: {
+        deploymentId: d.id,
+        status: { in: ['requested', 'submitted'] },
+        createdAt: { lte: before },
+      },
+      orderBy: [{ decisionSeq: 'asc' }],
+    });
+    const rank = (a: string): number => (a === 'freeze' ? 0 : 1);
+    pending.sort((a, b) => rank(a.action) - rank(b.action));
+    for (const c of pending) {
+      const minutes = Math.floor((this.clock.now().getTime() - c.createdAt.getTime()) / 60_000);
+      this.alarm(
+        'compliance_pending',
+        `${c.action} still ${c.status} after ${minutes} min${c.action === 'freeze' ? ' (FREEZE: page first)' : ''}`,
+        c.id,
+      );
+    }
+  }
+
+  /**
+   * Step 7 (M-1): after a change is confirmed at `block`, any other CONFIRMED change for the same
+   * account and flag whose block is out of decision order raises `compliance_out_of_order`.
+   */
+  private async checkDecisionOrder(change: ChangeWithWallet, block: bigint): Promise<void> {
+    const flag = flagChangeFor(change.action).flag;
+    const same: ComplianceChange['action'][] =
+      flag === 'frozen' ? ['freeze', 'unfreeze'] : ['verify', 'unverify'];
+    const others = await this.prisma.complianceChange.findMany({
+      where: {
+        deploymentId: change.deploymentId,
+        userId: change.userId,
+        action: { in: same },
+        status: 'confirmed',
+        id: { not: change.id },
+      },
+      select: { id: true, decisionSeq: true, confirmedBlock: true },
+    });
+    for (const o of others) {
+      if (o.confirmedBlock === null) continue;
+      const inverted =
+        (o.decisionSeq > change.decisionSeq && o.confirmedBlock < block) ||
+        (o.decisionSeq < change.decisionSeq && o.confirmedBlock > block);
+      if (inverted) {
+        this.alarm(
+          'compliance_out_of_order',
+          `${change.action} (decision ${change.decisionSeq}) landed in block ${block}, out of ` +
+            `decision order with change ${o.id} (decision ${o.decisionSeq}, block ${o.confirmedBlock}): ` +
+            `the registry holds the older decision's ${flag} value`,
+          change.id,
+        );
+      }
+    }
   }
 
   /** Signer binding first, then head, then the compliance nonces at explicit blocks. */
@@ -402,6 +530,7 @@ export class ComplianceMonitor {
           `registry event final in block ${found.like.blockNumber}`,
           found.row.txHash,
         );
+        await this.checkDecisionOrder(change, found.like.blockNumber);
         return change.status === 'failed' ? 'lateConfirmed' : 'confirmed';
       }
       if (change.status === 'submitted') {

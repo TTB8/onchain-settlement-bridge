@@ -15,8 +15,10 @@ import type { ComplianceChange } from '@bridge/db';
 import {
   deriveExpectedCompliance,
   type KnownComplianceChange,
+  moveComplianceChange,
   moveOperation,
   observedEventOf,
+  Reconciler,
   RECONCILIATION_ALARMS,
   type ReconciliationRunRecord,
 } from '../src';
@@ -348,16 +350,35 @@ describe('each mismatch kind is caught, persisted and alarmed', () => {
     });
   });
 
-  it('a stale index (an orphaned settlement still stored): stale_block from the NODE hashes, and the confirmed op is missing', async () => {
+  it('review L-1: an index on another fork AT the final block is caught by the anchor: unknown, never compared', async () => {
     const rig = await rigFor();
     const alice = await funded(rig, 10n);
     // The block holding the mint is replaced and its transaction forgotten; the indexer has not
-    // run since, so the index still holds the orphaned event at a height that is final.
+    // run since, so the index still holds the orphaned block at the (final) head.
     rig.chain.reorg({ depth: 1, dropTransactions: true });
     const run = await reconcile(rig);
-    expect(kinds(run)).toEqual(
-      expect.arrayContaining(['missing_onchain', 'unexpected_onchain_event', 'balance_mismatch']),
-    );
+    expect(run.status).toBe('unknown');
+    expect(run.error).toMatch(/^anchor_mismatch: at final block/);
+    expect(rig.chain.balanceOf(wallet(alice))).toBe(0n);
+    await rig.engine.tick(); // the indexer rolls back: the anchor agrees again
+    expect((await reconcile(rig)).error).not.toMatch(/^anchor_mismatch/);
+  });
+
+  it('an event whose block the node now reports with another hash (anchor intact): stale_block, from the NODE hashes', async () => {
+    const rig = await rigFor();
+    const alice = await funded(rig, 10n);
+    rig.chain.mine(2);
+    await rig.engine.tick(); // index past the mint
+    const [minted] = await db.prisma.chainEvent.findMany({
+      where: { kind: 'Minted', toAddress: alice.wallet },
+    });
+    const getBlock = rig.chain.getBlock.bind(rig.chain);
+    rig.chain.getBlock = async (n) => {
+      const b = await getBlock(n);
+      return b !== null && n === minted?.blockNumber ? { ...b, hash: `0x${'77'.repeat(32)}` } : b;
+    };
+    const run = await reconcile(rig);
+    rig.chain.getBlock = getBlock;
     expect(run.mismatches.map((m) => m.detail)).toContainEqual(
       expect.objectContaining({
         kind: 'unexpected_onchain_event',
@@ -365,7 +386,165 @@ describe('each mismatch kind is caught, persisted and alarmed', () => {
         event: 'Minted',
       }),
     );
-    expect(rig.chain.balanceOf(wallet(alice))).toBe(0n);
+    expect(kinds(run)).toContain('missing_onchain');
+  });
+});
+
+describe('review M-1: the latest CONFIRMED decision (by decision_seq) is the expectation', () => {
+  /**
+   * Patrick's scenario, end to end on the fake chain: U1 (unfreeze, decided first) loses its nonce
+   * and lands LATE, at a higher block than F2 (freeze, decided second). A third decision F3
+   * (freeze) failed, or is still in flight. The registry ends UNFROZEN (U1 last), the bridge's
+   * newest applied decision says FROZEN: the reconciler must report compliance_mismatch, and the
+   * monitor raises compliance_out_of_order when U1 confirms.
+   */
+  async function lateUnfreeze(): Promise<{ rig: Rig; u: TestUser }> {
+    const rig = await rigFor({ maxResubmits: 2 }, { automine: false });
+    const u = await insertUser(db.prisma);
+    rig.chain.mine();
+    const request = (kind: 'freeze' | 'unfreeze') =>
+      rig.engine.compliance.request(kind, {
+        address: u.wallet,
+        reason: `${kind} decision`,
+        idempotencyKey: randomUUID(),
+        requestedBy: 'ops',
+      });
+    const u1 = (await request('unfreeze')).change;
+    await rig.engine.tick(); // U1 signed with nonce n, pooled
+    const [a1] = await db.prisma.chainAttempt.findMany({
+      where: { outbox: { complianceChangeId: u1.id } },
+    });
+    // U1's nonce is taken by another compliance transaction (an operator's, on another account).
+    rig.chain.dropTransaction(a1?.hash as `0x${string}`);
+    await setOnChain(rig.chain, `0x${'0d'.repeat(20)}`, { verified: true });
+    rig.clock.advance(1_000);
+    const f2 = (await request('freeze')).change;
+    await rig.engine.dispatcher.runOnce(); // F2: nonce n+1
+    rig.chain.mine(); // F2 lands first
+    await rig.engine.tick(); // F2 confirmed; U1 replaced: a NEW nonce
+    expect((await changeRow(f2.id)).status).toBe('confirmed');
+    rig.chain.mine(3);
+    await rig.engine.tick(); // U1 lands late and is confirmed
+    const late = await changeRow(u1.id);
+    expect(late.status).toBe('confirmed');
+    expect(late.confirmedBlock).toBeGreaterThan((await changeRow(f2.id)).confirmedBlock ?? 0n);
+    expect(rig.chain.complianceOf(wallet(u)).frozen).toBe(false);
+    expect(rig.alarms.ofKind('compliance_out_of_order').map((a) => a.complianceChangeId)).toContain(
+      u1.id,
+    );
+    return { rig, u };
+  }
+
+  const frozenMismatch = (u: TestUser) => ({
+    kind: 'compliance_mismatch',
+    address: u.wallet,
+    expected: { verified: false, frozen: true },
+    observed: { verified: false, frozen: false },
+  });
+
+  it('a newer FAILED freeze (F3) does not hide it: compliance_mismatch', async () => {
+    const { rig, u } = await lateUnfreeze();
+    rig.clock.advance(1_000);
+    const f3 = (
+      await rig.engine.compliance.requestFreeze({
+        address: u.wallet,
+        reason: 'freeze again',
+        idempotencyKey: randomUUID(),
+        requestedBy: 'ops',
+      })
+    ).change;
+    await db.prisma.$transaction((tx) =>
+      moveComplianceChange(tx, {
+        changeId: f3.id,
+        from: 'requested',
+        version: 0,
+        move: { event: 'FAIL', reason: 'rejected' },
+        at: rig.clock.now(),
+        note: 'operator cancelled',
+      }),
+    );
+    const run = await reconcile(rig);
+    expect(run.mismatches.map((m) => m.detail)).toContainEqual(frozenMismatch(u));
+  });
+
+  it('a newer IN-FLIGHT freeze (F3) does not hide it either', async () => {
+    const { rig, u } = await lateUnfreeze();
+    rig.clock.advance(1_000);
+    await rig.engine.compliance.requestFreeze({
+      address: u.wallet,
+      reason: 'freeze again',
+      idempotencyKey: randomUUID(),
+      requestedBy: 'ops',
+    });
+    const run = await reconcile(rig);
+    expect(run.mismatches.map((m) => m.detail)).toContainEqual(frozenMismatch(u));
+  });
+
+  it('decision_seq orders decisions even when the app clock ties', async () => {
+    const rig = await rigFor();
+    const u = await insertUser(db.prisma);
+    const ids: string[] = [];
+    for (const kind of ['freeze', 'unfreeze', 'freeze'] as const) {
+      ids.push(
+        (
+          await rig.engine.compliance.request(kind, {
+            address: u.wallet,
+            reason: kind,
+            idempotencyKey: randomUUID(),
+            requestedBy: 'ops',
+          })
+        ).change.id,
+      );
+    }
+    const rows = await db.prisma.complianceChange.findMany({ where: { id: { in: ids } } });
+    const seq = (id: string) => rows.find((r) => r.id === id)?.decisionSeq ?? 0n;
+    expect(new Set(rows.map((r) => r.createdAt.getTime())).size).toBe(1); // the clock tied
+    expect(seq(ids[0] ?? '') < seq(ids[1] ?? '') && seq(ids[1] ?? '') < seq(ids[2] ?? '')).toBe(
+      true,
+    );
+  });
+});
+
+describe('the run itself: multi-deployment users, a failing alarm sink', () => {
+  it('a ledger user with operations on another deployment: unknown multi_deployment_user', async () => {
+    const rig = await rigFor();
+    const alice = await funded(rig, 10n);
+    const other = await rigFor();
+    await other.engine.operations.requestDeposit(alice.id, 1n, randomUUID());
+    const run = await reconcile(rig);
+    expect(run.status).toBe('unknown');
+    expect(run.error).toMatch(/^multi_deployment_user: 1 user/);
+  });
+
+  it('a failing alarm sink after the commit: one run (mismatch), never a second unknown run', async () => {
+    const rig = await rigFor();
+    const alice = await funded(rig, 10n);
+    await setOnChain(rig.chain, alice.wallet, { frozen: true });
+    await rig.engine.tick();
+    const reconciler = new Reconciler({
+      prisma: db.prisma,
+      gateway: rig.chain,
+      clock: rig.clock,
+      policy: { confirmationDepth: 1 },
+      alarms: {
+        raise: () => {
+          throw new Error('pager down');
+        },
+      },
+    });
+    const before = await db.prisma.reconciliationRun.count({
+      where: { deploymentId: rig.deploymentId },
+    });
+    const run = await reconciler.reconcileNow();
+    expect(run?.status).toBe('mismatch');
+    const runs = await db.prisma.reconciliationRun.findMany({
+      where: { deploymentId: rig.deploymentId },
+    });
+    expect(runs).toHaveLength(before + 1);
+    const audit = await db.prisma.auditLog.findMany({
+      where: { entity: 'reconciliation', entityId: run?.id ?? '', toState: 'alarm_failed' },
+    });
+    expect(audit).toHaveLength(1);
   });
 });
 
@@ -453,10 +632,14 @@ describe('final block, reorgs and unknown runs (never a clean pass on bad reads)
     expect((await opRow(db.prisma, dep.id)).status).toBe('confirmed');
 
     const getBlock = rig.chain.getBlock.bind(rig.chain);
-    rig.chain.getBlock = async () => null;
+    const head = await rig.chain.getHeadBlock();
+    rig.chain.getBlock = async (n) => (n === head ? getBlock(n) : null); // anchor fine, events not
     const missing = await reconcile(rig);
+    rig.chain.getBlock = async () => null;
+    const noAnchor = await reconcile(rig);
     rig.chain.getBlock = getBlock;
     expect(missing.error).toMatch(/^node_inconsistent/);
+    expect(noAnchor.error).toMatch(/^anchor_mismatch: .* the node has no block/);
     expect((await reconcile(rig)).status).toBe('ok');
   });
 
@@ -484,14 +667,12 @@ describe('deriveExpectedCompliance (checklist 13, pure)', () => {
   const freeze: KnownComplianceChange = {
     content: { ref: freezeRef, account: A, flag: 'frozen', value: true },
     status: 'confirmed',
-    createdAt: new Date(1_000),
-    id: 'a',
+    decisionSeq: 1n,
   };
   const unfreeze: KnownComplianceChange = {
     content: { ref: unfreezeRef, account: A, flag: 'frozen', value: false },
     status: 'confirmed',
-    createdAt: new Date(2_000),
-    id: 'b',
+    decisionSeq: 2n,
   };
 
   it('chain order decides, never the order of the changes (confirmation order) in the input', () => {
@@ -531,7 +712,7 @@ describe('deriveExpectedCompliance (checklist 13, pure)', () => {
     expect(out.get(A)).toEqual({ verified: false, frozen: true });
   });
 
-  it('events are applied in chain order whatever order they arrive in (latest decision still in flight)', () => {
+  it('an in-flight change whose final event is already on chain counts as applied (monitor lag is not a finding)', () => {
     const events = [
       { ...pos(12n, 0), kind: 'FrozenSet' as const, account: A, frozen: false, ref: unfreezeRef },
       { ...pos(10n, 5), kind: 'FrozenSet' as const, account: A, frozen: true, ref: freezeRef },
@@ -539,6 +720,30 @@ describe('deriveExpectedCompliance (checklist 13, pure)', () => {
     const inFlight: KnownComplianceChange = { ...unfreeze, status: 'submitted' };
     const out = deriveExpectedCompliance({ addresses: [A], events, changes: [freeze, inFlight] });
     expect(out.get(A)).toEqual({ verified: false, frozen: false });
+  });
+
+  it("Patrick's PoC: a newer FAILED or IN-FLIGHT freeze never hides a late-landing old unfreeze", () => {
+    const f2Ref = `0x${'03'.repeat(32)}` as `0x${string}`;
+    const f3Ref = `0x${'04'.repeat(32)}` as `0x${string}`;
+    const u1: KnownComplianceChange = { ...unfreeze, decisionSeq: 1n };
+    const f2: KnownComplianceChange = {
+      content: { ref: f2Ref, account: A, flag: 'frozen', value: true },
+      status: 'confirmed',
+      decisionSeq: 2n,
+    };
+    const events = [
+      { ...pos(10n, 0), kind: 'FrozenSet' as const, account: A, frozen: true, ref: f2Ref },
+      { ...pos(20n, 0), kind: 'FrozenSet' as const, account: A, frozen: false, ref: unfreezeRef },
+    ];
+    for (const status of ['failed', 'submitted', 'requested'] as const) {
+      const f3: KnownComplianceChange = {
+        content: { ref: f3Ref, account: A, flag: 'frozen', value: true },
+        status,
+        decisionSeq: 3n,
+      };
+      const out = deriveExpectedCompliance({ addresses: [A], events, changes: [u1, f2, f3] });
+      expect(out.get(A)).toEqual({ verified: false, frozen: true }); // observed: false -> mismatch
+    }
   });
 
   it('observedEventOf refuses an indexed row missing a field', () => {
