@@ -132,16 +132,106 @@ function nodeText(error: unknown): string {
 }
 
 /**
- * Replaces every URL in a text. An RPC URL often carries an API key in its path or query, so no
- * URL may reach an error message, a cause, a log line or `util.inspect` output.
+ * Replaces every URL that LOOKS like one in a text: `scheme://...`, its JSON-escaped form
+ * (`https:\\/\\/host\\/path`) and its percent-encoded form (`https%3A%2F%2F...`). This is the
+ * generic layer only: a host and path without a scheme cannot be recognised by pattern, which is
+ * why the gateway also redacts its own configured URL literally (`makeRedactor`).
  */
 export function redactUrls(text: string): string {
-  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>|]+/gi, '<redacted-url>');
+  return text.replace(
+    /\b[a-z][a-z0-9+.-]*(?::\/\/|:\\\/\\\/|%3A%2F%2F)[^\s"'<>|]+/gi,
+    '<redacted-url>',
+  );
 }
 
-/** The node's own one-line reason, when viem has one, for an error message. URLs redacted. */
-function nodeDetails(error: unknown): string {
-  return error instanceof BaseError && error.details ? `: ${redactUrls(error.details)}` : '';
+/** A function that removes secrets from a text. */
+export type Redact = (text: string) => string;
+
+/** Escapes a string for use inside a regular expression. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+}
+
+/** Pieces of the URL shorter than this are too short to be a secret and too common to remove. */
+const MIN_SECRET_LENGTH = 4;
+
+/**
+ * A redactor for one configured RPC URL. It removes, case-insensitively, the full URL and each of
+ * its parts that could hold a key: host (with and without port), credentials, path, every path
+ * segment and every query value. It removes each one as written, JSON-escaped (`\\/`),
+ * percent-encoded and JSON-string-escaped. It then applies the generic `redactUrls`. An API key
+ * therefore cannot leak through a node message that quotes the URL without its scheme ("nonce
+ * too high at host/v2/KEY"), escaped, or encoded.
+ */
+export function makeRedactor(rpcUrl?: string): Redact {
+  const secrets = new Set<string>();
+  const add = (value: string | undefined | null): void => {
+    if (value && value.length >= MIN_SECRET_LENGTH) secrets.add(value);
+  };
+  const decode = (value: string): string => {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  };
+  if (rpcUrl) {
+    add(rpcUrl);
+    try {
+      const url = new URL(rpcUrl);
+      add(url.href);
+      add(url.host);
+      add(url.hostname);
+      add(decode(url.username));
+      add(decode(url.password));
+      add(`${url.host}${url.pathname}`);
+      add(url.pathname.length > 1 ? url.pathname : undefined);
+      add(url.search.length > 1 ? url.search.slice(1) : undefined);
+      for (const segment of url.pathname.split('/')) {
+        add(segment);
+        add(decode(segment));
+      }
+      for (const [, value] of url.searchParams) add(value);
+    } catch {
+      // Not parseable as a URL: the literal string is all there is to remove.
+    }
+  }
+  const variants = new Set<string>();
+  for (const secret of secrets) {
+    variants.add(secret);
+    variants.add(secret.replace(/\//g, '\\/'));
+    variants.add(encodeURIComponent(secret));
+    variants.add(encodeURI(secret));
+    variants.add(JSON.stringify(secret).slice(1, -1));
+  }
+  const patterns = [...variants]
+    .filter((v) => v.length >= MIN_SECRET_LENGTH)
+    .sort((a, b) => b.length - a.length)
+    .map((v) => new RegExp(escapeRegExp(v), 'gi'));
+  return (text: string): string => {
+    let out = text;
+    for (const pattern of patterns) out = out.replace(pattern, '<redacted>');
+    return redactUrls(out);
+  };
+}
+
+/**
+ * Applies a redactor, in place, to the message and the stack of every error in a chain (by
+ * `cause`), and returns the same error. The last step before the gateway throws anything.
+ */
+export function sanitizeError<E>(error: E, redact: Redact): E {
+  let current: unknown = error;
+  for (let depth = 0; current instanceof Error && depth < 12; depth += 1) {
+    current.message = redact(current.message);
+    if (typeof current.stack === 'string') current.stack = redact(current.stack);
+    current = current.cause;
+  }
+  return error;
+}
+
+/** The node's own one-line reason, when viem has one, for an error message. Redacted. */
+function nodeDetails(error: unknown, redact: Redact): string {
+  return error instanceof BaseError && error.details ? `: ${redact(error.details)}` : '';
 }
 
 /**
@@ -149,7 +239,11 @@ function nodeDetails(error: unknown): string {
  * message and the node's details (URLs redacted) and a numeric `code`, and drops everything else
  * (viem's request URL, request body and metadata). Our own `ChainError`s are kept as they are.
  */
-export function safeCause(error: unknown, depth = 0): Error | undefined {
+export function safeCause(
+  error: unknown,
+  redact: Redact = redactUrls,
+  depth = 0,
+): Error | undefined {
   if (error === undefined || error === null || depth > 8) return undefined;
   if (error instanceof ChainError) return error;
   let name = 'Error';
@@ -163,9 +257,10 @@ export function safeCause(error: unknown, depth = 0): Error | undefined {
   } else {
     text = String(error);
   }
-  const inner = safeCause((error as { cause?: unknown }).cause, depth + 1);
-  const copy = new Error(redactUrls(text), inner ? { cause: inner } : undefined);
+  const inner = safeCause((error as { cause?: unknown }).cause, redact, depth + 1);
+  const copy = new Error(redact(text), inner ? { cause: inner } : undefined);
   copy.name = name;
+  if (typeof copy.stack === 'string') copy.stack = redact(copy.stack);
   const code = (error as { code?: unknown }).code;
   if (typeof code === 'number' || typeof code === 'string') {
     (copy as Error & { code?: unknown }).code = code;
@@ -214,9 +309,13 @@ const DEFINITE_REJECTIONS: readonly RegExp[] = [
  * outcome is unknown and the caller must check by hash and by reference before re-sending.
  * Matching is case-insensitive. The cause kept on the result is scrubbed of URLs.
  */
-export function mapSubmitError(error: unknown, hash?: TxHash): ChainError {
-  if (error instanceof ChainError) return error;
-  const cause = safeCause(error);
+export function mapSubmitError(
+  error: unknown,
+  hash?: TxHash,
+  redact: Redact = redactUrls,
+): ChainError {
+  if (error instanceof ChainError) return sanitizeError(error, redact);
+  const cause = safeCause(error, redact);
   if (isTransportError(error)) {
     return new ChainUnavailableError(
       'submit: the node did not answer; the outcome is unknown',
@@ -235,10 +334,13 @@ export function mapSubmitError(error: unknown, hash?: TxHash): ChainError {
     return new InsufficientFundsError('submit: insufficient funds for gas', cause);
   }
   if (DEFINITE_REJECTIONS.some((pattern) => pattern.test(text))) {
-    return new SubmissionRejectedError(`submit: rejected by the node${nodeDetails(error)}`, cause);
+    return new SubmissionRejectedError(
+      `submit: this node refused the submission${nodeDetails(error, redact)}`,
+      cause,
+    );
   }
   return new ChainUnavailableError(
-    `submit: unrecognised node error, the outcome is unknown${nodeDetails(error)}`,
+    `submit: unrecognised node error, the outcome is unknown${nodeDetails(error, redact)}`,
     cause,
   );
 }
@@ -251,6 +353,8 @@ function lower(address: string): Address {
 /** A `ChainGateway` for a real node, built on viem. */
 export class ViemChainGateway implements ChainGateway {
   readonly #client: PublicClient;
+  /** Removes the configured RPC URL and its parts from anything the gateway throws. */
+  readonly #redact: Redact;
   private readonly chainId: number;
   private readonly registry: Address;
   private readonly token: Address;
@@ -276,6 +380,7 @@ export class ViemChainGateway implements ChainGateway {
       settlement: ViemChainGateway.toAccount('settlement', options.signers?.settlement),
       compliance: ViemChainGateway.toAccount('compliance', options.signers?.compliance),
     };
+    this.#redact = makeRedactor(options.rpcUrl);
     this.#client = createPublicClient({
       transport: http(options.rpcUrl, {
         timeout: options.timeoutMs ?? 10_000,
@@ -380,6 +485,15 @@ export class ViemChainGateway implements ChainGateway {
   }
 
   async submit(request: SubmitRequest): Promise<TxHash> {
+    try {
+      return await this.#submit(request);
+    } catch (error) {
+      throw sanitizeError(error, this.#redact);
+    }
+  }
+
+  /** `submit` without the final redaction pass. */
+  async #submit(request: SubmitRequest): Promise<TxHash> {
     const kind = request.call?.kind;
     const expected = SIGNER_FOR_CALL[kind];
     if (!expected) throw new SubmissionRejectedError('submit: unknown call kind');
@@ -408,7 +522,10 @@ export class ViemChainGateway implements ChainGateway {
     try {
       ({ to, data } = this.encode(request.call));
     } catch (error) {
-      throw new SubmissionRejectedError(`submit: invalid arguments for ${kind}`, safeCause(error));
+      throw new SubmissionRejectedError(
+        `submit: invalid arguments for ${kind}`,
+        safeCause(error, this.#redact),
+      );
     }
 
     await this.ensureChain();
@@ -435,7 +552,7 @@ export class ViemChainGateway implements ChainGateway {
       const sent = await this.#client.sendRawTransaction({ serializedTransaction: raw });
       return sent.toLowerCase() as TxHash;
     } catch (error) {
-      throw mapSubmitError(error, hash);
+      throw mapSubmitError(error, hash, this.#redact);
     }
   }
 
@@ -607,8 +724,11 @@ export class ViemChainGateway implements ChainGateway {
         } catch (error) {
           this.chainCheck = undefined;
           throw isTransportError(error)
-            ? new ChainUnavailableError('chain id check: the node did not answer', safeCause(error))
-            : new ChainError('chain id check failed', safeCause(error));
+            ? new ChainUnavailableError(
+                'chain id check: the node did not answer',
+                safeCause(error, this.#redact),
+              )
+            : new ChainError('chain id check failed', safeCause(error, this.#redact));
         }
         if (actual !== this.chainId) throw new ChainIdMismatchError(this.chainId, actual);
       })();
@@ -618,15 +738,27 @@ export class ViemChainGateway implements ChainGateway {
 
   /** Runs a node call behind the chain-id check and maps its failures to `ChainError`s. */
   private async run<T>(op: string, fn: () => Promise<T>, checkChain = true): Promise<T> {
-    if (checkChain) await this.ensureChain();
     try {
+      if (checkChain) await this.ensureChain();
       return await fn();
     } catch (error) {
-      if (error instanceof ChainError) throw error;
+      if (error instanceof ChainError) throw sanitizeError(error, this.#redact);
       if (isTransportError(error)) {
-        throw new ChainUnavailableError(`${op}: the node did not answer`, safeCause(error));
+        throw sanitizeError(
+          new ChainUnavailableError(
+            `${op}: the node did not answer`,
+            safeCause(error, this.#redact),
+          ),
+          this.#redact,
+        );
       }
-      throw new ChainError(`${op} failed${nodeDetails(error)}`, safeCause(error));
+      throw sanitizeError(
+        new ChainError(
+          `${op} failed${nodeDetails(error, this.#redact)}`,
+          safeCause(error, this.#redact),
+        ),
+        this.#redact,
+      );
     }
   }
 
