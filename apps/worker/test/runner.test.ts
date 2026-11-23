@@ -170,6 +170,22 @@ describe('WorkerRunner', () => {
     expect(msgs().find((m) => m.msg === 'stopping')).toMatchObject({ level: 'error', exitCode: 1 });
   });
 
+  it('a reorg beyond the indexer window while running exits 1 with an operator hint', async () => {
+    const { engine, runner, msgs } = setup();
+    const done = runner.run();
+    await flush();
+    runner.onFatalAlarm({
+      kind: 'reorg_beyond_window',
+      detail: 'fork at 90, window 128',
+      at: new Date(),
+    });
+    expect(await done).toBe(1);
+    expect(engine.stopped).toBe(1);
+    expect(String(msgs().find((m) => m.msg === 'stopping')?.reason)).toBe(
+      'fatal alarm reorg_beyond_window: fork at 90, window 128 (a reorg deeper than the indexer window: a person must inspect the chain and re-index before restarting)',
+    );
+  });
+
   it('a stop requested before run() is honoured without starting the loop', async () => {
     const { engine, runner } = setup();
     runner.requestStop(1, 'early');
@@ -222,6 +238,8 @@ describe('WorkerAlarmSink', () => {
     sink.raise({ kind: 'deployment_mismatch', detail: 'x', at });
     sink.raise({ kind: 'chain_mismatch', detail: 'y', at });
     expect(fatal).toEqual(['deployment_mismatch', 'chain_mismatch']);
+    sink.raise({ kind: 'reorg_beyond_window', detail: 'fork below the window', at });
+    expect(fatal).toEqual(['deployment_mismatch', 'chain_mismatch', 'reorg_beyond_window']);
     const parsed = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
     expect(parsed[0]).toMatchObject({
       level: 'warn',
@@ -233,7 +251,11 @@ describe('WorkerAlarmSink', () => {
       complianceChangeId: null,
     });
     expect(parsed[1]?.level).toBe('error');
-    expect([...FATAL_ALARMS].sort()).toEqual(['chain_mismatch', 'deployment_mismatch']);
+    expect([...FATAL_ALARMS.keys()].sort()).toEqual([
+      'chain_mismatch',
+      'deployment_mismatch',
+      'reorg_beyond_window',
+    ]);
 
     sink.onFatal = () => {
       throw new Error('boom');

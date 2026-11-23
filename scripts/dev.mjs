@@ -11,6 +11,10 @@
  *
  * Both processes validate the environment themselves (packages/engine/src/env.ts): this script
  * only checks reachability so that a stopped container gives a one-line answer, not a stack.
+ *
+ * DEV ONLY: both processes get the SAME environment, so the API process also holds the signer
+ * keys (it never reads them). Production gives each process its own environment; the API must
+ * not receive SETTLEMENT_SIGNER_KEY / COMPLIANCE_SIGNER_KEY.
  */
 
 import { spawn } from 'node:child_process';

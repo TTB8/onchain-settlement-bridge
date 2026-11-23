@@ -15,7 +15,7 @@
 
 import { describeError, type EngineAlarm } from '@bridge/engine';
 
-import type { WorkerLogger } from './logger';
+import { FATAL_ALARMS, type WorkerLogger } from './logger';
 
 /** What the runner needs from `BridgeEngine`. */
 export interface EngineLoop {
@@ -80,7 +80,11 @@ export class WorkerRunner {
 
   /** Called by the alarm sink for a fatal alarm. */
   onFatalAlarm(alarm: EngineAlarm): void {
-    this.requestStop(1, `fatal alarm ${alarm.kind}: ${alarm.detail}`);
+    const action = FATAL_ALARMS.get(alarm.kind);
+    this.requestStop(
+      1,
+      `fatal alarm ${alarm.kind}: ${alarm.detail}${action === undefined ? '' : ` (${action})`}`,
+    );
   }
 
   /** Startup checks, the loop, and the shutdown. Resolves with the exit code; never rejects. */

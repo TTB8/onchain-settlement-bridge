@@ -78,14 +78,26 @@ function ctx(context: unknown): Record<string, LogValue> {
 }
 
 /**
- * Alarms that mean this worker must not keep running: the database's active deployment is not
- * the one it is bound to, or the node is on another chain. The engine already refuses to do any
- * work then (every tick throws); exiting makes the refusal visible to the orchestrator instead
- * of a silent loop of identical alarms.
+ * Alarms that mean this worker must not keep running, each with the line an operator reads:
+ *
+ * - `deployment_mismatch`: the database's active deployment is not the one it is bound to;
+ * - `chain_mismatch`: the node is on another chain;
+ * - `reorg_beyond_window`: a reorg deeper than the indexer's window; the indexer halts on every
+ *   pass, so nothing new is indexed and nothing can be decided on fresh evidence.
+ *
+ * The engine already refuses the affected work then; exiting makes the refusal visible to the
+ * orchestrator instead of a silent loop of identical alarms.
  */
-export const FATAL_ALARMS: ReadonlySet<AlarmKind> = new Set([
-  'deployment_mismatch',
-  'chain_mismatch',
+export const FATAL_ALARMS: ReadonlyMap<AlarmKind, string> = new Map<AlarmKind, string>([
+  [
+    'deployment_mismatch',
+    'the active deployment is not the configured one: fix the deployment row or TOKEN_ADDRESS / REGISTRY_ADDRESS',
+  ],
+  ['chain_mismatch', 'the node is on another chain than CHAIN_ID: fix RPC_URL'],
+  [
+    'reorg_beyond_window',
+    'a reorg deeper than the indexer window: a person must inspect the chain and re-index before restarting',
+  ],
 ]);
 
 /**

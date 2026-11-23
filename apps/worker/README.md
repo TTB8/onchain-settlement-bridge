@@ -37,9 +37,17 @@ them). Connect as a **non-owner** database role in production (see `apps/api/REA
 
 - Alarms are written as structured `warn` lines (`msg: "alarm"`, kind, detail, ids), redacted with
   the engine's `sanitizeText` and every configured secret (database URL, RPC URL, both keys).
-- `deployment_mismatch` and `chain_mismatch` while running are **fatal**: the engine already
-  refuses to work (every tick throws), so the worker stops and exits 1 instead of looping on the
-  same alarm; the orchestrator sees it.
+- `deployment_mismatch`, `chain_mismatch` and `reorg_beyond_window` while running are **fatal**:
+  the engine already refuses the affected work (a mismatch makes every tick throw; a reorg deeper
+  than the indexer window halts the indexer on every pass), so the worker stops and exits 1 with
+  a line naming what a person must fix, instead of looping on the same alarm.
+- **Alarms are log lines only.** There is no transport (no pager, no webhook, no table): ship the
+  worker's stdout to a log pipeline and alert on `"msg":"alarm"`, or wire a real `AlarmSink`.
+- **The non-owner database role is not enforced by the app** (see `apps/api/README.md`): it is an
+  operator obligation.
+- **`pnpm dev` runs both apps with ONE environment**, so locally the API process also holds the
+  signer keys in its environment (it never reads them). In production give each process its own
+  environment: the API must not have `SETTLEMENT_SIGNER_KEY` / `COMPLIANCE_SIGNER_KEY` at all.
 - SIGTERM / SIGINT: stop scheduling ticks, wait for the tick in progress (bounded by
   `SHUTDOWN_TIMEOUT_MS`, default 30 s; past it exit 1), then close the context (Prisma
   disconnects). Exit 0 after a clean stop. Cutting a tick short is safe (commit before broadcast,
