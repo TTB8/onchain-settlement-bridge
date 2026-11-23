@@ -29,7 +29,9 @@ export type EngineErrorCode =
   | 'EVIDENCE_REFUSED'
   | 'HANDLER_TIMEOUT'
   | 'RETRIES_EXHAUSTED'
-  | 'LEDGER_SETUP';
+  | 'LEDGER_SETUP'
+  | 'LEASE_LOST'
+  | 'SIGNED_HASH_MISMATCH';
 
 /** Base class of every error the engine throws on purpose. */
 export abstract class EngineError extends Error {
@@ -176,6 +178,24 @@ export class RetriesExhaustedError extends EngineError {
 /** The ledger is not set up (no `fiat_clearing` account): run the seed. */
 export class LedgerSetupError extends EngineError {
   readonly code = 'LEDGER_SETUP' as const;
+}
+
+/**
+ * The outbox row's lease is no longer ours (another worker took it, it was cancelled, or the
+ * handler's time limit fired). Nothing may be committed or broadcast for the row by this worker:
+ * the outcome is unknown to the dispatcher (a retry), never a failure.
+ */
+export class LeaseLostError extends EngineError {
+  readonly code = 'LEASE_LOST' as const;
+}
+
+/**
+ * A broadcast reported a different transaction hash than the one recorded when the attempt was
+ * signed. The bytes on the wire are not the bytes in `chain_attempt`, so the outcome is UNKNOWN
+ * (ADR 0009): retried, never treated as a rejection, and worth an alarm.
+ */
+export class SignedHashMismatchError extends EngineError {
+  readonly code = 'SIGNED_HASH_MISMATCH' as const;
 }
 
 /**
