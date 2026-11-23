@@ -32,7 +32,8 @@ export type EngineErrorCode =
   | 'LEDGER_SETUP'
   | 'LEASE_LOST'
   | 'SIGNED_TX_MISMATCH'
-  | 'SIGNER_MISMATCH';
+  | 'SIGNER_MISMATCH'
+  | 'UNSAFE_ISOLATION';
 
 /** Base class of every error the engine throws on purpose. */
 export abstract class EngineError extends Error {
@@ -198,6 +199,15 @@ export class LeaseLostError extends EngineError {
  */
 export class SignedTransactionMismatchError extends EngineError {
   readonly code = 'SIGNED_TX_MISMATCH' as const;
+}
+
+/**
+ * Nonce allocation was asked to run at an isolation level other than READ COMMITTED. Under a
+ * snapshot older than the statement, the read of the nonces already held misses a concurrent
+ * winner and two operations can record one nonce (review round 2, L-B). Refused, never run.
+ */
+export class UnsafeIsolationError extends EngineError {
+  readonly code = 'UNSAFE_ISOLATION' as const;
 }
 
 /**

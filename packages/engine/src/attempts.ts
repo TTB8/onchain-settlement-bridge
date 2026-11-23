@@ -48,6 +48,7 @@ import {
   LeaseLostError,
   RetriesExhaustedError,
   SignedTransactionMismatchError,
+  UnsafeIsolationError,
 } from './errors';
 import { writeAudit } from './ledger-writes';
 import { describeError, type SanitizeOptions } from './redact';
@@ -288,6 +289,13 @@ export interface FreshNonceCommit<T> {
  * @param args See `FreshNonceCommit`.
  */
 export async function commitWithFreshNonce<T>(args: FreshNonceCommit<T>): Promise<T> {
+  // READ COMMITTED is what makes the held-nonce read see a concurrent winner: refuse anything
+  // else rather than silently weaken the guarantee (the database refuses it too, guard 8).
+  const level = args.transactions?.isolationLevel ?? 'ReadCommitted';
+  if (level !== 'ReadCommitted') {
+    throw new UnsafeIsolationError(`nonce allocation needs READ COMMITTED, not ${level}`);
+  }
+  const transactions = { ...args.transactions, isolationLevel: 'ReadCommitted' as const };
   let last: unknown;
   for (let i = 1; i <= 3; i += 1) {
     const predicted = await predictNonce(args.prisma, args.allocation);
@@ -302,7 +310,7 @@ export async function commitWithFreshNonce<T>(args: FreshNonceCommit<T>): Promis
           if (nonce !== predicted) throw new NonceMovedError();
           return args.commit(tx, request, signed);
         },
-        args.transactions,
+        transactions,
       );
       return value;
     } catch (err) {

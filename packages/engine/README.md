@@ -286,6 +286,26 @@ noise and gas. `start()`/`stop()` loop around `tick()` without overlap.
 - **Rollback audit.** The indexer's rollback audit row lists every deleted event (`deletedEvents`:
   block, block hash, tx hash, log index, kind, ref, amount).
 
+### Review round 2
+
+- **N-1, drop patience.** Every rebroadcast of an existing nonce is stamped on the attempt
+  (`last_checked_at`, compare-and-set) in the transaction that decides it, before the broadcast,
+  whatever the node answers; the next one waits `dropRetrySeconds` from that stamp. Once the
+  domain's counter is used up (`give_up(max_resubmits)`), a nonce that is not final is still
+  rebroadcast on that cadence, uncounted, before and after `giveUpAfterSeconds` (which only raises
+  `nonce_stuck`). The new-nonce budget counts new nonces (distinct attempt nonces - 1), not
+  rebroadcasts.
+- **L-A.** `operation_skipped` after `skipAlarmPasses` consecutive failed evidence reads of one
+  operation (an in-memory counter per operation id; a restart only delays the alarm).
+- **L-B.** `commitWithFreshNonce` runs at READ COMMITTED and refuses any other level
+  (`UnsafeIsolationError`); the database refuses it too (guard 8 of `@bridge/db`: one nonce, one
+  outbox row; attempts recorded at READ COMMITTED only).
+- **Inspector.** Also refuses a non-zero `value` and calldata with trailing bytes, and compares the
+  gas limit when the caller passes `gasLimit`.
+- **Inactive deployment.** An engine bound to an inactive deployment refuses to run
+  (`assertDeployment`). Nothing needs draining: the database refuses to deactivate a deployment
+  with work in flight.
+
 ### Info (documented, not enforced)
 
 - One outbox row per (deployment, signer, nonce) is lock discipline only (`signer_state FOR

@@ -68,6 +68,8 @@ export class FakeTransactionInspector implements RawTransactionInspector {
       maxFeePerGas: d.fees.maxFeePerGas,
       maxPriorityFeePerGas: d.fees.maxPriorityFeePerGas,
       from: d.from,
+      value: 0n, // the fake's encoding carries no value: the bridge never sends any
+      gas: null,
     };
   }
 }

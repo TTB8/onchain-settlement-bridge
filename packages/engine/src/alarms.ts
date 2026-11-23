@@ -43,7 +43,9 @@ export type AlarmKind =
   /** One component of `tick()` threw; the others still ran. */
   | 'component_failed'
   /** The gateway's deployment is not the database's active deployment: the engine refuses to run. */
-  | 'deployment_mismatch';
+  | 'deployment_mismatch'
+  /** An operation's evidence read failed for the configured number of passes in a row. */
+  | 'operation_skipped';
 
 /** One raised alarm. */
 export interface EngineAlarm {

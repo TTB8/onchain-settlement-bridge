@@ -12,8 +12,6 @@
 import type { ChainGateway } from '@bridge/chain';
 import type { PrismaClient } from '@bridge/db';
 
-const ADDRESS = /^0x[0-9a-f]{40}$/;
-
 import { AlarmLog, type AlarmSink } from './alarms';
 import { DeploymentMismatchError, InvalidRequestError } from './errors';
 import { Indexer, type IndexerResult } from './indexer';
@@ -26,6 +24,8 @@ import type { RawTransactionInspector } from './signing';
 import { bindingOf, type DeploymentBinding, isBound } from './signer-binding';
 import type { TransactionOptions } from './transaction';
 import { type MonitorSummary, TxMonitor } from './tx-monitor';
+
+const ADDRESS = /^0x[0-9a-f]{40}$/;
 
 /**
  * Default resubmissions after a drop: 3. WHY: a node forgets a pooled transaction for transient
@@ -101,6 +101,8 @@ export interface BridgeEngineConfig {
   readonly failedAlarmAfterSeconds?: number;
   /** Age before an unsent reserved operation is released. Default `DEFAULT_ORPHAN_AFTER_SECONDS`. */
   readonly orphanAfterSeconds?: number;
+  /** Consecutive failed evidence reads of one operation before `operation_skipped`. Default 10. */
+  readonly skipAlarmPasses?: number;
   /** Most blocks the indexer scans per pass. Default 500. */
   readonly indexerMaxBatch?: number;
   /** Stored blocks compared with the node per pass. Default 128. */
@@ -299,6 +301,7 @@ export class BridgeEngine {
         failedAlarmAfterSeconds:
           config.failedAlarmAfterSeconds ?? DEFAULT_FAILED_ALARM_AFTER_SECONDS,
         orphanAfterSeconds: config.orphanAfterSeconds ?? DEFAULT_ORPHAN_AFTER_SECONDS,
+        skipAlarmPasses: config.skipAlarmPasses ?? 10,
       },
       alarms: this.alarms,
       transactions,
@@ -318,12 +321,16 @@ export class BridgeEngine {
     });
   }
 
-  /** One dispatcher pass, one indexer pass, one monitor pass, in that order. */
   /**
    * Review M-2: the gateway's deployment must be the database's ACTIVE deployment of its chain
    * (chain id, token AND registry). Otherwise the engine would sign for, read evidence from, or
    * index another contract than the one operations are bound to. Raises `deployment_mismatch`
    * and throws `DeploymentMismatchError`; nothing runs.
+   *
+   * An engine bound to an INACTIVE deployment therefore refuses to run at all. There is nothing
+   * left for it to drain: the database refuses to deactivate a deployment while any of its
+   * operations or compliance changes is not final (guard 6b), so an inactive deployment has no
+   * work in flight.
    */
   async assertDeployment(): Promise<void> {
     const active = await this.prisma.deployment.findFirst({
@@ -340,6 +347,10 @@ export class BridgeEngine {
     }
   }
 
+  /**
+   * One pass: the deployment check, then one dispatcher pass, one indexer pass, one monitor pass,
+   * in that order, each isolated from the others' failures.
+   */
   async tick(): Promise<TickSummary> {
     await this.assertDeployment();
     // Each component is isolated (review L-2): an indexer that throws must not stop the monitor

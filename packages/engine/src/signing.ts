@@ -33,7 +33,13 @@ import {
   settlementTokenAbi,
   type SubmitRequest,
 } from '@bridge/chain';
-import { decodeFunctionData, keccak256, parseTransaction, recoverTransactionAddress } from 'viem';
+import {
+  decodeFunctionData,
+  encodeFunctionData,
+  keccak256,
+  parseTransaction,
+  recoverTransactionAddress,
+} from 'viem';
 
 import { SignedTransactionMismatchError } from './errors';
 
@@ -55,6 +61,10 @@ export interface DecodedTransaction {
   readonly maxPriorityFeePerGas: bigint;
   /** The address the signature recovers to (lowercase). */
   readonly from: Address;
+  /** The ether sent with it (the bridge never sends any). */
+  readonly value: bigint;
+  /** The gas limit, or null when the encoding carries none (the fake's). */
+  readonly gas: bigint | null;
 }
 
 /** Decodes signed bytes (and recovers their sender). */
@@ -77,6 +87,8 @@ export interface SigningExpectation {
   readonly registry: Address;
   /** The deployment's recorded address for the request's signer (`signer_state`). */
   readonly signerAddress: Address;
+  /** The gas limit the gateway is configured with, when the caller knows it: then compared. */
+  readonly gasLimit?: bigint;
 }
 
 const lower = (a: string): Address => a.toLowerCase() as Address;
@@ -117,6 +129,8 @@ export function signedTransactionDifferences(
     out.push('maxPriorityFeePerGas');
   }
   if (lower(decoded.from) !== lower(expected.signerAddress)) out.push('from');
+  if (decoded.value !== 0n) out.push('value');
+  if (expected.gasLimit !== undefined && decoded.gas !== expected.gasLimit) out.push('gas');
   return out;
 }
 
@@ -180,7 +194,10 @@ function asRef(v: unknown): `0x${string}` {
   return v.toLowerCase() as `0x${string}`;
 }
 
-/** Decodes bridge calldata into a `ContractCall`. Throws for anything else. */
+/**
+ * Decodes bridge calldata into a `ContractCall`. Throws for anything else, including calldata with
+ * bytes after the encoded arguments (the ABI decoder ignores them; re-encoding shows them).
+ */
 export function callFromCalldata(data: Hex): ContractCall {
   for (const abi of ABIS) {
     let decoded: { functionName: string; args: readonly unknown[] | undefined };
@@ -188,6 +205,14 @@ export function callFromCalldata(data: Hex): ContractCall {
       decoded = decodeFunctionData({ abi, data }) as typeof decoded;
     } catch {
       continue;
+    }
+    const again = encodeFunctionData({
+      abi,
+      functionName: decoded.functionName,
+      args: decoded.args,
+    } as Parameters<typeof encodeFunctionData>[0]);
+    if (again.toLowerCase() !== data.toLowerCase()) {
+      throw new TypeError('calldata carries bytes after the encoded arguments');
     }
     const a = decoded.args ?? [];
     switch (decoded.functionName) {
@@ -253,6 +278,8 @@ export class ViemTransactionInspector implements RawTransactionInspector {
       maxFeePerGas: tx.maxFeePerGas,
       maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
       from: lower(from),
+      value: tx.value ?? 0n,
+      gas: tx.gas ?? null,
     };
   }
 }

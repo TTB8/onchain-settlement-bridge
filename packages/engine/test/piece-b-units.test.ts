@@ -15,10 +15,11 @@ import {
   type SubmitRequest,
   type ChainGateway,
   type SignedTransaction,
+  settlementTokenAbi,
   ViemChainGateway,
 } from '@bridge/chain';
 import type { PrismaClient } from '@bridge/db';
-import { keccak256 } from 'viem';
+import { encodeFunctionData, keccak256 } from 'viem';
 
 import {
   AlarmLog,
@@ -214,6 +215,65 @@ describe('signAndVerify (review M-3): the signed bytes are checked before anythi
     await expect(signAndVerify(lying(other), inspector, request(), expected)).rejects.toThrow(why);
   });
 
+  /** Signs a raw EIP-1559 transaction directly with the dev settlement key (DEV ONLY). */
+  const rawSign = async (over: { value?: bigint; data?: `0x${string}`; gas?: bigint }) => {
+    const data =
+      over.data ??
+      encodeFunctionData({ abi: settlementTokenAbi, functionName: 'mint', args: [A, 5n, REF] });
+    const raw = await devAccount(1).signTransaction({
+      type: 'eip1559',
+      chainId: 31337,
+      nonce: 3,
+      to: TOKEN,
+      data,
+      value: over.value ?? 0n,
+      gas: over.gas ?? 300_000n,
+      maxFeePerGas: 10n ** 10n,
+      maxPriorityFeePerGas: 10n ** 9n,
+    });
+    return { raw, hash: keccak256(raw) };
+  };
+
+  it('refuses a transaction that sends ether', async () => {
+    await expect(
+      signAndVerify(
+        lying(() => rawSign({ value: 1n })),
+        inspector,
+        request(),
+        expected,
+      ),
+    ).rejects.toThrow(/value/);
+    await expect(
+      signAndVerify(
+        lying(() => rawSign({})),
+        inspector,
+        request(),
+        expected,
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it('refuses calldata with trailing bytes', async () => {
+    const data =
+      `${encodeFunctionData({ abi: settlementTokenAbi, functionName: 'mint', args: [A, 5n, REF] })}00` as `0x${string}`;
+    await expect(
+      signAndVerify(
+        lying(() => rawSign({ data })),
+        inspector,
+        request(),
+        expected,
+      ),
+    ).rejects.toThrow(/decoded/);
+  });
+
+  it('compares the gas limit when the caller knows it', async () => {
+    const g = lying(() => rawSign({ gas: 21_000n }));
+    await expect(signAndVerify(g, inspector, request(), expected)).resolves.toBeDefined();
+    await expect(
+      signAndVerify(g, inspector, request(), { ...expected, gasLimit: 300_000n }),
+    ).rejects.toThrow(/gas/);
+  });
+
   it('the fake inspector checks the fake encoding the same way', async () => {
     const chain = new SpyChain({ chainId: 4242 });
     const dep = chain.deployment();
@@ -295,6 +355,7 @@ describe('BridgeEngine construction and loop', () => {
       giveUpAfterSeconds: 1,
       failedAlarmAfterSeconds: 1,
       orphanAfterSeconds: 1,
+      skipAlarmPasses: 1,
     };
     expect(() => new TxMonitor({ ...base, policy: { ...policy, confirmationDepth: 0 } })).toThrow(
       RangeError,

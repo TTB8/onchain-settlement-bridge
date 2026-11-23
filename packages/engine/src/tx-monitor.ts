@@ -114,13 +114,16 @@ export interface MonitorPolicy {
    */
   readonly headStallTicks: number;
   /**
-   * Seconds between two rebroadcasts of a dropped attempt. Patience is measured in time, not in
-   * passes: a fast poll interval must not burn through `maxResubmits` in seconds.
+   * Seconds between two rebroadcasts of a dropped attempt, measured from the last rebroadcast
+   * (stamped when it is decided, whatever the node answered). Patience is time, not passes: a fast
+   * poll or a flaky node must not burn through `maxResubmits` in seconds.
    */
   readonly dropRetrySeconds: number;
   /**
-   * Seconds since an operation's first attempt before a `give_up` verdict is acted on. Before
-   * that, the engine keeps waiting (and rebroadcasting at `dropRetrySeconds`).
+   * Seconds since an operation's first attempt before a `give_up` verdict raises `nonce_stuck`.
+   * A dropped attempt whose nonce is not final is rebroadcast at `dropRetrySeconds` for as long
+   * as it stays dropped, before and after this point: `maxResubmits` bounds the COUNTED
+   * resubmissions and new-nonce resubmissions, never the rebroadcast of an existing nonce.
    */
   readonly giveUpAfterSeconds: number;
   /** Seconds a failed operation may stay unreversible before `failed_not_reversible`. */
@@ -130,6 +133,8 @@ export interface MonitorPolicy {
    * failed and released (nothing was ever signed for it).
    */
   readonly orphanAfterSeconds: number;
+  /** Consecutive passes an operation's evidence read may fail before `operation_skipped`. */
+  readonly skipAlarmPasses: number;
 }
 
 /** Construction options for `TxMonitor`. */
@@ -248,6 +253,11 @@ export class TxMonitor {
   private lastHead: bigint | null = null;
   private stalledPasses = 0;
   private failedReads = 0;
+  /**
+   * Consecutive failed evidence reads per operation id (review round 2, L-A). In memory: it
+   * restarts at zero with the process, which only delays the alarm by `skipAlarmPasses` passes.
+   */
+  private readonly skips = new Map<string, number>();
 
   /** @param options Database, gateway, signer, clock, binding, policy and alarm sink. */
   constructor(options: TxMonitorOptions) {
@@ -324,10 +334,20 @@ export class TxMonitor {
       let evidence: Evidence;
       try {
         evidence = await this.gather(op, deployment, view);
-      } catch {
+      } catch (err) {
         skipped += 1;
+        const n = (this.skips.get(op.id) ?? 0) + 1;
+        this.skips.set(op.id, n);
+        if (n >= this.policy.skipAlarmPasses) {
+          this.alarm(
+            'operation_skipped',
+            `evidence read failed ${n} pass(es) in a row: ${describeError(err, this.redaction)}`,
+            op.id,
+          );
+        }
         continue;
       }
+      this.skips.delete(op.id);
       try {
         const outcome = await this.decide(op, deployment, view, evidence);
         if (outcome !== null) counts[outcome] += 1;
@@ -564,7 +584,7 @@ export class TxMonitor {
       case 'dropped':
         return this.dropped(op, d, latest, now);
       case 'give_up':
-        return this.givenUp(op, ev, view, verdict.why, now);
+        return this.givenUp(op, d, ev, view, verdict.why, now);
       case 'replaced_or_lost':
         return this.replacedOrLost(op, d, view, ev, verdicts);
       default:
@@ -583,13 +603,13 @@ export class TxMonitor {
     d: Deployment,
     latest: AttemptWithCall,
     now: Date,
+    counted = true,
   ): Promise<Outcome | null> {
     const lastSent = latest.lastCheckedAt ?? latest.submittedAt;
     if (now.getTime() - lastSent.getTime() < this.policy.dropRetrySeconds * 1000) return null;
     const estimate = await this.gateway.estimateFees();
     if (latest.maxFeePerGas >= estimate.maxFeePerGas) {
-      await this.resubmitSame(op, latest);
-      return 'resubmitted';
+      return (await this.resubmitSame(op, latest, now, counted)) ? 'resubmitted' : null;
     }
     let fees: Fees;
     try {
@@ -628,6 +648,7 @@ export class TxMonitor {
    */
   private async givenUp(
     op: Operation,
+    d: Deployment,
     ev: Evidence,
     view: ChainView,
     why: 'max_bumps' | 'fee_cap' | 'max_resubmits',
@@ -636,18 +657,23 @@ export class TxMonitor {
     const first = ev.attempts[0];
     const latest = ev.attempts[ev.attempts.length - 1];
     if (first === undefined || latest === undefined) return null;
-    if (now.getTime() - first.submittedAt.getTime() < this.policy.giveUpAfterSeconds * 1000) {
-      return null;
-    }
-    if (latest.nonce >= view.finalNonce) {
+    const patient =
+      now.getTime() - first.submittedAt.getTime() < this.policy.giveUpAfterSeconds * 1000;
+    const notFinal = latest.nonce >= view.finalNonce;
+    if (!patient && notFinal) {
       this.alarm(
         'nonce_stuck',
         `settlement signer ${this.gateway.signerAddress('settlement')}: nonce ${view.finalNonce} ` +
           `is the lowest non-final nonce; this operation's nonce ${latest.nonce} gave up (${why})`,
         op.id,
       );
-      return null;
     }
+    // Review round 2, N-1: the resubmit COUNTER ran out, but the nonce is still ours and open.
+    // Rebroadcasting the same bytes is always safe (same nonce, same reference) and is the only
+    // way a dropped transaction gets mined again, so keep doing it on the dropRetrySeconds
+    // cadence, uncounted, before and after the give-up point.
+    if (why === 'max_resubmits' && notFinal) return this.dropped(op, d, latest, now, false);
+    if (patient || notFinal) return null;
     await this.fail(op, giveUpReason(why), `gave up: ${why}`);
     return 'failed';
   }
@@ -677,7 +703,10 @@ export class TxMonitor {
       );
       return null;
     }
-    if (op.resubmitsSoFar >= this.policy.maxResubmits) {
+    // The NEW-NONCE budget counts new nonces only (review round 2, N-1): rebroadcasts of an
+    // existing nonce share the domain's counter but must not use this budget up.
+    const newNonces = new Set(ev.attempts.map((a) => a.nonce)).size - 1;
+    if (newNonces >= this.policy.maxResubmits) {
       await this.fail(op, 'retries_exhausted', 'nonce taken and resubmissions exhausted');
       return 'failed';
     }
@@ -746,6 +775,12 @@ export class TxMonitor {
    * operation row locked and every condition re-checked there (a row claimed meanwhile, or an
    * attempt committed meanwhile, stops it), FAIL (`rejected`) then REVERSE with evidence read
    * this pass: no attempt, no indexed event, the reference unused at the final block.
+   *
+   * The FAIL commits even when `mayReverse` refuses the evidence (an indexed event, or the
+   * reference already consumed on chain): the operation is then `failed` and held, visible, and
+   * the failed path takes over (the `escalation` alarm for a consumed reference with no event, a
+   * late confirmation if its settling event appears, `failed_not_reversible` after a while). Only
+   * the reversal is skipped.
    */
   private async sweepOrphans(d: Deployment, view: ChainView): Promise<number> {
     const before = new Date(this.clock.now().getTime() - this.policy.orphanAfterSeconds * 1000);
@@ -923,15 +958,45 @@ export class TxMonitor {
     await this.broadcast(op, attempt);
   }
 
-  /** The node forgot it: rebroadcast the same signed bytes (SUBMIT `resubmit`, no new attempt). */
-  private async resubmitSame(op: Operation, latest: AttemptWithCall): Promise<void> {
-    await this.move(
-      op,
-      { event: 'SUBMIT', kind: 'resubmit', resubmitsSoFar: op.resubmitsSoFar },
-      `rebroadcast of nonce ${latest.nonce} after a drop`,
-      latest.hash,
+  /**
+   * The node forgot it: rebroadcast the same signed bytes (no new attempt). The rebroadcast time
+   * is stamped on the attempt in the SAME transaction as the decision (and, when `counted`, the
+   * SUBMIT `resubmit` move), compare-and-set on the previous stamp, BEFORE the broadcast: an
+   * unknown answer (a flaky node) must not make the next pass rebroadcast again at once
+   * (review round 2, N-1). Returns false when another monitor stamped it first (nothing sent).
+   */
+  private async resubmitSame(
+    op: Operation,
+    latest: AttemptWithCall,
+    now: Date,
+    counted: boolean,
+  ): Promise<boolean> {
+    const { value: stamped } = await runTransaction(
+      this.prisma,
+      async (tx) => {
+        const r = await tx.chainAttempt.updateMany({
+          where: { id: latest.id, lastCheckedAt: latest.lastCheckedAt },
+          data: { lastCheckedAt: now },
+        });
+        if (r.count !== 1) return false;
+        if (counted) {
+          await moveOperation(tx, {
+            operationId: op.id,
+            from: 'submitted',
+            version: op.version,
+            move: { event: 'SUBMIT', kind: 'resubmit', resubmitsSoFar: op.resubmitsSoFar },
+            at: now,
+            txHash: latest.hash as `0x${string}`,
+            note: `rebroadcast of nonce ${latest.nonce} after a drop`,
+          });
+        }
+        return true;
+      },
+      this.transactions,
     );
+    if (!stamped) return false;
     await this.broadcast(op, latest);
+    return true;
   }
 
   /** Every nonce we used is finally taken by something else: sign with a NEW nonce. */

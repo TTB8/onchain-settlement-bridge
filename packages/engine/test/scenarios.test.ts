@@ -553,7 +553,7 @@ describe('reverts, drops, bumps and give-ups (ADR 0006, 0007)', () => {
   it('dropped and never mined: no FAIL while the nonce is not final (nonce_stuck); reverse ONLY once the nonce use is final (obligations 2, 4, 7)', async () => {
     const rig = await makeRig(
       db.prisma,
-      { maxResubmits: 1, confirmationDepth: 3 },
+      { maxResubmits: 0, confirmationDepth: 3 },
       { automine: false },
     );
     const alice = await verifiedUser(rig);
@@ -564,14 +564,14 @@ describe('reverts, drops, bumps and give-ups (ADR 0006, 0007)', () => {
     const hash = attempt?.hash as `0x${string}`;
     rig.chain.dropTransaction(hash);
     rig.clock.advance(31_000);
-    await rig.engine.tick(); // dropped: resubmit (1 of 1)
+    await rig.engine.tick(); // dropped, no counted resubmits allowed: rebroadcast uncounted
+    expect(rig.chain.mempoolHashes()).toEqual([hash]);
     rig.chain.dropTransaction(hash);
-    rig.clock.advance(31_000);
-    await rig.engine.tick(); // dropped again: the domain gives up, too early to act
     rig.clock.advance(300_000);
-    await rig.engine.tick();
+    await rig.engine.tick(); // past giveUpAfterSeconds: nonce_stuck, and still rebroadcast
     expect(await statusOf(dep.id)).toBe('submitted'); // nonce never used: it can still mine
     expect(rig.alarms.ofKind('nonce_stuck').length).toBeGreaterThan(0);
+    rig.chain.dropTransaction(hash);
 
     // Something else takes the nonce (an operator's transaction from the same key).
     await rig.chain.submit({
@@ -1275,5 +1275,96 @@ describe('review M-2: the gateway deployment must be the active deployment', () 
     expect(() => new BridgeEngine(deps, { ...configFor(chain), tokenAddress: 'nope' })).toThrow(
       InvalidRequestError,
     );
+  });
+});
+
+describe('review round 2, N-1: drop patience survives a flaky node', () => {
+  it('an unknown answer to a rebroadcast still stamps it: passes under dropRetrySeconds do not rebroadcast again', async () => {
+    const rig = await makeRig(db.prisma, {}, { automine: false });
+    const alice = await verifiedUser(rig);
+    rig.chain.mine();
+    const dep = await deposit(rig, alice, 3n);
+    await rig.engine.tick();
+    const [attempt] = await attemptsOf(db.prisma, dep.id);
+    rig.chain.dropTransaction(attempt?.hash as `0x${string}`);
+    rig.clock.advance(31_000);
+    rig.chain.failNextSubmit(new ChainUnavailableError('proxy 502'));
+    await rig.engine.tick();
+    expect((await opRow(db.prisma, dep.id)).resubmitsSoFar).toBe(1);
+    const sent = rig.signer.broadcasts.length;
+    for (let i = 0; i < 4; i += 1) {
+      rig.clock.advance(5_000); // 20 s in total, under dropRetrySeconds (30 s)
+      await rig.engine.tick();
+    }
+    expect(rig.signer.broadcasts.length).toBe(sent);
+    expect((await opRow(db.prisma, dep.id)).resubmitsSoFar).toBe(1);
+  });
+
+  it('a node restart that drops nonce n and answers unknown or drops it 5 times: n is rebroadcast (same bytes) and mined once it recovers', async () => {
+    const rig = await makeRig(db.prisma, {}, { automine: false }); // maxResubmits 3 (default)
+    const alice = await verifiedUser(rig);
+    rig.chain.mine();
+    const dep = await deposit(rig, alice, 9n);
+    await rig.engine.tick();
+    const [attempt] = await attemptsOf(db.prisma, dep.id);
+    const hash = attempt?.hash as `0x${string}`;
+    for (let i = 0; i < 5; i += 1) {
+      rig.chain.dropTransaction(hash);
+      if (i % 2 === 0) rig.chain.failNextSubmit(new ChainUnavailableError('node restarting'));
+      rig.clock.advance(31_000);
+      await rig.engine.tick();
+      expect(await statusOf(dep.id)).toBe('submitted');
+    }
+    expect((await opRow(db.prisma, dep.id)).resubmitsSoFar).toBe(3); // the counter ran out...
+    rig.chain.dropTransaction(hash);
+    rig.clock.advance(31_000);
+    await rig.engine.tick(); // ...but the same bytes are still rebroadcast
+    expect(rig.chain.mempoolHashes()).toEqual([hash]);
+    rig.chain.mine();
+    await rig.engine.tick();
+    expect(await statusOf(dep.id)).toBe('confirmed');
+    expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(1);
+    expect(new Set(rig.signer.broadcasts)).toEqual(new Set([hash]));
+    expect(rig.chain.balanceOf(alice.wallet as `0x${string}`)).toBe(9n);
+  });
+});
+
+describe('review round 2, L-A: an operation skipped pass after pass is alarmed', () => {
+  it('operation_skipped after skipAlarmPasses consecutive failed evidence reads; a good read resets it', async () => {
+    const rig = await makeRig(db.prisma, { skipAlarmPasses: 3 }, { automine: false });
+    const alice = await verifiedUser(rig);
+    rig.chain.mine();
+    const dep = await deposit(rig, alice, 3n);
+    await rig.engine.tick();
+    const original = rig.chain.getReceipt.bind(rig.chain);
+    rig.chain.getReceipt = async () => {
+      throw new ChainUnavailableError('flaky');
+    };
+    await rig.engine.monitor.runOnce();
+    await rig.engine.monitor.runOnce();
+    expect(rig.alarms.ofKind('operation_skipped')).toHaveLength(0);
+    await rig.engine.monitor.runOnce();
+    expect(rig.alarms.ofKind('operation_skipped').map((a) => a.operationId)).toEqual([dep.id]);
+    rig.chain.getReceipt = original;
+    await rig.engine.monitor.runOnce(); // a good read resets the count
+    rig.chain.getReceipt = async () => {
+      throw new ChainUnavailableError('flaky');
+    };
+    await rig.engine.monitor.runOnce();
+    await rig.engine.monitor.runOnce();
+    rig.chain.getReceipt = original;
+    expect(rig.alarms.ofKind('operation_skipped')).toHaveLength(1);
+  });
+});
+
+describe('review round 2, L-B: nonce allocation runs at READ COMMITTED only', () => {
+  it('an engine configured for REPEATABLE READ refuses to allocate a nonce (UnsafeIsolationError), nothing stored', async () => {
+    const rig = await makeRig(db.prisma, { transactions: { isolationLevel: 'RepeatableRead' } });
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 3n);
+    await rig.engine.dispatcher.runOnce();
+    const row = await db.prisma.outboxMessage.findFirstOrThrow({ where: { operationId: dep.id } });
+    expect(row.lastError).toContain('UnsafeIsolationError');
+    expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(0);
   });
 });
