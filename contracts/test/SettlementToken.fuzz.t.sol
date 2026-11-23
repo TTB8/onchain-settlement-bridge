@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ISettlementToken} from "../src/interfaces/ISettlementToken.sol";
 import {BridgeTest} from "./BridgeTest.sol";
 
@@ -144,7 +145,12 @@ contract SettlementTokenFuzzTest is BridgeTest {
         amount = bound(amount, 1, MAX_AMOUNT);
         // The zero address can be neither a spender (ERC-20 rejects the approval) nor a recipient.
         vm.assume(caller != address(0) && to != address(0));
+        _enableHolderTransfers();
         _mint(alice, MAX_AMOUNT);
+        // An allowed spender, approved before the freeze, so only the freeze can stop it.
+        vm.prank(alice);
+        token.approve(caller, amount);
+        _verify(caller);
         _freeze(alice);
         bytes32 ref = _nextRef();
 
@@ -159,8 +165,6 @@ contract SettlementTokenFuzzTest is BridgeTest {
         token.burn(alice, amount, ref);
 
         // ...nor can any spender, even one approved before the freeze.
-        vm.prank(alice);
-        token.approve(caller, amount);
         vm.expectRevert(abi.encodeWithSelector(ISettlementToken.NotAllowed.selector, alice));
         vm.prank(caller);
         token.transferFrom(alice, to, amount);
@@ -173,6 +177,7 @@ contract SettlementTokenFuzzTest is BridgeTest {
     {
         minted = bound(minted, 1, MAX_AMOUNT);
         sent = bound(sent, 0, minted);
+        _enableHolderTransfers();
         _mint(alice, minted);
 
         vm.prank(alice);
@@ -180,5 +185,132 @@ contract SettlementTokenFuzzTest is BridgeTest {
 
         assertEq(token.balanceOf(alice) + token.balanceOf(bob), minted);
         assertEq(token.totalSupply(), minted);
+    }
+
+    // --- the holder-transfer switch ------------------------------------------------------------
+
+    function testFuzz_theHolderPathIsClosedByDefaultForEveryone(
+        address caller,
+        address from,
+        address to,
+        uint256 amount
+    ) public {
+        amount = bound(amount, 0, MAX_AMOUNT);
+        _mint(alice, MAX_AMOUNT);
+
+        vm.startPrank(caller);
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        token.transfer(to, amount);
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        token.approve(to, amount);
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        token.transferFrom(from, to, amount);
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(alice), MAX_AMOUNT);
+        assertEq(token.allowance(caller, to), 0);
+    }
+
+    function testFuzz_theSwitchNeverAffectsThePlatformPaths(
+        bool enabled,
+        uint256 minted,
+        uint256 moved,
+        uint256 burned
+    ) public {
+        minted = bound(minted, 2, MAX_AMOUNT);
+        moved = bound(moved, 1, minted - 1);
+        burned = bound(burned, 1, minted - moved);
+        vm.prank(admin);
+        token.setHolderTransfersEnabled(enabled);
+
+        _mint(alice, minted);
+        bytes32 settleRef = _nextRef();
+        vm.prank(settler);
+        token.settleTransfer(alice, bob, moved, settleRef);
+        bytes32 burnRef = _nextRef();
+        vm.prank(minter);
+        token.burn(alice, burned, burnRef);
+
+        assertEq(token.balanceOf(alice), minted - moved - burned);
+        assertEq(token.balanceOf(bob), moved);
+        assertEq(token.totalSupply(), minted - burned);
+        assertEq(token.holderTransfersEnabled(), enabled);
+    }
+
+    function testFuzz_transferFromSucceedsOnlyForAnAllowedSpender(
+        address spender,
+        bool verified,
+        bool frozen,
+        uint256 amount
+    ) public {
+        amount = bound(amount, 1, MAX_AMOUNT);
+        vm.assume(spender != address(0) && spender != alice && spender != bob);
+        _enableHolderTransfers();
+        _mint(alice, MAX_AMOUNT);
+        vm.prank(alice);
+        token.approve(spender, amount);
+        vm.startPrank(compliance);
+        registry.setVerified(spender, verified, _nextRef());
+        registry.setFrozen(spender, frozen, _nextRef());
+        vm.stopPrank();
+
+        bool allowed = verified && !frozen;
+        if (!allowed) {
+            vm.expectRevert(abi.encodeWithSelector(ISettlementToken.NotAllowed.selector, spender));
+        }
+        vm.prank(spender);
+        token.transferFrom(alice, bob, amount);
+
+        assertEq(token.balanceOf(bob), allowed ? amount : 0);
+        assertEq(token.balanceOf(alice), MAX_AMOUNT - (allowed ? amount : 0));
+        assertEq(token.allowance(alice, spender), allowed ? 0 : amount);
+    }
+
+    function testFuzz_approveSucceedsOnlyForAnAllowedOwnerWhileUnpaused(
+        address owner,
+        address spender,
+        bool verified,
+        bool frozen,
+        bool paused,
+        uint256 amount
+    ) public {
+        vm.assume(owner != address(0) && spender != address(0));
+        _enableHolderTransfers();
+        vm.startPrank(compliance);
+        registry.setVerified(owner, verified, _nextRef());
+        registry.setFrozen(owner, frozen, _nextRef());
+        vm.stopPrank();
+        if (paused) {
+            vm.prank(pauser);
+            token.pause();
+        }
+
+        bool ok = !paused && verified && !frozen;
+        if (paused) {
+            vm.expectRevert(Pausable.EnforcedPause.selector);
+        } else if (!ok) {
+            vm.expectRevert(abi.encodeWithSelector(ISettlementToken.NotAllowed.selector, owner));
+        }
+        vm.prank(owner);
+        token.approve(spender, amount);
+
+        assertEq(token.allowance(owner, spender), ok ? amount : 0);
+    }
+
+    function testFuzz_settlingToSelfAlwaysRevertsAndKeepsTheReference(
+        address account,
+        uint256 amount,
+        bytes32 ref
+    ) public {
+        amount = bound(amount, 1, MAX_AMOUNT);
+        ref = _fuzzRef(ref);
+        _mint(alice, MAX_AMOUNT);
+
+        vm.expectRevert(ISettlementToken.SelfTransfer.selector);
+        vm.prank(settler);
+        token.settleTransfer(account, account, amount, ref);
+
+        assertFalse(token.referenceUsed(ref));
+        assertEq(token.balanceOf(alice), MAX_AMOUNT);
     }
 }

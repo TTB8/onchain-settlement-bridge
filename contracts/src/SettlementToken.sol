@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IComplianceRegistry} from "./interfaces/IComplianceRegistry.sol";
 import {ISettlementToken} from "./interfaces/ISettlementToken.sol";
 
@@ -15,6 +16,19 @@ import {ISettlementToken} from "./interfaces/ISettlementToken.sol";
 /// registry. Minting skips the sender check and burning skips the receiver check, because the zero
 /// address is not a holder. The registry is fixed at deployment: swapping it would change who may
 /// hold the token, which should be a new deployment, not a setting.
+///
+/// The system is custodial (users hold no keys), so the holder-signed ERC-20 path (`transfer`,
+/// `transferFrom`, `approve`) is OFF by default and reverts `HolderTransfersDisabled` before any
+/// other check. The admin may switch it on with `setHolderTransfersEnabled`. When on, it is
+/// compliance-checked like every other movement, plus the `transferFrom` spender and the `approve`
+/// owner must be allowed and `approve` refuses while paused; it emits no reference event, which is
+/// how a reconciler recognizes it as a movement the ledger did not authorize. `mint`, `burn` and
+/// `settleTransfer` use the internal `_mint`, `_burn` and `_transfer` and ignore the switch.
+///
+/// Role blast radius: `DEFAULT_ADMIN_ROLE` grants and revokes every role and toggles the
+/// holder-signed path; `MINTER_ROLE` creates and destroys supply for allowed holders;
+/// `SETTLER_ROLE` moves any allowed holder's balance to another allowed holder; `PAUSER_ROLE`
+/// halts every movement. None of them can move a frozen or unverified balance.
 contract SettlementToken is ISettlementToken, ERC20, AccessControl, Pausable {
     /// @notice Role allowed to mint and burn.
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
@@ -33,16 +47,25 @@ contract SettlementToken is ISettlementToken, ERC20, AccessControl, Pausable {
     /// @inheritdoc ISettlementToken
     mapping(bytes32 ref => bool) public referenceUsed;
 
+    /// @inheritdoc ISettlementToken
+    bool public holderTransfersEnabled;
+
     /// @param name_ Token name.
     /// @param symbol_ Token symbol.
-    /// @param registry_ The compliance registry consulted on every balance change.
-    /// @param admin Receives `DEFAULT_ADMIN_ROLE`, which grants and revokes every other role.
+    /// @param registry_ The compliance registry consulted on every balance change. Must be a
+    /// deployed contract.
+    /// @param admin Receives `DEFAULT_ADMIN_ROLE`, which grants and revokes every other role. Must
+    /// not be the zero address.
     constructor(
         string memory name_,
         string memory symbol_,
         IComplianceRegistry registry_,
         address admin
     ) ERC20(name_, symbol_) {
+        if (address(registry_) == address(0) || admin == address(0)) {
+            revert ZeroAddress();
+        }
+        if (address(registry_).code.length == 0) revert NotAContract(address(registry_));
         registry = registry_;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
     }
@@ -72,6 +95,7 @@ contract SettlementToken is ISettlementToken, ERC20, AccessControl, Pausable {
         onlyRole(SETTLER_ROLE)
     {
         _consume(ref, amount);
+        if (from == to) revert SelfTransfer();
         _transfer(from, to, amount);
         emit SettledTransfer(from, to, amount, ref);
     }
@@ -86,12 +110,56 @@ contract SettlementToken is ISettlementToken, ERC20, AccessControl, Pausable {
         _unpause();
     }
 
+    /// @inheritdoc ISettlementToken
+    function setHolderTransfersEnabled(bool enabled) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        holderTransfersEnabled = enabled;
+        emit HolderTransfersSet(enabled);
+    }
+
+    /// @notice Holder-signed transfer. Reverts `HolderTransfersDisabled` unless the admin switched
+    /// the holder-signed path on; then behaves as ERC-20 `transfer`, checked by `_update`.
+    function transfer(address to, uint256 value) public override(ERC20, IERC20) returns (bool) {
+        _requireHolderTransfersEnabled();
+        return super.transfer(to, value);
+    }
+
+    /// @notice Holder-approved transfer by a spender. Reverts `HolderTransfersDisabled` unless the
+    /// holder-signed path is on, then `NotAllowed(spender)` unless the spender (the caller) is
+    /// allowed by the registry; then behaves as ERC-20 `transferFrom`, checked by `_update`.
+    function transferFrom(address from, address to, uint256 value)
+        public
+        override(ERC20, IERC20)
+        returns (bool)
+    {
+        _requireHolderTransfersEnabled();
+        address spender = _msgSender();
+        if (!registry.isAllowed(spender)) revert NotAllowed(spender);
+        return super.transferFrom(from, to, value);
+    }
+
+    /// @notice Sets the caller's allowance for `spender`. Reverts `HolderTransfersDisabled` unless
+    /// the holder-signed path is on, then `EnforcedPause` while paused, then `NotAllowed(owner)`
+    /// unless the owner (the caller) is allowed by the registry.
+    /// @dev The spender is checked when it spends, in `transferFrom`, not here.
+    function approve(address spender, uint256 value) public override(ERC20, IERC20) returns (bool) {
+        _requireHolderTransfersEnabled();
+        _requireNotPaused();
+        address owner = _msgSender();
+        if (!registry.isAllowed(owner)) revert NotAllowed(owner);
+        return super.approve(spender, value);
+    }
+
     /// @dev The single choke point for every balance change, so no path can skip the checks.
     function _update(address from, address to, uint256 value) internal override {
         _requireNotPaused();
         if (from != address(0) && !registry.isAllowed(from)) revert NotAllowed(from);
         if (to != address(0) && !registry.isAllowed(to)) revert NotAllowed(to);
         super._update(from, to, value);
+    }
+
+    /// @dev Reverts unless the admin switched the holder-signed ERC-20 path on.
+    function _requireHolderTransfersEnabled() private view {
+        if (!holderTransfersEnabled) revert HolderTransfersDisabled();
     }
 
     /// @dev Rejects a zero amount, the zero reference and any reference seen before, then records it.

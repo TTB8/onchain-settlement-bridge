@@ -5,6 +5,9 @@ import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol"
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {Vm} from "forge-std/Vm.sol";
+import {ComplianceRegistry} from "../src/ComplianceRegistry.sol";
+import {SettlementToken} from "../src/SettlementToken.sol";
+import {IComplianceRegistry} from "../src/interfaces/IComplianceRegistry.sol";
 import {ISettlementToken} from "../src/interfaces/ISettlementToken.sol";
 import {BridgeTest} from "./BridgeTest.sol";
 
@@ -15,6 +18,7 @@ contract SettlementTokenTest is BridgeTest {
         address indexed from, address indexed to, uint256 amount, bytes32 indexed ref
     );
     event Transfer(address indexed from, address indexed to, uint256 value);
+    event HolderTransfersSet(bool enabled);
 
     uint256 internal constant ONE = 1_000_000; // one token, six decimals
 
@@ -22,6 +26,12 @@ contract SettlementTokenTest is BridgeTest {
         super.setUp();
         _verify(alice);
         _verify(bob);
+    }
+
+    /// @dev For tests of the holder-signed ERC-20 path, which is off by default.
+    modifier holderTransfersOn() {
+        _enableHolderTransfers();
+        _;
     }
 
     function _notAllowed(address account) internal pure returns (bytes memory) {
@@ -297,16 +307,16 @@ contract SettlementTokenTest is BridgeTest {
         assertEq(token.balanceOf(bob), ONE, "the duplicate moved nothing");
     }
 
-    // --- plain ERC-20 transfers are compliance-checked too -------------------------------------
+    // --- plain ERC-20 transfers, once switched on, are compliance-checked too -------------------
 
-    function test_holderTransferBetweenVerifiedAddressesWorks() public {
+    function test_holderTransferBetweenVerifiedAddressesWorks() public holderTransfersOn {
         _mint(alice, 3 * ONE);
         vm.prank(alice);
         token.transfer(bob, ONE);
         assertEq(token.balanceOf(bob), ONE);
     }
 
-    function test_holderTransferEmitsNoReferenceEvent() public {
+    function test_holderTransferEmitsNoReferenceEvent() public holderTransfersOn {
         // This is what makes an unauthorized movement recognizable to the reconciler: only the
         // standard Transfer event is emitted, with no Minted, Burned or SettledTransfer beside it.
         _mint(alice, 3 * ONE);
@@ -319,14 +329,14 @@ contract SettlementTokenTest is BridgeTest {
         assertEq(logs[0].topics[0], Transfer.selector);
     }
 
-    function test_holderTransferToUnverifiedReverts() public {
+    function test_holderTransferToUnverifiedReverts() public holderTransfersOn {
         _mint(alice, ONE);
         vm.expectRevert(_notAllowed(carol));
         vm.prank(alice);
         token.transfer(carol, ONE);
     }
 
-    function test_frozenHolderCannotSendOrReceive() public {
+    function test_frozenHolderCannotSendOrReceive() public holderTransfersOn {
         _mint(alice, 2 * ONE);
         _mint(bob, ONE);
         _freeze(alice);
@@ -340,11 +350,11 @@ contract SettlementTokenTest is BridgeTest {
         token.transfer(alice, ONE);
     }
 
-    function test_transferFromChecksBothEndsToo() public {
+    function test_transferFromChecksBothEndsToo() public holderTransfersOn {
         _mint(alice, 2 * ONE);
         vm.prank(alice);
         token.approve(carol, 2 * ONE);
-        _verify(carol); // the spender is not a party to the transfer, only the two holders are
+        _verify(carol); // the spender must be allowed too, as well as both holders
 
         vm.prank(carol);
         token.transferFrom(alice, bob, ONE);
@@ -356,7 +366,7 @@ contract SettlementTokenTest is BridgeTest {
         token.transferFrom(alice, bob, ONE);
     }
 
-    function test_unfreezeRestoresAHoldersAbilityToSend() public {
+    function test_unfreezeRestoresAHoldersAbilityToSend() public holderTransfersOn {
         _mint(alice, 2 * ONE);
         _freeze(alice);
         _unfreeze(alice);
@@ -366,7 +376,7 @@ contract SettlementTokenTest is BridgeTest {
         assertEq(token.balanceOf(bob), ONE);
     }
 
-    function test_removingVerificationBlocksMovementImmediately() public {
+    function test_removingVerificationBlocksMovementImmediately() public holderTransfersOn {
         _mint(alice, ONE);
         vm.prank(compliance);
         registry.setVerified(alice, false, _nextRef());
@@ -401,7 +411,7 @@ contract SettlementTokenTest is BridgeTest {
         token.unpause();
     }
 
-    function test_pausedTokenStopsEveryMovement() public {
+    function test_pausedTokenStopsEveryMovement() public holderTransfersOn {
         _mint(alice, 3 * ONE);
         vm.prank(pauser);
         token.pause();
@@ -445,7 +455,7 @@ contract SettlementTokenTest is BridgeTest {
         assertEq(token.balanceOf(alice), 4 * ONE);
     }
 
-    function test_frozenStateSurvivesPause() public {
+    function test_frozenStateSurvivesPause() public holderTransfersOn {
         _mint(alice, ONE);
         _freeze(alice);
         vm.prank(pauser);
@@ -456,5 +466,252 @@ contract SettlementTokenTest is BridgeTest {
         vm.expectRevert(_notAllowed(alice));
         vm.prank(alice);
         token.transfer(bob, ONE);
+    }
+
+    // --- constructors --------------------------------------------------------------------------
+
+    function test_tokenConstructorRejectsAZeroRegistry() public {
+        vm.expectRevert(ISettlementToken.ZeroAddress.selector);
+        new SettlementToken("T", "T", IComplianceRegistry(address(0)), admin);
+    }
+
+    function test_tokenConstructorRejectsAZeroAdmin() public {
+        vm.expectRevert(ISettlementToken.ZeroAddress.selector);
+        new SettlementToken("T", "T", registry, address(0));
+    }
+
+    function test_tokenConstructorRejectsARegistryWithoutCode() public {
+        vm.expectRevert(abi.encodeWithSelector(ISettlementToken.NotAContract.selector, mallory));
+        new SettlementToken("T", "T", IComplianceRegistry(mallory), admin);
+    }
+
+    function test_registryConstructorRejectsAZeroAdmin() public {
+        vm.expectRevert(IComplianceRegistry.ZeroAddress.selector);
+        new ComplianceRegistry(address(0));
+    }
+
+    // --- the holder-transfer switch ------------------------------------------------------------
+
+    function test_holderTransfersAreOffAfterDeployment() public view {
+        assertFalse(token.holderTransfersEnabled());
+    }
+
+    function test_adminTogglesHolderTransfersAndEachChangeEmits() public {
+        vm.expectEmit(false, false, false, true, address(token));
+        emit HolderTransfersSet(true);
+        vm.prank(admin);
+        token.setHolderTransfersEnabled(true);
+        assertTrue(token.holderTransfersEnabled());
+
+        vm.expectEmit(false, false, false, true, address(token));
+        emit HolderTransfersSet(false);
+        vm.prank(admin);
+        token.setHolderTransfersEnabled(false);
+        assertFalse(token.holderTransfersEnabled());
+    }
+
+    function test_onlyTheAdminCanToggleHolderTransfers() public {
+        address[5] memory others = [minter, settler, pauser, compliance, alice];
+        for (uint256 i; i < others.length; ++i) {
+            vm.expectRevert(_unauthorized(others[i], defaultAdminRole));
+            vm.prank(others[i]);
+            token.setHolderTransfersEnabled(true);
+        }
+        assertFalse(token.holderTransfersEnabled());
+    }
+
+    function test_transferRevertsWhileHolderTransfersAreOff() public {
+        _mint(alice, ONE);
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        vm.prank(alice);
+        token.transfer(bob, ONE);
+        assertEq(token.balanceOf(alice), ONE);
+    }
+
+    function test_approveRevertsWhileHolderTransfersAreOff() public {
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        vm.prank(alice);
+        token.approve(carol, ONE);
+        assertEq(token.allowance(alice, carol), 0);
+    }
+
+    function test_transferFromRevertsWhileHolderTransfersAreOff() public {
+        // An allowance granted while the path was on cannot be spent once it is switched off.
+        _mint(alice, ONE);
+        _verify(carol);
+        _enableHolderTransfers();
+        vm.prank(alice);
+        token.approve(carol, ONE);
+        vm.prank(admin);
+        token.setHolderTransfersEnabled(false);
+
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        vm.prank(carol);
+        token.transferFrom(alice, bob, ONE);
+        assertEq(token.balanceOf(alice), ONE);
+        assertEq(token.allowance(alice, carol), ONE);
+    }
+
+    function test_theSwitchIsCheckedBeforeAnythingElse() public {
+        // Unverified callers, a paused token: the first error is still the switch.
+        vm.prank(pauser);
+        token.pause();
+
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        vm.prank(mallory);
+        token.transfer(bob, ONE);
+
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        vm.prank(mallory);
+        token.approve(carol, ONE);
+
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        vm.prank(mallory);
+        token.transferFrom(alice, bob, ONE);
+    }
+
+    function test_mintBurnAndSettleWorkWithHolderTransfersOff() public {
+        assertFalse(token.holderTransfersEnabled());
+        _mint(alice, 5 * ONE);
+
+        vm.prank(settler);
+        token.settleTransfer(alice, bob, 2 * ONE, _nextRef());
+
+        bytes32 burnRef = _nextRef();
+        vm.prank(minter);
+        token.burn(bob, ONE, burnRef);
+
+        assertEq(token.balanceOf(alice), 3 * ONE);
+        assertEq(token.balanceOf(bob), ONE);
+        assertEq(token.totalSupply(), 4 * ONE);
+    }
+
+    // --- holder-signed path, switched on: extra checks -----------------------------------------
+
+    function test_anUnverifiedSpenderCannotTransferFrom() public holderTransfersOn {
+        _mint(alice, ONE);
+        vm.prank(alice);
+        token.approve(carol, ONE); // carol is not verified
+
+        vm.expectRevert(_notAllowed(carol));
+        vm.prank(carol);
+        token.transferFrom(alice, bob, ONE);
+        assertEq(token.balanceOf(alice), ONE);
+        assertEq(token.allowance(alice, carol), ONE, "a refused spend leaves the allowance");
+    }
+
+    function test_aFrozenSpenderCannotTransferFrom() public holderTransfersOn {
+        _mint(alice, ONE);
+        _verify(carol);
+        vm.prank(alice);
+        token.approve(carol, ONE);
+        _freeze(carol);
+
+        vm.expectRevert(_notAllowed(carol));
+        vm.prank(carol);
+        token.transferFrom(alice, bob, ONE);
+    }
+
+    function test_aVerifiedSpenderCanTransferFromAndSpendsTheAllowance() public holderTransfersOn {
+        _mint(alice, 3 * ONE);
+        _verify(carol);
+        vm.prank(alice);
+        token.approve(carol, 2 * ONE);
+
+        vm.prank(carol);
+        assertTrue(token.transferFrom(alice, bob, ONE));
+        assertEq(token.balanceOf(alice), 2 * ONE);
+        assertEq(token.balanceOf(bob), ONE);
+        assertEq(token.balanceOf(carol), 0, "the spender receives nothing");
+        assertEq(token.allowance(alice, carol), ONE);
+    }
+
+    function test_aFrozenOwnerCannotApprove() public holderTransfersOn {
+        _freeze(alice);
+        vm.expectRevert(_notAllowed(alice));
+        vm.prank(alice);
+        token.approve(carol, ONE);
+        assertEq(token.allowance(alice, carol), 0);
+    }
+
+    function test_anUnverifiedOwnerCannotApprove() public holderTransfersOn {
+        vm.expectRevert(_notAllowed(mallory));
+        vm.prank(mallory);
+        token.approve(carol, ONE);
+    }
+
+    function test_approveIsBlockedWhilePaused() public holderTransfersOn {
+        vm.prank(pauser);
+        token.pause();
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vm.prank(alice);
+        token.approve(carol, ONE);
+
+        vm.prank(pauser);
+        token.unpause();
+        vm.prank(alice);
+        assertTrue(token.approve(carol, ONE));
+        assertEq(token.allowance(alice, carol), ONE);
+    }
+
+    function test_approveChecksPauseBeforeTheOwner() public holderTransfersOn {
+        vm.prank(pauser);
+        token.pause();
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vm.prank(mallory);
+        token.approve(carol, ONE);
+    }
+
+    function test_transferFromChecksTheSpenderBeforeTheAllowance() public holderTransfersOn {
+        _mint(alice, ONE);
+        vm.expectRevert(_notAllowed(mallory));
+        vm.prank(mallory);
+        token.transferFrom(alice, bob, ONE);
+    }
+
+    function test_transferFromStillNeedsAnAllowance() public holderTransfersOn {
+        _mint(alice, ONE);
+        _verify(carol);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, carol, 0, ONE)
+        );
+        vm.prank(carol);
+        token.transferFrom(alice, bob, ONE);
+    }
+
+    // --- settleTransfer to self ----------------------------------------------------------------
+
+    function test_settleTransferToSelfRevertsAndLeavesTheReferenceUnused() public {
+        _mint(alice, 2 * ONE);
+        bytes32 ref = _nextRef();
+        vm.recordLogs();
+        vm.expectRevert(ISettlementToken.SelfTransfer.selector);
+        vm.prank(settler);
+        token.settleTransfer(alice, alice, ONE, ref);
+
+        assertEq(vm.getRecordedLogs().length, 0);
+        assertFalse(token.referenceUsed(ref), "a refused self-settle does not consume the ref");
+        assertEq(token.balanceOf(alice), 2 * ONE);
+
+        // The same reference still settles a real transfer.
+        vm.prank(settler);
+        token.settleTransfer(alice, bob, ONE, ref);
+        assertTrue(token.referenceUsed(ref));
+    }
+
+    function test_selfSettleIsCheckedAfterTheReferenceAndAmount() public {
+        _mint(alice, ONE);
+        vm.startPrank(settler);
+        vm.expectRevert(ISettlementToken.InvalidReference.selector);
+        token.settleTransfer(alice, alice, ONE, bytes32(0));
+
+        bytes32 ref = _nextRef();
+        vm.expectRevert(ISettlementToken.ZeroAmount.selector);
+        token.settleTransfer(alice, alice, 0, ref);
+
+        token.settleTransfer(alice, bob, ONE, ref);
+        vm.expectRevert(abi.encodeWithSelector(ISettlementToken.ReferenceAlreadyUsed.selector, ref));
+        token.settleTransfer(bob, bob, ONE, ref);
+        vm.stopPrank();
     }
 }

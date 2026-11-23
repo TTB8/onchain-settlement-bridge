@@ -69,6 +69,12 @@ abstract contract BridgeTest is Test {
         registry.setFrozen(account, false, ref);
     }
 
+    /// @dev Switches the holder-signed ERC-20 path on, as the admin. It is off after deployment.
+    function _enableHolderTransfers() internal {
+        vm.prank(admin);
+        token.setHolderTransfersEnabled(true);
+    }
+
     /// @dev Verifies `to` if needed is the caller's job; this only mints.
     function _mint(address to, uint256 amount) internal {
         bytes32 ref = _nextRef();

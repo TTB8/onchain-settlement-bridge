@@ -26,7 +26,7 @@ interface IComplianceRegistry {
     /// @notice The reference is the zero value, which is reserved for "no reference".
     error InvalidReference();
 
-    /// @notice The zero address cannot be verified or frozen.
+    /// @notice The zero address cannot be verified or frozen, nor be the constructor's admin.
     error ZeroAddress();
 
     /// @notice Marks an account as verified, or removes its verification.

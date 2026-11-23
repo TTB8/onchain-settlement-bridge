@@ -20,8 +20,10 @@ contract ComplianceRegistry is IComplianceRegistry, AccessControl {
     /// @inheritdoc IComplianceRegistry
     mapping(bytes32 ref => bool) public referenceUsed;
 
-    /// @param admin Receives `DEFAULT_ADMIN_ROLE`, which grants and revokes every other role.
+    /// @param admin Receives `DEFAULT_ADMIN_ROLE`, which grants and revokes every other role. Must
+    /// not be the zero address.
     constructor(address admin) {
+        if (admin == address(0)) revert ZeroAddress();
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
     }
 
