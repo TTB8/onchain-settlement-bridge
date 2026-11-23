@@ -14,3 +14,5 @@ export * from './ledger';
 export * from './operation';
 export * from './reference';
 export * from './compliance';
+export * from './gas';
+export * from './nonce';
