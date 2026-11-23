@@ -394,7 +394,7 @@ BEGIN
   IF NEW.version IS DISTINCT FROM OLD.version + 1 THEN
     RAISE EXCEPTION 'operation_version: operation % is at version %, an update must write %, got %',
       OLD.id, OLD.version, OLD.version + 1, NEW.version
-      USING ERRCODE = 'serialization_failure';
+      USING ERRCODE = 'check_violation'; -- not 40001: Prisma would hide this message behind P2034
   END IF;
   IF NOT ((OLD.status::text || '>' || NEW.status::text) = ANY (ARRAY[
       'requested>ledger_reserved',
