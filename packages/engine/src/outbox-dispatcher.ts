@@ -43,7 +43,7 @@ import { auditEntryFor } from '@bridge/domain';
 import { HandlerTimeoutError, InvalidRequestError } from './errors';
 import { writeAudit } from './ledger-writes';
 import type { Clock, IdSource } from './ports';
-import { describeError, sanitizeText } from './redact';
+import { describeError, sanitizeText, type SanitizeOptions } from './redact';
 import type { Tx } from './transaction';
 
 /** What the handler decided for one row. */
@@ -104,6 +104,11 @@ export interface OutboxDispatcherOptions {
   readonly maxWaitAgeMs?: number;
   /** Backoff for thrown handler errors. Default 1 s doubling to 10 min, 10 attempts. */
   readonly backoff?: BackoffPolicy;
+  /**
+   * Literal secrets to remove from every error text written (the RPC URL, its API key, its host),
+   * in every escaped or encoded spelling, on top of the generic URL and host/path patterns.
+   */
+  readonly secrets?: readonly string[];
 }
 
 /** What one `runOnce` did. */
@@ -166,6 +171,7 @@ export class OutboxDispatcher {
   private readonly handlerTimeoutMs: number;
   private readonly maxWaitAgeMs: number;
   private readonly backoff: BackoffPolicy;
+  private readonly redaction: SanitizeOptions;
 
   /** @param options Database, clock, ids, worker name, handler and policies. */
   constructor(options: OutboxDispatcherOptions) {
@@ -200,6 +206,7 @@ export class OutboxDispatcher {
     this.handlerTimeoutMs = handlerTimeoutMs;
     this.maxWaitAgeMs = maxWaitAgeMs;
     this.backoff = backoff;
+    this.redaction = { secrets: [...(options.secrets ?? [])] };
   }
 
   /** One reap-claim-handle-finish cycle. Rows are handled one after another, in claim order. */
@@ -330,10 +337,16 @@ export class OutboxDispatcher {
       return (await this.finish(row, { status: 'done', processedAt: now })) ? 'done' : 'lost';
     }
     if (typeof outcome === 'object' && outcome !== null && 'failed' in outcome) {
-      const code = sanitizeText(String(outcome.failed), 100);
+      const code = sanitizeText(String(outcome.failed), { ...this.redaction, max: 100 });
       const detail =
-        outcome.detail === undefined ? '' : `: ${sanitizeText(String(outcome.detail))}`;
-      return (await this.deadLetter(row, now, sanitizeText(`failed:${code}${detail}`)))
+        outcome.detail === undefined
+          ? ''
+          : `: ${sanitizeText(String(outcome.detail), this.redaction)}`;
+      return (await this.deadLetter(
+        row,
+        now,
+        sanitizeText(`failed:${code}${detail}`, this.redaction),
+      ))
         ? 'dead'
         : 'lost';
     }
@@ -361,7 +374,7 @@ export class OutboxDispatcher {
       return this.retryOrDie(row, now, 'InvalidOutcome: retryAt is not a valid Date');
     }
     if (typeof outcome === 'object' && outcome !== null && 'thrown' in outcome) {
-      return this.retryOrDie(row, now, describeError(outcome.thrown));
+      return this.retryOrDie(row, now, describeError(outcome.thrown, this.redaction));
     }
     return this.retryOrDie(row, now, 'InvalidOutcome: the handler returned an unknown outcome');
   }
@@ -373,7 +386,10 @@ export class OutboxDispatcher {
     error: string,
   ): Promise<'retry' | 'dead' | 'lost'> {
     if (row.attemptsCount >= this.backoff.maxAttempts) {
-      const why = sanitizeText(`attempts exhausted (${row.attemptsCount}); last: ${error}`);
+      const why = sanitizeText(
+        `attempts exhausted (${row.attemptsCount}); last: ${error}`,
+        this.redaction,
+      );
       return (await this.deadLetter(row, now, why)) ? 'dead' : 'lost';
     }
     const delay = backoffDelayMs(this.backoff, row.attemptsCount);

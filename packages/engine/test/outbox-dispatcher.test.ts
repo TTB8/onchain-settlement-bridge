@@ -550,6 +550,19 @@ describe('error text is recorded redacted and bounded (review L-1, L-2)', () => 
     expect((audit.detail as { note?: string }).note).toBe(row.lastError);
   });
 
+  it('the configured secrets are removed by value from last_error', async () => {
+    const [id] = await enqueue(1);
+    const d = dispatcher(
+      handlerOf(async () => {
+        throw new Error('node said: key SECRETKEY9 is over quota');
+      }),
+      { secrets: ['https://rpc.example.org/v3/SECRETKEY9'] },
+    );
+    await d.runOnce();
+    const row = await rowOf(id as string);
+    expect(row.lastError).toBe('Error: node said: key <redacted> is over quota');
+  });
+
   it('the dead letter at the attempt cap keeps the last error', async () => {
     const [id] = await enqueue(1);
     const d = dispatcher(

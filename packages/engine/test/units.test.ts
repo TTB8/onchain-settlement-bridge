@@ -101,8 +101,8 @@ describe('sanitizeText / describeError', () => {
     const out = sanitizeText('a'.repeat(5000));
     expect(out).toHaveLength(1000);
     expect(out.endsWith('...')).toBe(true);
-    expect(sanitizeText('abcdef', 5)).toBe('ab...');
-    expect(sanitizeText('abcde', 5)).toBe('abcde');
+    expect(sanitizeText('abcdef', { max: 5 })).toBe('ab...');
+    expect(sanitizeText('abcde', { max: 5 })).toBe('abcde');
   });
 
   it('describes errors by class and non-errors by type', () => {
@@ -120,5 +120,69 @@ describe('sanitizeText / describeError', () => {
       },
     };
     expect(describeError(evil)).toBe('object: (unprintable)');
+  });
+});
+
+describe('sanitizeText: forms that leaked before (review L-C)', () => {
+  const KEY = 'SECRETKEY1';
+  const URL = `https://node.example.org/v2/${KEY}`;
+  const slashEscaped = URL.replace(/\//g, '\\/');
+
+  it.each([
+    ['doubly JSON-escaped URL', JSON.stringify(JSON.stringify({ u: slashEscaped }))],
+    ['triply backslash-escaped separator', `at https:\\\\\\/\\\\\\/node.example.org/v2/${KEY}`],
+    ['double percent-encoded URL', `GET ${encodeURIComponent(encodeURIComponent(URL))}`],
+    ['scheme-less host/path', `nonce too high at eth.g.alchemy.com/v2/${KEY}`],
+    ['scheme-less host:port/path', `connect node.example.org:8545/${KEY} refused`],
+    ['IPv4 host/path', `dial 10.0.0.7:8545/${KEY}`],
+    ['host with an escaped slash', `at node.example.org\\/v2\\/${KEY}`],
+    ['host with an encoded slash', `at node.example.org%2Fv2%2F${KEY}`],
+  ])('%s', (_name, raw) => {
+    expect(raw).toContain(KEY); // non-vacuous: the secret is in the input
+    const out = sanitizeText(raw);
+    expect(out).not.toContain(KEY);
+    expect(out).toContain('<redacted-url>');
+  });
+
+  it('a bare key is only caught by value, in every spelling', () => {
+    const rpc = `https://user:${KEY}pw@node.example.org/v3/${KEY}?apikey=${KEY}Q`;
+    const forms = [
+      `api key ${KEY} rejected`,
+      `api key ${KEY.toLowerCase()} rejected`,
+      `path /v3/${KEY} rejected`,
+      `query apikey=${KEY}Q rejected`,
+      `escaped ${JSON.stringify(JSON.stringify(`/v3/${KEY}`))}`,
+      `encoded ${encodeURIComponent(encodeURIComponent(`/v3/${KEY}`))}`,
+      `password ${KEY}pw rejected`,
+    ];
+    for (const raw of forms) {
+      expect(raw.toUpperCase()).toContain(KEY);
+      expect(sanitizeText(raw, { secrets: [rpc] }).toUpperCase()).not.toContain(KEY);
+    }
+    // Without the literal, the generic patterns cannot know a bare key is one.
+    expect(sanitizeText(`api key ${KEY} rejected`)).toContain(KEY);
+  });
+
+  it('ignores secret pieces too short to be secrets and non-URL secrets work as literals', () => {
+    expect(sanitizeText('a b c', { secrets: ['a', 'b'] })).toBe('a b c');
+    expect(sanitizeText(`token ${KEY} bad`, { secrets: [KEY] })).toBe('token <redacted> bad');
+    expect(sanitizeText(`token ${KEY} bad`, { secrets: [] })).toBe(`token ${KEY} bad`);
+  });
+
+  it('leaves ordinary error text alone', () => {
+    for (const text of [
+      'insufficient funds for gas * price + value',
+      'nonce too low: next nonce 7, tx nonce 5',
+      'version 1.2.3 is not supported',
+      'packages/engine/src/redact.ts line 3',
+    ]) {
+      expect(sanitizeText(text)).toBe(text);
+    }
+  });
+
+  it('describeError applies the literal secrets too', () => {
+    expect(describeError(new Error(`bad key ${KEY}`), { secrets: [KEY] })).toBe(
+      'Error: bad key <redacted>',
+    );
   });
 });
