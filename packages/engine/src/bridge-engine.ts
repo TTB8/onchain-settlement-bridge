@@ -18,7 +18,7 @@ import { Indexer, type IndexerResult } from './indexer';
 import { OperationService } from './operation-service';
 import { type BackoffPolicy, type DispatchSummary, OutboxDispatcher } from './outbox-dispatcher';
 import type { Clock, IdSource } from './ports';
-import { describeError } from './redact';
+import { describeError, type SanitizeOptions } from './redact';
 import { SettlementSubmitter } from './settlement-submitter';
 import type { TransactionSigner } from './signing';
 import type { TransactionOptions } from './transaction';
@@ -79,6 +79,12 @@ export interface BridgeEngineConfig {
   readonly backoff?: BackoffPolicy;
   /** Transaction settings for every component. */
   readonly transactions?: TransactionOptions;
+  /**
+   * Literal secrets (the RPC URL, its API key, its host) removed from every error text the engine
+   * writes (outbox `last_error`, audit notes, alarms). The gateway scrubs its own errors too; this
+   * is the second layer.
+   */
+  readonly secrets?: readonly string[];
 }
 
 /** What the engine is built from. */
@@ -127,6 +133,7 @@ export class BridgeEngine {
   private timer: NodeJS.Timeout | undefined;
   private running: Promise<void> | undefined;
   private stopped = true;
+  private readonly redaction: SanitizeOptions;
 
   /**
    * @param deps Database, gateway, signer, clock, ids and alarm sink.
@@ -142,6 +149,8 @@ export class BridgeEngine {
     }
     const binding = { chainId: config.chainId, tokenAddress: config.tokenAddress };
     const transactions = config.transactions ?? {};
+    const secrets = [...(config.secrets ?? [])];
+    this.redaction = { secrets };
     this.alarms = deps.alarms ?? new AlarmLog();
     this.clock = deps.clock;
     this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
@@ -165,6 +174,7 @@ export class BridgeEngine {
         feeWaitMs: config.feeWaitMs ?? 60_000,
       },
       transactions,
+      secrets,
     });
     this.dispatcher = new OutboxDispatcher({
       prisma: deps.prisma,
@@ -178,6 +188,7 @@ export class BridgeEngine {
         ? { handlerTimeoutMs: config.handlerTimeoutMs }
         : {}),
       ...(config.backoff !== undefined ? { backoff: config.backoff } : {}),
+      secrets,
     });
     this.monitor = new TxMonitor({
       prisma: deps.prisma,
@@ -197,6 +208,7 @@ export class BridgeEngine {
       },
       alarms: this.alarms,
       transactions,
+      secrets,
     });
     this.indexer = new Indexer({
       prisma: deps.prisma,
@@ -245,7 +257,7 @@ export class BridgeEngine {
           // A failed tick is an alarm, never the end of the loop.
           this.alarms.raise({
             kind: 'examine_error',
-            detail: describeError(err),
+            detail: describeError(err, this.redaction),
             at: this.clock.now(),
           });
         })

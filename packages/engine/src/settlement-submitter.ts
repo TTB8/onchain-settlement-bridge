@@ -39,7 +39,7 @@ import { DeploymentMismatchError, InvalidRequestError, LeaseLostError } from './
 import { moveOperation } from './move-operation';
 import type { HandlerContext, OutboxHandler, OutboxOutcome } from './outbox-dispatcher';
 import type { Clock } from './ports';
-import { describeError } from './redact';
+import { describeError, type SanitizeOptions } from './redact';
 import type { TransactionSigner } from './signing';
 import { runTransaction, type TransactionOptions } from './transaction';
 
@@ -77,6 +77,8 @@ export interface SettlementSubmitterOptions {
   readonly fees: InitialFeePolicy;
   /** Transaction settings. */
   readonly transactions?: TransactionOptions;
+  /** Literal secrets (RPC URL, API key, host) removed from every error text written. */
+  readonly secrets?: readonly string[];
 }
 
 /** Throws `DeploymentMismatchError` unless `d` is the bound deployment. */
@@ -98,6 +100,7 @@ export class SettlementSubmitter implements OutboxHandler {
   private readonly binding: DeploymentBinding;
   private readonly fees: InitialFeePolicy;
   private readonly transactions: TransactionOptions;
+  private readonly redaction: SanitizeOptions;
 
   /** @param options Database, gateway, signer, clock, binding and fee policy. */
   constructor(options: SettlementSubmitterOptions) {
@@ -108,6 +111,7 @@ export class SettlementSubmitter implements OutboxHandler {
     this.binding = options.binding;
     this.fees = options.fees;
     this.transactions = options.transactions ?? {};
+    this.redaction = { secrets: [...(options.secrets ?? [])] };
   }
 
   /** @inheritdoc */
@@ -125,7 +129,7 @@ export class SettlementSubmitter implements OutboxHandler {
     try {
       call = contractCallFromJson(row.call);
     } catch (err) {
-      return { failed: 'invalid_call', detail: describeError(err) };
+      return { failed: 'invalid_call', detail: describeError(err, this.redaction) };
     }
     if (call.ref !== op.ref || row.ref !== op.ref) return { failed: 'reference_mismatch' };
 
@@ -215,13 +219,17 @@ export class SettlementSubmitter implements OutboxHandler {
       result,
       { entity: 'operation', id: op.id, state: 'submitted' },
       this.clock.now(),
+      this.redaction,
     );
     switch (result.kind) {
       case 'sent':
       case 'nonce_used':
         return 'done';
       case 'rejected':
-        return { failed: 'submission_rejected', detail: describeError(result.error) };
+        return {
+          failed: 'submission_rejected',
+          detail: describeError(result.error, this.redaction),
+        };
       case 'unknown':
         // Unknown outcome: retried by the dispatcher, which rebroadcasts these same bytes.
         throw result.error instanceof Error

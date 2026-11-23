@@ -42,7 +42,7 @@ import { type AttemptRecord, auditEntryFor, type AuditEntity, nextNonce } from '
 
 import { InvalidRequestError, LeaseLostError } from './errors';
 import { writeAudit } from './ledger-writes';
-import { describeError } from './redact';
+import { describeError, type SanitizeOptions } from './redact';
 import type { SignedTransaction, TransactionSigner } from './signing';
 import type { Tx } from './transaction';
 
@@ -332,6 +332,7 @@ export async function broadcastAttempt(
  * @param result The broadcast outcome.
  * @param subject The audited entity and its id (an operation, or a compliance change in piece C).
  * @param at The time.
+ * @param redaction Literal secrets (RPC URL, API key) to remove from the audited error text.
  */
 export async function recordBroadcast(
   prisma: PrismaClient,
@@ -339,6 +340,7 @@ export async function recordBroadcast(
   result: BroadcastResult,
   subject: { readonly entity: AuditEntity; readonly id: string; readonly state: string },
   at: Date,
+  redaction: SanitizeOptions = {},
 ): Promise<void> {
   await prisma.$transaction(async (tx) => {
     const status = result.kind === 'rejected' ? 'dropped' : 'sent';
@@ -358,7 +360,7 @@ export async function recordBroadcast(
           fromState: subject.state,
           toState: subject.state,
           txHash: attempt.hash as TxHash,
-          detail: `broadcast ${result.kind}: ${describeError(result.error)}`,
+          detail: `broadcast ${result.kind}: ${describeError(result.error, redaction)}`,
           at,
         }),
         { attemptId: attempt.id, nonce: attempt.nonce, broadcast: result.kind },

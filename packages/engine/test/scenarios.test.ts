@@ -867,3 +867,21 @@ describe('nonce allocation (obligation 1)', () => {
     expect(rig.chain.balanceOf(alice.wallet as `0x${string}`)).toBe(3n);
   });
 });
+
+describe('redaction (review: literal secrets)', () => {
+  it('a configured secret in a node error never reaches the audit trail or the outbox row', async () => {
+    const secret = 'test-api-key-0123456789abcdef';
+    const rig = await makeRig(db.prisma, { secrets: [secret] });
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 4n);
+    rig.chain.failNextSubmit(new SubmissionRejectedError(`node with key ${secret} refused`));
+    await rig.engine.dispatcher.runOnce();
+    const row = await db.prisma.outboxMessage.findFirstOrThrow({ where: { operationId: dep.id } });
+    expect(row.status).toBe('dead');
+    expect(row.lastError).toContain('submission_rejected');
+    expect(row.lastError).not.toContain(secret);
+    const audits = await db.prisma.auditLog.findMany({ where: { entityId: dep.id } });
+    expect(audits.some((a) => JSON.stringify(a.detail).includes('broadcast rejected'))).toBe(true);
+    expect(audits.every((a) => !JSON.stringify(a.detail).includes(secret))).toBe(true);
+  });
+});

@@ -71,7 +71,7 @@ import { VersionConflictError } from './errors';
 import { writeAudit } from './ledger-writes';
 import { moveOperation, type OperationMove } from './move-operation';
 import type { Clock } from './ports';
-import { describeError } from './redact';
+import { describeError, type SanitizeOptions } from './redact';
 import type { DeploymentBinding } from './settlement-submitter';
 import type { TransactionSigner } from './signing';
 import { runTransaction, type TransactionOptions } from './transaction';
@@ -114,6 +114,8 @@ export interface TxMonitorOptions {
   readonly alarms: AlarmSink;
   /** Transaction settings. */
   readonly transactions?: TransactionOptions;
+  /** Literal secrets (RPC URL, API key, host) removed from every error text written. */
+  readonly secrets?: readonly string[];
 }
 
 /** What one pass did. */
@@ -205,6 +207,7 @@ export class TxMonitor {
   private readonly policy: MonitorPolicy;
   private readonly alarms: AlarmSink;
   private readonly transactions: TransactionOptions;
+  private readonly redaction: SanitizeOptions;
   private lastHead: bigint | null = null;
   private stalledPasses = 0;
 
@@ -225,6 +228,7 @@ export class TxMonitor {
     this.policy = p;
     this.alarms = options.alarms;
     this.transactions = options.transactions ?? {};
+    this.redaction = { secrets: [...(options.secrets ?? [])] };
   }
 
   /** One pass over every submitted and failed operation of the bound deployment. */
@@ -289,7 +293,7 @@ export class TxMonitor {
       } catch (err) {
         // Someone moved the operation first: decide again next pass, on fresh reads.
         if (err instanceof VersionConflictError) continue;
-        this.alarm('examine_error', describeError(err), op.id);
+        this.alarm('examine_error', describeError(err, this.redaction), op.id);
       }
     }
     return { ran: true, head: view.head, examined: ops.length, skipped, ...counts };
@@ -743,6 +747,7 @@ export class TxMonitor {
       result,
       { entity: 'operation', id: op.id, state: 'submitted' },
       this.clock.now(),
+      this.redaction,
     );
   }
 
