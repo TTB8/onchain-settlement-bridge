@@ -81,6 +81,12 @@ export async function startAnvil(extraArgs: string[] = []): Promise<AnvilNode> {
     { stdio: 'ignore' },
   );
   const exited = new Promise<void>((done) => child.once('exit', () => done()));
+  // Safety net: if the test worker exits without running afterAll (a crashed suite), take anvil
+  // down with it instead of leaving an orphan holding a port.
+  const killOnExit = () => {
+    if (child.exitCode === null) child.kill('SIGKILL');
+  };
+  process.once('exit', killOnExit);
 
   const rpc = async <T>(method: string, params: unknown[] = []): Promise<T> => {
     const response = await fetch(url, {
@@ -113,6 +119,7 @@ export async function startAnvil(extraArgs: string[] = []): Promise<AnvilNode> {
     client: createPublicClient({ transport: http(url, { retryCount: 0 }) }),
     rpc,
     stop: async () => {
+      process.removeListener('exit', killOnExit);
       if (child.exitCode === null) {
         child.kill('SIGKILL');
         await exited;
