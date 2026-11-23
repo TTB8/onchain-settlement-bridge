@@ -21,6 +21,8 @@ export type ProblemCode =
   | 'VALIDATION_FAILED'
   | 'MALFORMED_JSON'
   | 'PAYLOAD_TOO_LARGE'
+  | 'UNSUPPORTED_MEDIA_TYPE'
+  | 'BAD_REQUEST_BODY'
   | 'IDEMPOTENCY_KEY_MISSING'
   | 'IDEMPOTENCY_KEY_INVALID'
   | 'AMOUNT_ABOVE_LIMIT'
@@ -72,6 +74,16 @@ export const PROBLEMS: Readonly<Record<ProblemCode, ProblemSpec>> = Object.freez
     status: 413,
     title: 'Payload too large',
     detail: 'The request body exceeds the size limit.',
+  },
+  UNSUPPORTED_MEDIA_TYPE: {
+    status: 415,
+    title: 'Unsupported media type',
+    detail: 'The request body uses a character set or content encoding this API does not accept.',
+  },
+  BAD_REQUEST_BODY: {
+    status: 400,
+    title: 'Bad request body',
+    detail: 'The request body could not be read (aborted, truncated or of an invalid size).',
   },
   IDEMPOTENCY_KEY_MISSING: {
     status: 400,
@@ -253,12 +265,30 @@ function conflictExtensions(err: EngineError): Record<string, unknown> {
   return {};
 }
 
-/** Body-parser errors carry a `type` string; only these two are the client's fault. */
+/**
+ * Body-parser (raw-body) errors carry a `type` string and an HTTP `status`. Every one with a 4xx
+ * status is the client's fault and maps to a catalog problem (never a 500): parse failures,
+ * too-large bodies, unsupported charsets and encodings, aborted or mis-sized bodies. A 5xx one
+ * (for example `stream.encoding.set`, a server bug) stays an internal error.
+ */
 function bodyParserProblem(err: unknown): ProblemCode | null {
-  const type = (err as { type?: unknown } | null)?.type;
-  if (type === 'entity.parse.failed') return 'MALFORMED_JSON';
-  if (type === 'entity.too.large') return 'PAYLOAD_TOO_LARGE';
-  return null;
+  const e = err as { type?: unknown; status?: unknown; statusCode?: unknown } | null;
+  const type = e?.type;
+  const status = typeof e?.status === 'number' ? e.status : e?.statusCode;
+  if (typeof type !== 'string' || typeof status !== 'number' || status < 400 || status >= 500) {
+    return null;
+  }
+  switch (type) {
+    case 'entity.parse.failed':
+      return 'MALFORMED_JSON';
+    case 'entity.too.large':
+      return 'PAYLOAD_TOO_LARGE';
+    case 'charset.unsupported':
+    case 'encoding.unsupported':
+      return 'UNSUPPORTED_MEDIA_TYPE';
+    default:
+      return 'BAD_REQUEST_BODY';
+  }
 }
 
 /** The Nest `HttpException`s the framework itself raises, by status. */

@@ -225,6 +225,23 @@ describe('problem+json', () => {
     expect(array.status).toBe(400);
   });
 
+  it.each([
+    ['an unsupported charset', { 'Content-Type': 'application/json; charset=koi8-r' }],
+    [
+      'an unsupported content encoding',
+      { 'Content-Type': 'application/json', 'Content-Encoding': 'compress' },
+    ],
+  ])('%s is a 415 problem, never a 500 or an unhandled-error log', async (_name, headers) => {
+    const before = rig.logs.filter((l) => l.includes('unhandled error')).length;
+    const req = http().post('/v1/users').set(auth);
+    for (const [k, v] of Object.entries(headers)) req.set(k, v);
+    const res = await req.send(JSON.stringify({ walletAddress: wallet() }));
+    expect(res.status).toBe(415);
+    expect(res.headers['content-type']).toMatch(/^application\/problem\+json/);
+    expect(res.body.code).toBe('UNSUPPORTED_MEDIA_TYPE');
+    expect(rig.logs.filter((l) => l.includes('unhandled error')).length).toBe(before);
+  });
+
   it('a body above the limit is a 413 problem', async () => {
     const res = await http()
       .post('/v1/users')

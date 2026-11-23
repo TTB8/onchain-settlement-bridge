@@ -100,12 +100,13 @@ and are logged redacted, without the stack.
 
 | Status | Codes                                                                                  |
 | ------ | -------------------------------------------------------------------------------------- |
-| 400    | VALIDATION_FAILED, MALFORMED_JSON, IDEMPOTENCY_KEY_MISSING, IDEMPOTENCY_KEY_INVALID, AMOUNT_ABOVE_LIMIT, SELF_TRANSFER |
+| 400    | VALIDATION_FAILED, MALFORMED_JSON, BAD_REQUEST_BODY, IDEMPOTENCY_KEY_MISSING, IDEMPOTENCY_KEY_INVALID, AMOUNT_ABOVE_LIMIT, SELF_TRANSFER |
 | 401    | UNAUTHENTICATED                                                                        |
 | 403    | FORBIDDEN                                                                              |
 | 404    | NOT_FOUND, USER_NOT_FOUND, OPERATION_NOT_FOUND, COMPLIANCE_CHANGE_NOT_FOUND            |
 | 409    | IDEMPOTENCY_CONFLICT, WALLET_ALREADY_REGISTERED                                        |
 | 413    | PAYLOAD_TOO_LARGE                                                                      |
+| 415    | UNSUPPORTED_MEDIA_TYPE (charset or content encoding the body parser refuses)           |
 | 422    | INSUFFICIENT_FUNDS                                                                     |
 | 503    | NO_ACTIVE_DEPLOYMENT, DEPLOYMENT_MISMATCH, DEPLOYMENT_NOT_REGISTERED, BUSY, NOT_READY (all with `Retry-After`; retry with the same key) |
 | 500    | INTERNAL                                                                               |
