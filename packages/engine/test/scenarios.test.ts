@@ -826,6 +826,23 @@ describe('each piece of reversal evidence blocks on its own (obligations 5, 6)',
     for (let i = 0; i < 3; i += 1) await rig.engine.monitor.runOnce(); // no indexer pass
     expect(await statusOf(dep.id)).toBe('failed');
   });
+
+  it('chainHasEventForRef: a stale indexed event (block since reorged away, index not yet rolled back) still blocks the reversal', async () => {
+    const rig = await makeRig(db.prisma, { confirmationDepth: 2 });
+    const { dep } = await failedThenSettledOutside(rig);
+    await rig.engine.indexer.runOnce();
+    expect(await db.prisma.chainEvent.count({ where: { ref: dep.ref } })).toBe(1);
+    rig.chain.reorg({ depth: 1, dropTransactions: true }); // the outside mint is gone
+    rig.chain.mine(3);
+    // Every other field now allows it: no attempt, reference unused at the final block. Only the
+    // (stale) indexed event says "wait": reversing on the absence of evidence is what ADR 0007 forbids.
+    await rig.engine.monitor.runOnce(); // no indexer pass
+    expect(await statusOf(dep.id)).toBe('failed');
+    // Once the index has rolled back, the evidence is complete and final: reversed.
+    await rig.engine.indexer.runOnce();
+    await rig.engine.monitor.runOnce();
+    expect(await statusOf(dep.id)).toBe('reversed');
+  });
 });
 
 describe('nonce allocation (obligation 1)', () => {

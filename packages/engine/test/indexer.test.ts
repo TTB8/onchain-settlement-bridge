@@ -111,6 +111,21 @@ describe('scanning', () => {
     expect((await state(rig)).blocks).toHaveLength(s.blocks.length);
   });
 
+  it('re-scanning a block that holds events writes no duplicate (unique block hash + log index)', async () => {
+    const rig = await makeRig(db.prisma, { confirmationDepth: 2 });
+    const u = await insertUser(db.prisma);
+    await setOnChain(rig.chain, u.wallet, { verified: true });
+    await rig.engine.operations.requestDeposit(u.id, 5n, randomUUID());
+    await rig.engine.dispatcher.runOnce(); // the head block now holds Minted + Transfer
+    const ix = indexerFor(rig);
+    await ix.runOnce();
+    const n = (await state(rig)).events.length;
+    const again = await ix.runOnce(); // the unfinal tail (the head block) is read again
+    expect(again).toMatchObject({ status: 'scanned', toBlock: await rig.chain.getHeadBlock() });
+    if (again.status === 'scanned') expect(again.events).toBeGreaterThan(0);
+    expect((await state(rig)).events).toHaveLength(n);
+  });
+
   it('scans in batches and never past the head', async () => {
     const rig = await busyRig();
     const ix = indexerFor(rig, rig.chain, { confirmationDepth: 2, maxBatch: 2, reorgWindow: 4 });

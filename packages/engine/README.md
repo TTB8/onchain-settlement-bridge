@@ -3,8 +3,9 @@
 The bridge engine, framework-free: plain classes and functions that take a Prisma client, a clock
 and an id source. No NestJS here; the API and worker apps wire these up.
 
-This is **piece A**: the operation service, the single status-move helper, and the outbox
-dispatcher. Piece B (submitter, confirmer, indexer, reconciler) builds on it.
+**Piece A**: the operation service, the single status-move helper, and the outbox dispatcher.
+**Piece B**: the settlement submitter, the transaction monitor, the indexer and the `BridgeEngine`
+composition root (below). The reconciler, compliance sending and audit extras are piece C.
 
 | Module                 | What it does                                                                                       |
 | ---------------------- | -------------------------------------------------------------------------------------------------- |
@@ -14,6 +15,13 @@ dispatcher. Piece B (submitter, confirmer, indexer, reconciler) builds on it.
 | `transaction.ts`       | `runTransaction`: one interactive transaction, retried a bounded number of times on 40001 / 40P01 |
 | `ledger-writes.ts`     | Shared writes: account resolution, journal entry + postings, audit row                             |
 | `redact.ts`            | `sanitizeText` / `describeError`: URL-free, single-line, bounded error text                       |
+| `signing.ts`           | `TransactionSigner` (sign first, broadcast exactly that later), `ResigningSigner`                  |
+| `attempts.ts`          | Shared attempt/nonce machinery: call codec, nonce under the signer lock, lease fence, broadcast classification |
+| `settlement-submitter.ts` | `SettlementSubmitter`: the `OutboxHandler` for `settlement` rows                               |
+| `tx-monitor.ts`        | `TxMonitor`: submitted/failed operations decided on final evidence                                 |
+| `indexer.ts`           | `Indexer`: events + block hashes into the database, reorg-aware                                    |
+| `alarms.ts`            | `AlarmSink` / `AlarmLog`: conditions a person must look at                                         |
+| `bridge-engine.ts`     | `BridgeEngine`: wiring, `tick()`, a thin `start()`/`stop()` loop                                   |
 | `errors.ts`            | Typed `EngineError`s, and the translation from domain errors                                       |
 | `ports.ts`             | `Clock`, `IdSource` and their production implementations                                         |
 
@@ -135,6 +143,88 @@ The guarantees above hold only if the handler keeps to these:
 6. **Outcomes.** Return `{ retryAt }` while waiting for finality, `{ failed: code }` only for a
    definite refusal, and throw for anything unknown.
 
+## Piece B: sending, watching, indexing
+
+### Sign first, then commit, then broadcast (obligation 1)
+
+`ChainGateway.submit` signs and sends in one call and reveals the hash only afterwards, while
+`chain_attempt` needs the hash and the raw bytes at INSERT. So the engine takes a
+`TransactionSigner`: `sign(request)` returns `{ hash, raw }` without sending, and
+`broadcast(signed, request)` sends exactly that. `ResigningSigner` adapts a gateway whose signing
+is deterministic (both are): it re-submits the same request and refuses to call it a success
+unless the gateway reports the recorded hash (`SignedHashMismatchError`, an unknown outcome). The
+tests supply the signing function (the fake's hash; viem with Anvil's dev key). **Production needs
+a sign-only + send-raw method on the chain package's gateway** (open question): until then no
+production key holder can produce the bytes before the send.
+
+### The submitter (`SettlementSubmitter.handle`)
+
+1. Operation + deployment; the deployment must be the gateway's (`DeploymentMismatchError`, a
+   retry) (obligation 17).
+2. The row already has an attempt: rebroadcast THAT attempt (same bytes, same nonce), or `done` if
+   the operation is no longer `submitted`. Never a new nonce for a row that has one.
+3. Else: pending nonce and fee estimate read first (no lock across a node call), then ONE
+   transaction: lease fence on the outbox row (`UPDATE ... WHERE status='processing' AND
+   locked_by=<lease>`, exactly 1 row, else roll back; review L-B), `lockSignerState` + `nextNonce`
+   over every attempt nonce at or above the chain's pending count, sign, insert the attempt,
+   `moveOperation` SUBMIT `first` (version-fenced).
+4. After the commit: `signal` not aborted and `stillHolds()` true, else `LeaseLostError` and no
+   send.
+5. Broadcast: sent / already known / nonce already used -> `done`; this node refused ->
+   attempt marked `dropped` (still counted until its nonce is final), row `failed`, operation
+   stays `submitted`; unknown -> thrown, the dispatcher retries and step 2 rebroadcasts.
+
+### The monitor (`TxMonitor.runOnce`)
+
+Chain view head first: `head`, `getNonce(signer, head)`, `getNonce(signer, max(0, head-depth+1))`;
+any read error ends the pass with nothing written. Only the bound deployment's operations are
+examined; others raise `foreign_deployment`. Per operation: every attempt (rejected ones too) with
+its receipt and whether the node knows it, every indexed event carrying the reference, and the
+canonical hash of each event's block read from the node now.
+
+- A canonical settling event: `lateConfirmation` -> CONFIRM (CONFIRM_LATE if failed) with
+  `confirmedBlock` = the event block; `reference_conflict` -> FAIL + escalation; `wait` -> wait.
+- `submitted`, no event: `assessAttempt` per attempt. Mined (final or not) -> wait for the event
+  (alarm `settled_without_event` if final). Final revert -> `resolveRevert` -> FAIL with its
+  reason (`duplicate_reference` escalated). Newest attempt: `stuck_bump` -> same nonce, bumped
+  fees, new attempt + SUBMIT `bump` in one commit; `dropped` -> SUBMIT `resubmit` and rebroadcast
+  the same bytes; `give_up` -> FAIL (`dropped` for `max_resubmits`, else `retries_exhausted`);
+  `replaced_or_lost` on every attempt -> `readReferenceUsed` at the final block; unused and no
+  event -> new nonce (SUBMIT `resubmit`), else wait + alarm.
+- `failed`, not an escalation: REVERSE only if `mayReverse` accepts evidence from this pass.
+- The head not advancing for `headStallTicks` passes raises `head_stalled`.
+
+### The indexer (`Indexer.runOnce`)
+
+`detectReorg` over the newest `reorgWindow` stored blocks against hashes from the node:
+`beyondWindow` halts (alarm, nothing written, every pass); `reorged` removes the blocks above the
+fork point with their events and rewinds the cursor in one transaction with an audit row;
+`nodeBehind` neither rolls back nor advances. Then `nextScanRange`, blocks and events from the
+node, hash-linked and hash-matched, written in one transaction (`skipDuplicates` on block hash +
+log index; the cursor never moves back on a scan). Finality is never stored: it is judged from the
+head at use.
+
+**Deviation from the brief (schema):** `chain_event` has no canonical flag and cascades with its
+`indexed_block` (one row per height), so orphaned events are deleted, not marked. Every consumer
+re-checks hashes against the node, so nothing depends on keeping them; a "mark, never delete"
+model needs a db migration (open question).
+
+### `BridgeEngine`
+
+`new BridgeEngine({ prisma, gateway, signer, clock, ids, alarms? }, config)`; `tick()` = dispatcher,
+indexer, monitor. `maxResubmits` defaults to 3: three rebroadcasts ride out a node restart, pool
+eviction or a load balancer flap; a transaction every node keeps dropping after that needs a
+person, and a resubmission can never pay twice (single-use reference), so the limit only bounds
+noise and gas. `start()`/`stop()` loop around `tick()` without overlap.
+
+### Known limit: a dead nonce blocks the signer
+
+An attempt that was dropped everywhere and given up keeps its nonce reserved (attempts are never
+deleted, and it can still mine). Until something uses that nonce, later transactions of the signer
+queue behind the gap, and the operation cannot be reversed (its nonce is not final). Releasing it
+needs a "cancel" transaction (a zero-value self-send with that nonce) that the gateway does not
+offer yet (open question).
+
 ## Tests
 
 Real PostgreSQL 16 (the db package's migrations, so every SQL guard is live). Each test file
@@ -168,6 +258,14 @@ pnpm --filter @bridge/engine test:cov    # with thresholds (90% statements/lines
 | Redacted, bounded last_error              | outbox-dispatcher: "error text is recorded redacted and bounded"; units: "sanitizeText / describeError"   |
 | Bounded waits                             | outbox-dispatcher: "deliberate waits are bounded (review L-3)"                                             |
 | Crash recovery, lease fence               | outbox-dispatcher: "crashes and stale locks" (4 tests)                                                    |
+| B / 1: commit before broadcast, idempotent | scenarios: "an outbox row delivered twice ...", "a crash between the attempt commit and the broadcast ...", "a nonce recorded but never broadcast ..." |
+| B / L-B: lease fence, REVERSE race        | scenarios: "a lease taken over while signing ...", "FAIL ... committed first ...", "REVERSE racing the attempt commit ..." |
+| B / 2-4: final nonce, unknown, rejected   | scenarios: "dropped and never mined ...", "submit outcome unknown ...", "another node accepted what ours rejected ...", "obligation 3: ..." (2) |
+| B / 5-8, 11: evidence and escalations     | scenarios: "frozen address ...", "a plain revert ...", "each piece of reversal evidence blocks on its own" (2), "duplicate_reference ...", "reference_conflict ..." |
+| B / 9, 12, 15: canonical, event block     | scenarios: "obligation 12 ...", "a reorg removing a not-yet-final transaction ...", "a stale event from an orphaned block ..." |
+| B / 10, 17: alarms, binding               | scenarios: "head_stalled", "another deployment's failed operation ...", "an outbox row bound to another deployment ...", "chain_mismatch" |
+| B / 14: indexer                           | indexer: scanning (5), reorgs (6)                                                                         |
+| B / end to end on a real chain            | engine.anvil: "deposit -> transfer -> withdrawal through tick() on Anvil ..."                             |
 
 ## Using the workspace packages
 
