@@ -1,5 +1,7 @@
 import {
+  type Address,
   canTransition,
+  type Finality,
   InvalidInputError,
   InvalidTransitionError,
   isTerminal,
@@ -13,6 +15,7 @@ import {
   type ReversalEvidence,
   resolveRevert,
   type SettlementExpectation,
+  type SettlingEventLike,
   settlementDifferences,
   SETTLING_EVENT,
   transition,
@@ -110,6 +113,12 @@ describe('settling events', () => {
   });
 });
 
+// Finality used throughout: head 100, depth 3. Block 98 has exactly 3 confirmations (final);
+// block 99 has 2 (not final).
+const FIN: Finality = { head: 100n, depth: 3 };
+const FINAL_BLOCK = 98n;
+const SHALLOW_BLOCK = 99n;
+
 describe('resolveRevert: the duplicate-submission rule', () => {
   const alice = addr(0xa);
   const bob = addr(0xb);
@@ -129,51 +138,82 @@ describe('resolveRevert: the duplicate-submission rule', () => {
     amount: 7n,
     parties: { type: 'transfer', from: alice, to: bob },
   };
+  const mint = (to: Address, amount: bigint, blockNumber = FINAL_BLOCK): SettlingEventLike => ({
+    kind: 'Minted',
+    to,
+    amount,
+    blockNumber,
+  });
 
   describe('the first submission won (exact settling event on chain)', () => {
-    it('confirms a deposit whose Minted event matches exactly', () => {
-      expect(
-        resolveRevert(deposit, REFERENCE_ALREADY_USED, {
-          kind: 'Minted',
-          to: alice,
-          amount: 1000n,
-        }),
-      ).toEqual({ verdict: 'confirm', event: 'CONFIRM' });
+    it('confirms a deposit whose final Minted event matches exactly', () => {
+      expect(resolveRevert(deposit, REFERENCE_ALREADY_USED, mint(alice, 1000n), FIN)).toEqual({
+        verdict: 'confirm',
+        event: 'CONFIRM',
+      });
     });
 
     it('confirms a withdrawal and a transfer that match exactly', () => {
       expect(
-        resolveRevert(withdrawal, REFERENCE_ALREADY_USED, {
-          kind: 'Burned',
-          from: alice,
-          amount: 50n,
-        }).verdict,
+        resolveRevert(
+          withdrawal,
+          REFERENCE_ALREADY_USED,
+          { kind: 'Burned', from: alice, amount: 50n, blockNumber: FINAL_BLOCK },
+          FIN,
+        ).verdict,
       ).toBe('confirm');
       expect(
-        resolveRevert(transfer, REFERENCE_ALREADY_USED, {
-          kind: 'SettledTransfer',
-          from: alice,
-          to: bob,
-          amount: 7n,
-        }).verdict,
+        resolveRevert(
+          transfer,
+          REFERENCE_ALREADY_USED,
+          { kind: 'SettledTransfer', from: alice, to: bob, amount: 7n, blockNumber: FINAL_BLOCK },
+          FIN,
+        ).verdict,
       ).toBe('confirm');
     });
 
     it('confirms even if this attempt reverted for another reason (the chain is the record)', () => {
+      expect(resolveRevert(deposit, NOT_ALLOWED, mint(alice, 1000n), FIN).verdict).toBe('confirm');
+      expect(resolveRevert(deposit, undefined, mint(alice, 1000n), FIN).verdict).toBe('confirm');
+    });
+  });
+
+  describe('finality of the observed event (review M-1)', () => {
+    it('a matching event with fewer than depth confirmations is wait, not confirm', () => {
       expect(
-        resolveRevert(deposit, NOT_ALLOWED, { kind: 'Minted', to: alice, amount: 1000n }).verdict,
-      ).toBe('confirm');
+        resolveRevert(deposit, REFERENCE_ALREADY_USED, mint(alice, 1000n, SHALLOW_BLOCK), FIN),
+      ).toEqual({ verdict: 'wait' });
+    });
+
+    it('a conflicting event that is not final is wait too: it may vanish in a reorg', () => {
       expect(
-        resolveRevert(deposit, undefined, { kind: 'Minted', to: alice, amount: 1000n }).verdict,
-      ).toBe('confirm');
+        resolveRevert(deposit, REFERENCE_ALREADY_USED, mint(alice, 100n, SHALLOW_BLOCK), FIN),
+      ).toEqual({ verdict: 'wait' });
+    });
+
+    it('an event above a lagging head (0 confirmations) is wait', () => {
+      expect(resolveRevert(deposit, undefined, mint(alice, 1000n, 101n), FIN).verdict).toBe('wait');
+    });
+
+    it('is decided at exactly depth confirmations', () => {
+      expect(resolveRevert(deposit, undefined, mint(alice, 1000n, 98n), FIN).verdict).toBe(
+        'confirm',
+      );
+      expect(resolveRevert(deposit, undefined, mint(alice, 100n, 98n), FIN).verdict).toBe(
+        'reference_conflict',
+      );
+    });
+
+    it('rejects an invalid depth', () => {
+      expect(() =>
+        resolveRevert(deposit, undefined, mint(alice, 1000n), { head: 100n, depth: 0 }),
+      ).toThrow(InvalidInputError);
     });
   });
 
   describe('the reference was used for something else (conflict, needs a person)', () => {
     it('mint(100) event vs a 1000 deposit is a conflict on amount', () => {
-      expect(
-        resolveRevert(deposit, REFERENCE_ALREADY_USED, { kind: 'Minted', to: alice, amount: 100n }),
-      ).toEqual({
+      expect(resolveRevert(deposit, REFERENCE_ALREADY_USED, mint(alice, 100n), FIN)).toEqual({
         verdict: 'reference_conflict',
         reason: 'reference_conflict',
         differences: [{ field: 'amount', expected: 1000n, observed: 100n }],
@@ -182,11 +222,12 @@ describe('resolveRevert: the duplicate-submission rule', () => {
 
     it('a burn event vs a deposit is a conflict on kind', () => {
       expect(
-        resolveRevert(deposit, REFERENCE_ALREADY_USED, {
-          kind: 'Burned',
-          from: alice,
-          amount: 1000n,
-        }),
+        resolveRevert(
+          deposit,
+          REFERENCE_ALREADY_USED,
+          { kind: 'Burned', from: alice, amount: 1000n, blockNumber: FINAL_BLOCK },
+          FIN,
+        ),
       ).toEqual({
         verdict: 'reference_conflict',
         reason: 'reference_conflict',
@@ -195,29 +236,26 @@ describe('resolveRevert: the duplicate-submission rule', () => {
     });
 
     it('a different recipient is a conflict on `to`', () => {
-      const r = resolveRevert(deposit, REFERENCE_ALREADY_USED, {
-        kind: 'Minted',
-        to: bob,
-        amount: 1000n,
-      });
+      const r = resolveRevert(deposit, REFERENCE_ALREADY_USED, mint(bob, 1000n), FIN);
       expect(r.verdict).toBe('reference_conflict');
       expect(r).toMatchObject({ differences: [{ field: 'to', expected: alice, observed: bob }] });
     });
 
     it('a different sender, or a different transfer recipient, is a conflict', () => {
       expect(
-        resolveRevert(withdrawal, REFERENCE_ALREADY_USED, {
-          kind: 'Burned',
-          from: bob,
-          amount: 50n,
-        }).verdict,
+        resolveRevert(
+          withdrawal,
+          REFERENCE_ALREADY_USED,
+          { kind: 'Burned', from: bob, amount: 50n, blockNumber: FINAL_BLOCK },
+          FIN,
+        ).verdict,
       ).toBe('reference_conflict');
-      const r = resolveRevert(transfer, REFERENCE_ALREADY_USED, {
-        kind: 'SettledTransfer',
-        from: carol,
-        to: carol,
-        amount: 8n,
-      });
+      const r = resolveRevert(
+        transfer,
+        REFERENCE_ALREADY_USED,
+        { kind: 'SettledTransfer', from: carol, to: carol, amount: 8n, blockNumber: FINAL_BLOCK },
+        FIN,
+      );
       expect(r).toMatchObject({
         verdict: 'reference_conflict',
         differences: [
@@ -229,11 +267,7 @@ describe('resolveRevert: the duplicate-submission rule', () => {
     });
 
     it('a conflict is never a CONFIRM or a REVERSE edge', () => {
-      const r = resolveRevert(deposit, REFERENCE_ALREADY_USED, {
-        kind: 'Minted',
-        to: alice,
-        amount: 100n,
-      });
+      const r = resolveRevert(deposit, REFERENCE_ALREADY_USED, mint(alice, 100n), FIN);
       expect('event' in r).toBe(false);
       expect(
         mayReverse({
@@ -248,7 +282,7 @@ describe('resolveRevert: the duplicate-submission rule', () => {
 
   describe('no event for the reference: a real failure', () => {
     it('ReferenceAlreadyUsed with no event is duplicate_reference, never a confirm', () => {
-      expect(resolveRevert(deposit, REFERENCE_ALREADY_USED, null)).toEqual({
+      expect(resolveRevert(deposit, REFERENCE_ALREADY_USED, null, FIN)).toEqual({
         verdict: 'failed',
         event: 'FAIL',
         reason: 'duplicate_reference',
@@ -256,7 +290,7 @@ describe('resolveRevert: the duplicate-submission rule', () => {
     });
 
     it('NotAllowed is compliance_rejected', () => {
-      expect(resolveRevert(transfer, NOT_ALLOWED, null)).toEqual({
+      expect(resolveRevert(transfer, NOT_ALLOWED, null, FIN)).toEqual({
         verdict: 'failed',
         event: 'FAIL',
         reason: 'compliance_rejected',
@@ -264,22 +298,20 @@ describe('resolveRevert: the duplicate-submission rule', () => {
     });
 
     it('any other or undecoded reason is a plain revert', () => {
-      expect(resolveRevert(withdrawal, 'EnforcedPause', null)).toEqual({
+      expect(resolveRevert(withdrawal, 'EnforcedPause', null, FIN)).toEqual({
         verdict: 'failed',
         event: 'FAIL',
         reason: 'reverted',
       });
-      expect(resolveRevert(withdrawal, undefined, null)).toMatchObject({ reason: 'reverted' });
+      expect(resolveRevert(withdrawal, undefined, null, FIN)).toMatchObject({
+        reason: 'reverted',
+      });
     });
   });
 
   it('settlementDifferences is empty exactly for the matching event', () => {
-    expect(settlementDifferences(deposit, { kind: 'Minted', to: alice, amount: 1000n })).toEqual(
-      [],
-    );
-    expect(
-      settlementDifferences(deposit, { kind: 'Minted', to: alice, amount: 999n }),
-    ).toHaveLength(1);
+    expect(settlementDifferences(deposit, mint(alice, 1000n))).toEqual([]);
+    expect(settlementDifferences(deposit, mint(alice, 999n))).toHaveLength(1);
   });
 });
 
@@ -292,7 +324,7 @@ describe('an operation whose type disagrees with its parties', () => {
     amount: 5n,
     parties: { type: 'transfer', from: bob, to: alice },
   };
-  const mint = { kind: 'Minted', to: alice, amount: 5n } as const;
+  const mint: SettlingEventLike = { kind: 'Minted', to: alice, amount: 5n, blockNumber: 1n };
 
   it('settlementDifferences throws InvalidInputError instead of comparing', () => {
     expect(() => settlementDifferences(inconsistent, mint)).toThrow(InvalidInputError);
@@ -300,10 +332,10 @@ describe('an operation whose type disagrees with its parties', () => {
   });
 
   it('resolveRevert throws on every branch, never confirming', () => {
-    expect(() => resolveRevert(inconsistent, REFERENCE_ALREADY_USED, mint)).toThrow(
+    expect(() => resolveRevert(inconsistent, REFERENCE_ALREADY_USED, mint, FIN)).toThrow(
       InvalidInputError,
     );
-    expect(() => resolveRevert(inconsistent, REFERENCE_ALREADY_USED, null)).toThrow(
+    expect(() => resolveRevert(inconsistent, REFERENCE_ALREADY_USED, null, FIN)).toThrow(
       InvalidInputError,
     );
     expect(() =>
@@ -311,7 +343,12 @@ describe('an operation whose type disagrees with its parties', () => {
         { type: 'withdrawal', amount: 5n, parties: { type: 'deposit', to: alice } },
         undefined,
         null,
+        FIN,
       ),
+    ).toThrow(InvalidInputError);
+    // Even when the event is not final yet: the bad input is reported, not deferred.
+    expect(() =>
+      resolveRevert(inconsistent, undefined, { ...mint, blockNumber: SHALLOW_BLOCK }, FIN),
     ).toThrow(InvalidInputError);
   });
 

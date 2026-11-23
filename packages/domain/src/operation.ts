@@ -12,6 +12,7 @@
  *                               +--------FAIL------------+--FAIL--> failed --REVERSE--> reversed (terminal)
  */
 
+import { type Finality, isFinal } from './confirmation';
 import { InvalidInputError, InvalidTransitionError } from './errors';
 import type { Address } from './primitives';
 
@@ -126,10 +127,11 @@ export const SETTLING_EVENT: Readonly<Record<OperationType, SettlingEventKind>> 
 export type SettlingEventKind = 'Minted' | 'Burned' | 'SettledTransfer';
 
 /**
- * The fields of a settling event that are compared with an operation. Structurally a subset of the
- * chain package's `Minted` / `Burned` / `SettledTransfer` events, so those can be passed as they are.
+ * The fields of a settling event that are compared with an operation, plus the block it is in (so
+ * its finality can be judged). Structurally a subset of the chain package's `Minted` / `Burned` /
+ * `SettledTransfer` events, so those can be passed as they are.
  */
-export type SettlingEventLike =
+export type SettlingEventLike = { readonly blockNumber: bigint } & (
   | { readonly kind: 'Minted'; readonly to: Address; readonly amount: bigint }
   | { readonly kind: 'Burned'; readonly from: Address; readonly amount: bigint }
   | {
@@ -137,7 +139,8 @@ export type SettlingEventLike =
       readonly from: Address;
       readonly to: Address;
       readonly amount: bigint;
-    };
+    }
+);
 
 /** The parts of an operation that its settling event must reproduce exactly. */
 export interface SettlementExpectation {
@@ -205,8 +208,13 @@ export function settlementDifferences(
 
 /** What a reverted attempt means for its operation. Exactly one verdict. */
 export type RevertResolution =
-  /** The chain shows this operation's exact settlement: apply CONFIRM. */
+  /** The chain shows this operation's exact settlement, final: apply CONFIRM. */
   | { readonly verdict: 'confirm'; readonly event: 'CONFIRM' }
+  /**
+   * An event for the reference exists but is not final yet. Do nothing and look again: a matching
+   * event can still vanish in a reorg, and so can a conflicting one.
+   */
+  | { readonly verdict: 'wait' }
   /** A real failure: apply FAIL with `reason`. Reversal is still gated by `mayReverse`. */
   | { readonly verdict: 'failed'; readonly event: 'FAIL'; readonly reason: FailureReason }
   /**
@@ -219,6 +227,29 @@ export type RevertResolution =
       readonly reason: 'reference_conflict';
       readonly differences: readonly SettlementDifference[];
     };
+
+/** The verdict on an observed settling event for an operation: final and exact, not final, or wrong. */
+export type SettlementJudgement = Exclude<RevertResolution, { verdict: 'failed' }>;
+
+/**
+ * Judges an observed settling event against its operation: `wait` until it is final, then
+ * `confirm` if `settlementDifferences` is empty, else `reference_conflict`. The one place that
+ * decides whether an event settles an operation, shared by `resolveRevert` and `lateConfirmation`.
+ */
+function judgeSettlementEvent(
+  op: SettlementExpectation,
+  event: SettlingEventLike,
+  finality: Finality,
+): SettlementJudgement {
+  const differences = settlementDifferences(op, event);
+  if (!isFinal(event.blockNumber, finality)) {
+    return { verdict: 'wait' };
+  }
+  if (differences.length === 0) {
+    return { verdict: 'confirm', event: 'CONFIRM' };
+  }
+  return { verdict: 'reference_conflict', reason: 'reference_conflict', differences };
+}
 
 /** The contract error the token raises when a reference was already consumed. */
 export const REFERENCE_ALREADY_USED = 'ReferenceAlreadyUsed';
@@ -246,24 +277,25 @@ export const NOT_ALLOWED = 'NotAllowed';
  * - no event: a real failure, classified by the revert reason (`ReferenceAlreadyUsed` without an
  *   event is `duplicate_reference`, `NotAllowed` is `compliance_rejected`, anything else `reverted`).
  *
+ * Any observed event is judged only once it is final (`finality.depth` confirmations); before
+ * that the verdict is `wait`, for a matching and a conflicting event alike.
+ *
  * Throws `InvalidInputError` when `op.type` and `op.parties.type` disagree, whichever branch runs.
  *
  * @param op The operation the attempt was for.
  * @param reason The decoded contract error name, or undefined when it could not be decoded.
  * @param observedEvent The settling-kind event on chain carrying this operation's reference, or null.
+ * @param finality The current head and the confirmations required.
  */
 export function resolveRevert(
   op: SettlementExpectation,
   reason: string | undefined,
   observedEvent: SettlingEventLike | null,
+  finality: Finality,
 ): RevertResolution {
   assertConsistentExpectation(op);
   if (observedEvent !== null) {
-    const differences = settlementDifferences(op, observedEvent);
-    if (differences.length === 0) {
-      return { verdict: 'confirm', event: 'CONFIRM' };
-    }
-    return { verdict: 'reference_conflict', reason: 'reference_conflict', differences };
+    return judgeSettlementEvent(op, observedEvent, finality);
   }
   if (reason === REFERENCE_ALREADY_USED) {
     // The reference is consumed but by nothing we can see: never treat that as settled.
