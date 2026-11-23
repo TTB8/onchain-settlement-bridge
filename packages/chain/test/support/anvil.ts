@@ -72,8 +72,11 @@ export interface AnvilNode {
 }
 
 /** Starts anvil on a free port and waits until it answers. */
-export async function startAnvil(extraArgs: string[] = []): Promise<AnvilNode> {
-  const port = await freePort();
+export async function startAnvil(
+  extraArgs: string[] = [],
+  options: { port?: number } = {},
+): Promise<AnvilNode> {
+  const port = options.port ?? (await freePort());
   const url = `http://127.0.0.1:${port}`;
   const child: ChildProcess = spawn(
     foundryBinary('anvil'),
@@ -188,7 +191,10 @@ async function sendAndWait(
 }
 
 /** Deploys the registry and the token from the forge artifacts and wires the roles. */
-export async function deployBridge(node: AnvilNode): Promise<Deployment> {
+export async function deployBridge(
+  node: AnvilNode,
+  options: { holderTransfersEnabled?: boolean } = {},
+): Promise<Deployment> {
   const deployer = devAccount(DEV_ROLES.deployer);
   const wallet = createWalletClient({
     account: deployer,
@@ -224,9 +230,72 @@ export async function deployBridge(node: AnvilNode): Promise<Deployment> {
   await grant(token, settlementTokenAbi, 'MINTER_ROLE', DEV_ROLES.settlement);
   await grant(token, settlementTokenAbi, 'SETTLER_ROLE', DEV_ROLES.settlement);
   await grant(token, settlementTokenAbi, 'PAUSER_ROLE', DEV_ROLES.pauser);
+  if (options.holderTransfersEnabled) {
+    await sendAndWait(node, deployer, {
+      to: token,
+      abi: settlementTokenAbi,
+      functionName: 'setHolderTransfersEnabled',
+      args: [true],
+    });
+  }
 
-  return { registry: registry.toLowerCase() as Address, token: token.toLowerCase() as Address };
+  // The same wiring checks the deploy script makes before it writes a record.
+  const read = (address: Address, abi: Abi, functionName: string, args: unknown[] = []) =>
+    node.client.readContract({ address, abi, functionName, args });
+  const checks: [string, boolean][] = [
+    [
+      'token registry',
+      lower(String(await read(token, settlementTokenAbi, 'registry'))) === lower(registry),
+    ],
+    [
+      'compliance role',
+      Boolean(
+        await read(registry, complianceRegistryAbi, 'hasRole', [
+          role('COMPLIANCE_ROLE'),
+          devAccount(DEV_ROLES.compliance).address,
+        ]),
+      ),
+    ],
+    [
+      'minter role',
+      Boolean(
+        await read(token, settlementTokenAbi, 'hasRole', [
+          role('MINTER_ROLE'),
+          devAccount(DEV_ROLES.settlement).address,
+        ]),
+      ),
+    ],
+    [
+      'settler role',
+      Boolean(
+        await read(token, settlementTokenAbi, 'hasRole', [
+          role('SETTLER_ROLE'),
+          devAccount(DEV_ROLES.settlement).address,
+        ]),
+      ),
+    ],
+    [
+      'pauser role',
+      Boolean(
+        await read(token, settlementTokenAbi, 'hasRole', [
+          role('PAUSER_ROLE'),
+          devAccount(DEV_ROLES.pauser).address,
+        ]),
+      ),
+    ],
+    [
+      'holder switch',
+      Boolean(await read(token, settlementTokenAbi, 'holderTransfersEnabled')) ===
+        Boolean(options.holderTransfersEnabled),
+    ],
+  ];
+  const failed = checks.filter(([, ok]) => !ok).map(([name]) => name);
+  if (failed.length > 0) throw new Error(`deployment wiring check failed: ${failed.join(', ')}`);
+
+  return { registry: lower(registry), token: lower(token) };
 }
+
+const lower = (address: string): Address => address.toLowerCase() as Address;
 
 /** A gateway for the deployment, signing with the dev settlement and compliance accounts. */
 export function gatewayFor(
@@ -268,26 +337,51 @@ export async function setPausedOnChain(
   return hash;
 }
 
+/**
+ * A dev account calls a token function directly (outside the bridge) with a fixed gas limit, so a
+ * call that reverts is still mined, and waits for it (automine on).
+ */
+export async function tokenCallOnChain(
+  node: AnvilNode,
+  deployment: Deployment,
+  accountIndex: number,
+  functionName: 'transfer' | 'transferFrom' | 'approve' | 'setHolderTransfersEnabled',
+  args: unknown[],
+): Promise<Hex> {
+  const wallet = createWalletClient({
+    account: devAccount(accountIndex),
+    transport: http(node.url, { retryCount: 0 }),
+  });
+  const hash = await wallet.writeContract({
+    chain: null,
+    address: deployment.token,
+    abi: settlementTokenAbi as Abi,
+    functionName,
+    args,
+    gas: 150_000n,
+  });
+  await waitRaw(node, hash);
+  return hash;
+}
+
 /** A holder signs a plain ERC-20 transfer outside the bridge and waits for it (automine on). */
-export async function holderTransferOnChain(
+export function holderTransferOnChain(
   node: AnvilNode,
   deployment: Deployment,
   fromIndex: number,
   to: Address,
   amount: bigint,
 ): Promise<Hex> {
-  const wallet = createWalletClient({
-    account: devAccount(fromIndex),
-    transport: http(node.url, { retryCount: 0 }),
-  });
-  const hash = await wallet.writeContract({
-    chain: null,
-    address: deployment.token,
-    abi: settlementTokenAbi,
-    functionName: 'transfer',
-    args: [to, amount],
-    gas: 150_000n,
-  });
-  await waitRaw(node, hash);
-  return hash;
+  return tokenCallOnChain(node, deployment, fromIndex, 'transfer', [to, amount]);
+}
+
+/** The admin (the deployer in tests) switches the holder-signed ERC-20 path on or off. */
+export function setHolderTransfersOnChain(
+  node: AnvilNode,
+  deployment: Deployment,
+  enabled: boolean,
+): Promise<Hex> {
+  return tokenCallOnChain(node, deployment, DEV_ROLES.deployer, 'setHolderTransfersEnabled', [
+    enabled,
+  ]);
 }

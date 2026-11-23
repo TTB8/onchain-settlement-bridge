@@ -29,6 +29,7 @@ import {
   freePort,
   gatewayFor,
   holderTransferOnChain,
+  setHolderTransfersOnChain,
   setPausedOnChain,
   startAnvil,
   waitForReceipt,
@@ -240,7 +241,23 @@ describe('ViemChainGateway on anvil: the five calls and their events', () => {
     expect(await gw.getEvents({ fromBlock: -3n, toBlock: 0n })).toEqual([]);
   });
 
-  it('a holder-signed transfer shows up as a Transfer with no reference event', async () => {
+  it('a holder-signed transfer reverts HolderTransfersDisabled while the switch is off', async () => {
+    await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
+    const hash = (await holderTransferOnChain(
+      node,
+      deployment,
+      DEV_ROLES.alice,
+      bob,
+      ONE,
+    )) as TxHash;
+    expect(await waitForReceipt(gw, hash)).toMatchObject({
+      status: 'reverted',
+      revertReason: 'HolderTransfersDisabled',
+    });
+  });
+
+  it('with the switch on, a holder-signed transfer shows up as a Transfer with no reference event', async () => {
+    await setHolderTransfersOnChain(node, deployment, true);
     await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
     const hash = (await holderTransferOnChain(
       node,
@@ -266,6 +283,67 @@ describe('ViemChainGateway on anvil: the five calls and their events', () => {
     ]);
     // Not one of the bridge's transactions.
     expect(await gw.getTransaction(hash)).toBeNull();
+    await setHolderTransfersOnChain(node, deployment, false);
+  });
+
+  it("readReferenceUsed reads each contract's own set, at the head and at a past block", async () => {
+    const r = nextRef();
+    const before = await gw.getHeadBlock();
+    await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: r });
+    const afterToken = await gw.getHeadBlock();
+    expect(await gw.readReferenceUsed('token', r)).toBe(true);
+    expect(await gw.readReferenceUsed('registry', r)).toBe(false);
+    expect(await gw.readReferenceUsed('token', r, before)).toBe(false);
+    // The same ref is still free on the registry: the sets are separate.
+    await sendOk({ kind: 'setFrozen', account: carol, frozen: false, ref: r });
+    expect(await gw.readReferenceUsed('registry', r)).toBe(true);
+    expect(await gw.readReferenceUsed('registry', r, afterToken)).toBe(false);
+    // A reverted operation does not consume its reference.
+    const unused = nextRef();
+    await waitForReceipt(
+      gw,
+      await send({ kind: 'mint', to: devAddress('deployer'), amount: ONE, ref: unused }),
+    );
+    expect(await gw.readReferenceUsed('token', unused)).toBe(false);
+    await expect(gw.readReferenceUsed('token', '0x12')).rejects.toBeInstanceOf(ChainError);
+    await expect(gw.readReferenceUsed('vault' as 'token', r)).rejects.toBeInstanceOf(ChainError);
+  });
+
+  it('getNonce at a block is the count mined up to and including that block', async () => {
+    const start = await gw.getNonce('settlement');
+    const h1 = await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
+    const b1 = (await gw.getReceipt(h1))!.blockNumber;
+    await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
+    expect(await gw.getNonce('settlement', b1 - 1n)).toEqual({
+      confirmed: start.confirmed,
+      pending: start.confirmed,
+    });
+    expect(await gw.getNonce('settlement', b1)).toEqual({
+      confirmed: start.confirmed + 1,
+      pending: start.confirmed + 1,
+    });
+    // With a transaction waiting in the pool, a block read still ignores the pool.
+    await automine(false);
+    try {
+      await gw.submit({
+        signer: 'settlement',
+        call: { kind: 'mint', to: alice, amount: ONE, ref: nextRef() },
+        nonce: start.confirmed + 2,
+        fees: FEES,
+      });
+      const head = await gw.getHeadBlock();
+      expect(await gw.getNonce('settlement')).toEqual({
+        confirmed: start.confirmed + 2,
+        pending: start.confirmed + 3,
+      });
+      expect(await gw.getNonce('settlement', head)).toEqual({
+        confirmed: start.confirmed + 2,
+        pending: start.confirmed + 2,
+      });
+    } finally {
+      await mine();
+      await automine(true);
+    }
   });
 
   it('reads balances, supply and flags at a past block', async () => {

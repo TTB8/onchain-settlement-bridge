@@ -27,6 +27,7 @@ export const DEV_ROLES = {
   bob: 5,
   carol: 6,
   dave: 7,
+  erin: 8,
 } as const;
 
 /** The lowercase address of a dev account by role. */

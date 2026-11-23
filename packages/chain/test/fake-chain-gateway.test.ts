@@ -28,6 +28,7 @@ const ONE = 10n ** BigInt(TOKEN_DECIMALS);
 const alice = '0x00000000000000000000000000000000000a11ce' as Address;
 const bob = '0x0000000000000000000000000000000000000b0b' as Address;
 const carol = '0x00000000000000000000000000000000000ca201' as Address;
+const dave = '0x0000000000000000000000000000000000000da5' as Address;
 const FEES: Fees = { maxFeePerGas: parseGwei('10'), maxPriorityFeePerGas: parseGwei('1') };
 
 /** A small driver that owns nonces and references, like the engine will. */
@@ -448,6 +449,7 @@ describe('FakeChainGateway: token rules', () => {
   it('pause stops every balance change with EnforcedPause; unpause restores it', async () => {
     const { chain, d } = await verified();
     await d.mint(alice, 2n * ONE);
+    chain.setHolderTransfersEnabled(true); // so the holder path reaches the pause check
     const pause = chain.setPaused(true);
     expect(await d.status(pause)).toEqual({ status: 'success', reason: undefined });
     expect(chain.isPaused()).toBe(true);
@@ -494,6 +496,7 @@ describe('FakeChainGateway: token rules', () => {
 describe('FakeChainGateway: rogue holder transfers', () => {
   it('emits only Transfer, with no reference event, in the next block', async () => {
     const { chain, d } = setup({ automine: false });
+    chain.setHolderTransfersEnabled(true);
     await d.verify(alice);
     await d.verify(bob);
     await d.mint(alice, 3n * ONE);
@@ -522,6 +525,7 @@ describe('FakeChainGateway: rogue holder transfers', () => {
 
   it('is still subject to the token rules', async () => {
     const { chain, d } = setup();
+    chain.setHolderTransfersEnabled(true);
     await d.verify(alice);
     await d.mint(alice, ONE);
     expect(await d.status(chain.injectTransfer(alice, carol, ONE))).toEqual({
@@ -543,6 +547,255 @@ describe('FakeChainGateway: rogue holder transfers', () => {
   it('two identical rogue transfers get different hashes', () => {
     const { chain } = setup({ automine: false });
     expect(chain.injectTransfer(alice, bob, 1n)).not.toBe(chain.injectTransfer(alice, bob, 1n));
+  });
+});
+
+describe('FakeChainGateway: holder-signed path (switch, approve, transferFrom, transfer)', () => {
+  async function funded() {
+    const s = setup();
+    await s.d.verify(alice);
+    await s.d.verify(bob);
+    await s.d.verify(dave);
+    await s.d.mint(alice, 10n * ONE);
+    return s;
+  }
+
+  it('is off after deployment: transfer, approve and transferFrom revert HolderTransfersDisabled first', async () => {
+    const { chain, d } = await funded();
+    expect(chain.holderTransfersEnabled()).toBe(false);
+    // Even with every other check failing too, the switch is reported first.
+    chain.setPaused(true);
+    for (const hash of [
+      chain.injectTransfer(alice, carol, 100n * ONE),
+      chain.injectApprove(carol, ZERO_ADDRESS, ONE),
+      chain.injectTransferFrom(carol, alice, carol, 100n * ONE),
+    ]) {
+      expect(await d.status(hash)).toEqual({
+        status: 'reverted',
+        reason: 'HolderTransfersDisabled',
+      });
+    }
+    expect(chain.balanceOf(alice)).toBe(10n * ONE);
+  });
+
+  it('the switch is a mined admin transaction that emits no bridge event and never reverts', async () => {
+    const { chain, d } = await funded();
+    const on = chain.setHolderTransfersEnabled(true);
+    expect(await d.status(on)).toEqual({ status: 'success', reason: undefined });
+    expect(await d.status(chain.setHolderTransfersEnabled(true))).toEqual({
+      status: 'success',
+      reason: undefined,
+    });
+    const block = (await chain.getReceipt(on))!.blockNumber;
+    expect(await chain.getEvents({ fromBlock: block, toBlock: block })).toEqual([]);
+    expect(chain.holderTransfersEnabled()).toBe(true);
+    chain.setHolderTransfersEnabled(false);
+    expect(chain.holderTransfersEnabled()).toBe(false);
+  });
+
+  it('mint, burn and settleTransfer ignore the switch', async () => {
+    const { chain, d } = await funded();
+    expect(chain.holderTransfersEnabled()).toBe(false);
+    expect(await d.status(await d.settle(alice, bob, ONE))).toEqual({
+      status: 'success',
+      reason: undefined,
+    });
+    expect(await d.status(await d.burn(bob, ONE))).toEqual({
+      status: 'success',
+      reason: undefined,
+    });
+    expect(await d.status(await d.mint(bob, ONE))).toEqual({
+      status: 'success',
+      reason: undefined,
+    });
+  });
+
+  it('approve: switch, then EnforcedPause, then NotAllowed(owner), then ERC20InvalidSpender', async () => {
+    const { chain, d } = await funded();
+    chain.setHolderTransfersEnabled(true);
+    chain.setPaused(true);
+    expect(await d.status(chain.injectApprove(carol, ZERO_ADDRESS, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'EnforcedPause',
+    });
+    chain.setPaused(false);
+    expect(await d.status(chain.injectApprove(carol, ZERO_ADDRESS, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'NotAllowed',
+    });
+    expect(await d.status(chain.injectApprove(alice, ZERO_ADDRESS, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'ERC20InvalidSpender',
+    });
+    // The spender is not checked at approve time.
+    expect(await d.status(chain.injectApprove(alice, carol, 3n * ONE))).toEqual({
+      status: 'success',
+      reason: undefined,
+    });
+    expect(chain.allowance(alice, carol)).toBe(3n * ONE);
+    const block = await chain.getHeadBlock();
+    expect(await chain.getEvents({ fromBlock: block, toBlock: block })).toEqual([]);
+  });
+
+  it('transferFrom: switch, then NotAllowed(spender), then allowance, then the transfer checks', async () => {
+    const { chain, d } = await funded();
+    chain.setHolderTransfersEnabled(true);
+    chain.injectApprove(alice, carol, 3n * ONE);
+    chain.injectApprove(alice, dave, 3n * ONE);
+    // carol (the spender) is not allowed, even though alice and bob are.
+    expect(await d.status(chain.injectTransferFrom(carol, alice, bob, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'NotAllowed',
+    });
+    // dave is allowed; more than the allowance fails before the receiver is looked at.
+    expect(await d.status(chain.injectTransferFrom(dave, alice, carol, 4n * ONE))).toEqual({
+      status: 'reverted',
+      reason: 'ERC20InsufficientAllowance',
+    });
+    expect(await d.status(chain.injectTransferFrom(dave, alice, carol, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'NotAllowed',
+    });
+    expect(chain.allowance(alice, dave)).toBe(3n * ONE); // a revert spends nothing
+    const ok = chain.injectTransferFrom(dave, alice, bob, 2n * ONE);
+    expect(await d.status(ok)).toEqual({ status: 'success', reason: undefined });
+    expect(chain.allowance(alice, dave)).toBe(ONE);
+    expect(chain.balanceOf(bob)).toBe(2n * ONE);
+    const block = (await chain.getReceipt(ok))!.blockNumber;
+    expect(await chain.getEvents({ fromBlock: block, toBlock: block })).toEqual([
+      expect.objectContaining({
+        kind: 'Transfer',
+        from: alice,
+        to: bob,
+        amount: 2n * ONE,
+        txHash: ok,
+      }),
+    ]);
+    // Paused: transferFrom has no pause check of its own; _update reverts and nothing changes.
+    chain.setPaused(true);
+    expect(await d.status(chain.injectTransferFrom(dave, alice, bob, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'EnforcedPause',
+    });
+    expect(chain.allowance(alice, dave)).toBe(ONE);
+  });
+
+  it('an infinite allowance is never decreased; zero owner or receiver follow OpenZeppelin', async () => {
+    const { chain, d } = await funded();
+    chain.setHolderTransfersEnabled(true);
+    const max = 2n ** 256n - 1n;
+    chain.injectApprove(alice, dave, max);
+    expect(await d.status(chain.injectTransferFrom(dave, alice, bob, ONE))).toMatchObject({
+      status: 'success',
+    });
+    expect(chain.allowance(alice, dave)).toBe(max);
+    expect(await d.status(chain.injectTransferFrom(dave, alice, ZERO_ADDRESS, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'ERC20InvalidReceiver',
+    });
+    // From the zero address with a zero amount: the allowance check passes, _approve refuses.
+    expect(await d.status(chain.injectTransferFrom(dave, ZERO_ADDRESS, bob, 0n))).toEqual({
+      status: 'reverted',
+      reason: 'ERC20InvalidApprover',
+    });
+    expect(() => chain.injectApprove('0x12' as Address, bob, 1n)).toThrow(RangeError);
+    expect(() => chain.injectTransferFrom(dave, alice, bob, -1n)).toThrow(RangeError);
+  });
+
+  it('allowances survive the switch going off and are usable again when it comes back', async () => {
+    const { chain, d } = await funded();
+    chain.setHolderTransfersEnabled(true);
+    chain.injectApprove(alice, dave, 2n * ONE);
+    chain.setHolderTransfersEnabled(false);
+    expect(await d.status(chain.injectTransferFrom(dave, alice, bob, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'HolderTransfersDisabled',
+    });
+    expect(chain.allowance(alice, dave)).toBe(2n * ONE);
+    chain.setHolderTransfersEnabled(true);
+    expect(await d.status(chain.injectTransferFrom(dave, alice, bob, ONE))).toMatchObject({
+      status: 'success',
+    });
+  });
+
+  it('settleTransfer to the same account reverts SelfTransfer, after the reference and amount checks', async () => {
+    const { chain, d } = await funded();
+    const used = d.nextRef();
+    await d.mint(alice, ONE, used);
+    expect(await d.status(await d.settle(alice, alice, ONE, ZERO_REF))).toEqual({
+      status: 'reverted',
+      reason: 'InvalidReference',
+    });
+    expect(await d.status(await d.settle(alice, alice, 0n))).toEqual({
+      status: 'reverted',
+      reason: 'ZeroAmount',
+    });
+    expect(await d.status(await d.settle(alice, alice, ONE, used))).toEqual({
+      status: 'reverted',
+      reason: 'ReferenceAlreadyUsed',
+    });
+    const r = d.nextRef();
+    expect(await d.status(await d.settle(alice, alice, ONE, r))).toEqual({
+      status: 'reverted',
+      reason: 'SelfTransfer',
+    });
+    expect(chain.tokenReferenceUsed(r)).toBe(false);
+    // Before the zero-address and compliance checks too.
+    expect(await d.status(await d.settle(ZERO_ADDRESS, ZERO_ADDRESS, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'SelfTransfer',
+    });
+    expect(await d.status(await d.settle(carol, carol, ONE))).toEqual({
+      status: 'reverted',
+      reason: 'SelfTransfer',
+    });
+  });
+});
+
+describe('FakeChainGateway: readReferenceUsed and getNonce at a block', () => {
+  it("reads each contract's own reference set, at the head and at past blocks", async () => {
+    const { chain, d } = setup();
+    const r = d.nextRef();
+    await d.send({ kind: 'setVerified', account: alice, verified: true, ref: r }); // block 1
+    await d.mint(alice, ONE, r); // block 2: the same ref on the token
+    expect(await chain.readReferenceUsed('registry', r)).toBe(true);
+    expect(await chain.readReferenceUsed('token', r)).toBe(true);
+    expect(await chain.readReferenceUsed('token', r, 1n)).toBe(false);
+    expect(await chain.readReferenceUsed('registry', r, 1n)).toBe(true);
+    expect(await chain.readReferenceUsed('registry', r, 0n)).toBe(false);
+    const upper = `0x${r.slice(2).toUpperCase()}` as typeof r;
+    expect(await chain.readReferenceUsed('token', upper)).toBe(true);
+    expect(await chain.readReferenceUsed('token', d.nextRef())).toBe(false);
+    await expect(chain.readReferenceUsed('token', r, 9n)).rejects.toBeInstanceOf(ChainError);
+    await expect(chain.readReferenceUsed('token', '0x12' as typeof r)).rejects.toBeInstanceOf(
+      ChainError,
+    );
+    await expect(chain.readReferenceUsed('vault' as 'token', r)).rejects.toBeInstanceOf(ChainError);
+  });
+
+  it('a reverted operation leaves the reference unused', async () => {
+    const { chain, d } = setup();
+    const r = d.nextRef();
+    await d.mint(carol, ONE, r); // carol is not verified
+    expect(await chain.readReferenceUsed('token', r)).toBe(false);
+  });
+
+  it('getNonce at a block reports what was mined up to and including it, with no pool', async () => {
+    const { chain } = setup({ automine: false });
+    await chain.submit(mintRequest(0, FEES, ref(1)));
+    chain.mine(); // block 1 holds nonce 0
+    await chain.submit(mintRequest(1, FEES, ref(2)));
+    chain.mine(); // block 2 holds nonce 1
+    await chain.submit(mintRequest(2, FEES, ref(3))); // pending
+    expect(await chain.getNonce('settlement')).toEqual({ confirmed: 2, pending: 3 });
+    expect(await chain.getNonce('settlement', 0n)).toEqual({ confirmed: 0, pending: 0 });
+    expect(await chain.getNonce('settlement', 1n)).toEqual({ confirmed: 1, pending: 1 });
+    expect(await chain.getNonce('settlement', 2n)).toEqual({ confirmed: 2, pending: 2 });
+    expect(await chain.getNonce('compliance', 2n)).toEqual({ confirmed: 0, pending: 0 });
+    await expect(chain.getNonce('settlement', 3n)).rejects.toBeInstanceOf(ChainError);
+    // A reorg undoes a mined nonce, so a nonce is only final below head - depth + 1.
+    chain.reorg({ depth: 1 });
+    expect(await chain.getNonce('settlement', 2n)).toEqual({ confirmed: 1, pending: 1 });
   });
 });
 
@@ -982,6 +1235,7 @@ describe('FakeChainGateway: reorgs', () => {
     await d.verify(alice);
     await d.verify(bob);
     await d.mint(alice, ONE);
+    chain.setHolderTransfersEnabled(true);
     const rogue = chain.injectTransfer(alice, bob, ONE);
     chain.reorg({ depth: 1 });
     expect(await chain.getReceipt(rogue)).toBeNull();

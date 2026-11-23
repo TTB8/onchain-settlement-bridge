@@ -50,6 +50,7 @@ import {
   type Address,
   type BlockRange,
   type BlockRef,
+  type Bytes32,
   type ChainEvent,
   type ChainGateway,
   type ComplianceStatus,
@@ -274,9 +275,17 @@ export class ViemChainGateway implements ChainGateway {
     return lower(account.address);
   }
 
-  async getNonce(signer: SignerName): Promise<{ confirmed: number; pending: number }> {
+  async getNonce(
+    signer: SignerName,
+    blockNumber?: bigint,
+  ): Promise<{ confirmed: number; pending: number }> {
     const address = this.signerAddress(signer);
     return this.run('getNonce', async () => {
+      if (blockNumber !== undefined) {
+        // At a block there is no pool: both counts are what was mined up to and including it.
+        const mined = await this.client.getTransactionCount({ address, blockNumber });
+        return { confirmed: mined, pending: mined };
+      }
       const [confirmed, pending] = await Promise.all([
         this.client.getTransactionCount({ address, blockTag: 'latest' }),
         this.client.getTransactionCount({ address, blockTag: 'pending' }),
@@ -461,6 +470,33 @@ export class ViemChainGateway implements ChainGateway {
         functionName: 'totalSupply',
         blockNumber,
       }),
+    );
+  }
+
+  async readReferenceUsed(
+    contract: 'token' | 'registry',
+    ref: Bytes32,
+    blockNumber?: bigint,
+  ): Promise<boolean> {
+    if (contract !== 'token' && contract !== 'registry') {
+      throw new ChainError(`unknown contract: ${String(contract)}`);
+    }
+    return this.run('readReferenceUsed', () =>
+      contract === 'token'
+        ? this.client.readContract({
+            address: this.token,
+            abi: settlementTokenAbi,
+            functionName: 'referenceUsed',
+            args: [ref],
+            blockNumber,
+          })
+        : this.client.readContract({
+            address: this.registry,
+            abi: complianceRegistryAbi,
+            functionName: 'referenceUsed',
+            args: [ref],
+            blockNumber,
+          }),
     );
   }
 

@@ -23,8 +23,10 @@ import {
   deployBridge,
   gatewayFor,
   holderTransferOnChain,
+  setHolderTransfersOnChain,
   setPausedOnChain,
   startAnvil,
+  tokenCallOnChain,
   waitForReceipt,
   type AnvilNode,
 } from './support/anvil';
@@ -35,8 +37,8 @@ jest.setTimeout(120_000);
 
 const ONE = 1_000_000n;
 const FEES: Fees = { maxFeePerGas: parseGwei('10'), maxPriorityFeePerGas: parseGwei('1') };
-type Holder = 'alice' | 'bob' | 'carol' | 'dave';
-const HOLDERS: Holder[] = ['alice', 'bob', 'carol', 'dave'];
+type Holder = 'alice' | 'bob' | 'carol' | 'dave' | 'erin';
+const HOLDERS: Holder[] = ['alice', 'bob', 'carol', 'dave', 'erin'];
 const at = (h: Holder): Address => devAddress(h);
 
 /** What a test needs from a chain beyond the gateway: the outside world's actions. */
@@ -45,6 +47,9 @@ interface Rig {
   gateway: ChainGateway;
   rogueTransfer(from: Holder, to: Address, amount: bigint): Promise<TxHash>;
   setPaused(paused: boolean): Promise<TxHash>;
+  setHolderTransfers(enabled: boolean): Promise<TxHash>;
+  approve(owner: Holder, spender: Address, amount: bigint): Promise<TxHash>;
+  transferFrom(spender: Holder, from: Address, to: Address, amount: bigint): Promise<TxHash>;
   setAutomine(on: boolean): Promise<void>;
   mine(): Promise<void>;
 }
@@ -53,6 +58,9 @@ type Step =
   | { call: ContractCall }
   | { rogue: { from: Holder; to: Address; amount: bigint } }
   | { pause: boolean }
+  | { holderSwitch: boolean }
+  | { approve: { owner: Holder; spender: Address; amount: bigint } }
+  | { transferFrom: { spender: Holder; from: Address; to: Address; amount: bigint } }
   /** A submission that must be refused, with a request shaped by the current nonces. */
   | {
       refused: (
@@ -224,11 +232,16 @@ const SCENARIOS: { name: string; steps: Step[] }[] = [
   {
     name: 'rogue holder transfers',
     steps: [
+      { rogue: { from: 'alice', to: at('bob'), amount: 2n * ONE } }, // switch off: disabled
+      { rogue: { from: 'dave', to: ZERO_ADDRESS, amount: 10_000n * ONE } }, // disabled comes first
+      { holderSwitch: true },
       { rogue: { from: 'alice', to: at('bob'), amount: 2n * ONE } },
       { rogue: { from: 'alice', to: at('carol'), amount: ONE } },
       { rogue: { from: 'alice', to: at('bob'), amount: 10_000n * ONE } },
       { rogue: { from: 'alice', to: ZERO_ADDRESS, amount: ONE } },
       { rogue: { from: 'dave', to: at('alice'), amount: 0n } }, // frozen sender, even for zero
+      { holderSwitch: false },
+      { rogue: { from: 'alice', to: at('bob'), amount: ONE } },
     ],
   },
   {
@@ -252,6 +265,139 @@ const SCENARIOS: { name: string; steps: Step[] }[] = [
       { pause: false },
       { pause: false },
       { call: { kind: 'mint', to: at('alice'), amount: ONE, ref: R(8, 1) } },
+    ],
+  },
+  {
+    name: 'holder approve and transferFrom',
+    steps: [
+      { approve: { owner: 'alice', spender: at('bob'), amount: ONE } }, // switch off
+      { transferFrom: { spender: 'bob', from: at('alice'), to: at('bob'), amount: ONE } },
+      { holderSwitch: true },
+      { approve: { owner: 'carol', spender: at('bob'), amount: ONE } }, // owner not allowed
+      { approve: { owner: 'alice', spender: ZERO_ADDRESS, amount: ONE } },
+      { approve: { owner: 'alice', spender: at('carol'), amount: 3n * ONE } }, // spender unchecked
+      { transferFrom: { spender: 'carol', from: at('alice'), to: at('bob'), amount: ONE } },
+      { approve: { owner: 'alice', spender: at('bob'), amount: 2n * ONE } },
+      { transferFrom: { spender: 'bob', from: at('alice'), to: at('bob'), amount: 3n * ONE } },
+      { transferFrom: { spender: 'bob', from: at('alice'), to: at('carol'), amount: ONE } },
+      { transferFrom: { spender: 'bob', from: at('alice'), to: ZERO_ADDRESS, amount: ONE } },
+      { transferFrom: { spender: 'bob', from: at('alice'), to: at('bob'), amount: ONE } },
+      { pause: true },
+      { approve: { owner: 'alice', spender: at('bob'), amount: ONE } },
+      { transferFrom: { spender: 'bob', from: at('alice'), to: at('bob'), amount: ONE } },
+      { pause: false },
+      { holderSwitch: false },
+      { transferFrom: { spender: 'bob', from: at('alice'), to: at('bob'), amount: ONE } },
+      { holderSwitch: true },
+      { transferFrom: { spender: 'bob', from: at('alice'), to: at('bob'), amount: ONE } }, // survived
+      { transferFrom: { spender: 'bob', from: at('alice'), to: at('bob'), amount: ONE } }, // spent
+      { holderSwitch: false },
+      // mint, burn and settleTransfer ignore the switch
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: at('bob'),
+          to: at('alice'),
+          amount: ONE,
+          ref: R(11, 1),
+        },
+      },
+    ],
+  },
+  {
+    name: 'self transfer',
+    steps: [
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: at('alice'),
+          to: at('alice'),
+          amount: ONE,
+          ref: ZERO_REF,
+        },
+      },
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: at('alice'),
+          to: at('alice'),
+          amount: 0n,
+          ref: R(12, 1),
+        },
+      },
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: at('alice'),
+          to: at('alice'),
+          amount: ONE,
+          ref: R(2, 1),
+        },
+      },
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: at('alice'),
+          to: at('alice'),
+          amount: ONE,
+          ref: R(12, 1),
+        },
+      },
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: ZERO_ADDRESS,
+          to: ZERO_ADDRESS,
+          amount: ONE,
+          ref: R(12, 1),
+        },
+      },
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: at('carol'),
+          to: at('carol'),
+          amount: ONE,
+          ref: R(12, 1),
+        },
+      },
+      // The reference was never consumed by the reverts.
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: at('alice'),
+          to: at('bob'),
+          amount: ONE,
+          ref: R(12, 1),
+        },
+      },
+    ],
+  },
+  {
+    name: 'revert-order edge cases',
+    steps: [
+      // Paused is checked before the parties: an unallowed party still gets EnforcedPause.
+      { pause: true },
+      { call: { kind: 'mint', to: at('carol'), amount: ONE, ref: R(13, 1) } },
+      {
+        call: {
+          kind: 'settleTransfer',
+          from: at('alice'),
+          to: at('carol'),
+          amount: ONE,
+          ref: R(13, 1),
+        },
+      },
+      { call: { kind: 'burn', from: at('dave'), amount: ONE, ref: R(13, 1) } },
+      { pause: false },
+      // Registry: the reference is consumed before the zero-address check.
+      { call: { kind: 'setVerified', account: ZERO_ADDRESS, verified: true, ref: R(1, 1) } },
+      { call: { kind: 'setFrozen', account: ZERO_ADDRESS, frozen: true, ref: ZERO_REF } },
+      { call: { kind: 'setVerified', account: ZERO_ADDRESS, verified: true, ref: R(13, 2) } },
+      // Token first, then the registry, with one reference: separate sets, both succeed.
+      { call: { kind: 'mint', to: at('alice'), amount: ONE, ref: R(13, 3) } },
+      { call: { kind: 'setFrozen', account: at('bob'), frozen: false, ref: R(13, 3) } },
+      { call: { kind: 'burn', from: at('alice'), amount: ONE, ref: R(13, 3) } }, // used on the token
     ],
   },
   {
@@ -351,6 +497,13 @@ async function runScenarios(rig: Rig) {
         hash = await gw.submit({ signer, call: step.call, nonce: pending, fees: FEES });
       } else if ('rogue' in step) {
         hash = await rig.rogueTransfer(step.rogue.from, step.rogue.to, step.rogue.amount);
+      } else if ('holderSwitch' in step) {
+        hash = await rig.setHolderTransfers(step.holderSwitch);
+      } else if ('approve' in step) {
+        hash = await rig.approve(step.approve.owner, step.approve.spender, step.approve.amount);
+      } else if ('transferFrom' in step) {
+        const t = step.transferFrom;
+        hash = await rig.transferFrom(t.spender, t.from, t.to, t.amount);
       } else {
         hash = await rig.setPaused(step.pause);
       }
@@ -397,6 +550,65 @@ async function runScenarios(rig: Rig) {
   await rig.setAutomine(true);
   const pooledReceipt = await gw.getReceipt(pooledHash);
 
+  // Two transactions in ONE block where the later one changes the earlier one's outcome: a mint
+  // to erin (not yet verified, higher tip so it runs first) and erin's verification. The fake
+  // knows the exact reason; the viem gateway replays the call on the state AFTER the block, where
+  // erin is verified, so the replay succeeds and the reason is undefined. Pinned, not hidden.
+  await rig.setAutomine(false);
+  const sbMintNonce = (await gw.getNonce('settlement')).pending;
+  const sbVerifyNonce = (await gw.getNonce('compliance')).pending;
+  const sbMint = await gw.submit({
+    signer: 'settlement',
+    call: { kind: 'mint', to: at('erin'), amount: ONE, ref: R(14, 1) },
+    nonce: sbMintNonce,
+    fees: { maxFeePerGas: parseGwei('10'), maxPriorityFeePerGas: parseGwei('5') },
+  });
+  const sbVerify = await gw.submit({
+    signer: 'compliance',
+    call: { kind: 'setVerified', account: at('erin'), verified: true, ref: R(14, 2) },
+    nonce: sbVerifyNonce,
+    fees: { maxFeePerGas: parseGwei('10'), maxPriorityFeePerGas: parseGwei('1') },
+  });
+  stepOf.set(sbMint, ++stepIndex);
+  stepOf.set(sbVerify, ++stepIndex);
+  await rig.mine();
+  await rig.setAutomine(true);
+  const sbMintReceipt = await waitForReceipt(gw, sbMint);
+  const sbVerifyReceipt = await waitForReceipt(gw, sbVerify);
+  const sameBlock = {
+    inOneBlock: sbMintReceipt.blockNumber === sbVerifyReceipt.blockNumber,
+    mintStatus: sbMintReceipt.status,
+    mintReason: sbMintReceipt.revertReason,
+    verifyStatus: sbVerifyReceipt.status,
+    mintFirst:
+      (
+        await gw.getEvents({
+          fromBlock: sbMintReceipt.blockNumber,
+          toBlock: sbMintReceipt.blockNumber,
+        })
+      ).length === 1, // only VerificationSet: the mint emitted nothing
+  };
+
+  const refs = [
+    ZERO_REF,
+    ...new Set(
+      SCENARIOS.flatMap((sc) => sc.steps)
+        .filter((st): st is { call: ContractCall } => 'call' in st)
+        .map((st) => st.call.ref),
+    ),
+    R(10, 1),
+    R(10, 2),
+    R(14, 1),
+    R(14, 2),
+  ];
+  const referenceFlags = async (at?: bigint) =>
+    Promise.all(
+      refs.flatMap((r) => [
+        gw.readReferenceUsed('token', r, at),
+        gw.readReferenceUsed('registry', r, at),
+      ]),
+    );
+
   const endNonces = await nonces(gw);
   const toBlock = await gw.getHeadBlock();
   const holders = [...HOLDERS.map(at), ZERO_ADDRESS];
@@ -413,6 +625,13 @@ async function runScenarios(rig: Rig) {
     balancesAtCheckpoint: await Promise.all(holders.map((h) => gw.readBalance(h, checkpoint))),
     supplyAtCheckpoint: await gw.readTotalSupply(checkpoint),
     complianceAtCheckpoint: await Promise.all(holders.map((h) => gw.readCompliance(h, checkpoint))),
+    sameBlock,
+    referenceFlags: await referenceFlags(),
+    referenceFlagsAtCheckpoint: await referenceFlags(checkpoint),
+    noncesAtCheckpoint: {
+      settlement: await gw.getNonce('settlement', checkpoint),
+      compliance: await gw.getNonce('compliance', checkpoint),
+    },
     nonceDeltas: {
       settlement: endNonces.settlement.confirmed - startNonces.settlement.confirmed,
       compliance: endNonces.compliance.confirmed - startNonces.compliance.confirmed,
@@ -433,6 +652,19 @@ beforeAll(async () => {
     rogueTransfer: async (from, to, amount) =>
       (await holderTransferOnChain(node, deployment, DEV_ROLES[from], to, amount)) as TxHash,
     setPaused: async (paused) => (await setPausedOnChain(node, deployment, paused)) as TxHash,
+    setHolderTransfers: async (enabled) =>
+      (await setHolderTransfersOnChain(node, deployment, enabled)) as TxHash,
+    approve: async (owner, spender, amount) =>
+      (await tokenCallOnChain(node, deployment, DEV_ROLES[owner], 'approve', [
+        spender,
+        amount,
+      ])) as TxHash,
+    transferFrom: async (spender, from, to, amount) =>
+      (await tokenCallOnChain(node, deployment, DEV_ROLES[spender], 'transferFrom', [
+        from,
+        to,
+        amount,
+      ])) as TxHash,
     setAutomine: async (on) => {
       await node.rpc('evm_setAutomine', [on]);
     },
@@ -451,6 +683,10 @@ beforeAll(async () => {
     gateway: fake,
     rogueTransfer: async (from, to, amount) => fake.injectTransfer(at(from), to, amount),
     setPaused: async (paused) => fake.setPaused(paused),
+    setHolderTransfers: async (enabled) => fake.setHolderTransfersEnabled(enabled),
+    approve: async (owner, spender, amount) => fake.injectApprove(at(owner), spender, amount),
+    transferFrom: async (spender, from, to, amount) =>
+      fake.injectTransferFrom(at(spender), from, to, amount),
     setAutomine: async (on) => fake.setAutomine(on),
     mine: async () => {
       fake.mine();
@@ -480,14 +716,18 @@ describe('parity: fake vs viem gateway on anvil', () => {
     );
     expect([...reasons].sort()).toEqual(
       [
+        'ERC20InsufficientAllowance',
         'ERC20InsufficientBalance',
         'ERC20InvalidReceiver',
         'ERC20InvalidSender',
+        'ERC20InvalidSpender',
         'EnforcedPause',
         'ExpectedPause',
+        'HolderTransfersDisabled',
         'InvalidReference',
         'NotAllowed',
         'ReferenceAlreadyUsed',
+        'SelfTransfer',
         'ZeroAddress',
         'ZeroAmount',
       ].sort(),
@@ -537,5 +777,36 @@ describe('parity: fake vs viem gateway on anvil', () => {
     expect(fakeResult.supplyAtCheckpoint).toBe(anvilResult.supplyAtCheckpoint);
     expect(fakeResult.complianceAtCheckpoint).toEqual(anvilResult.complianceAtCheckpoint);
     expect(anvilResult.supplyAtCheckpoint).toBe(90n * ONE);
+  });
+
+  it('readReferenceUsed matches for every reference, on both contracts, at head and checkpoint', () => {
+    expect(fakeResult.referenceFlags).toEqual(anvilResult.referenceFlags);
+    expect(fakeResult.referenceFlagsAtCheckpoint).toEqual(anvilResult.referenceFlagsAtCheckpoint);
+    // Not vacuous: some references are used, some are not, and the two moments differ.
+    expect(anvilResult.referenceFlags).toContain(true);
+    expect(anvilResult.referenceFlags).toContain(false);
+    expect(anvilResult.referenceFlags).not.toEqual(anvilResult.referenceFlagsAtCheckpoint);
+  });
+
+  it('getNonce at the checkpoint block matches', () => {
+    expect(fakeResult.noncesAtCheckpoint).toEqual(anvilResult.noncesAtCheckpoint);
+    expect(anvilResult.noncesAtCheckpoint.settlement.confirmed).toBe(3);
+    expect(anvilResult.noncesAtCheckpoint.compliance.confirmed).toBe(4);
+  });
+
+  it('KNOWN DIFFERENCE: a revert caused by state a later transaction in the same block changed', () => {
+    // Same on both: one block, the mint ran first and reverted, the verification succeeded.
+    for (const result of [fakeResult, anvilResult]) {
+      expect(result.sameBlock).toMatchObject({
+        inOneBlock: true,
+        mintStatus: 'reverted',
+        verifyStatus: 'success',
+        mintFirst: true,
+      });
+    }
+    // Different: the fake knows the reason; the viem gateway's replay (on the state after the
+    // block, where erin is verified) succeeds, so it cannot name one. See the README.
+    expect(fakeResult.sameBlock.mintReason).toBe('NotAllowed');
+    expect(anvilResult.sameBlock.mintReason).toBeUndefined();
   });
 });

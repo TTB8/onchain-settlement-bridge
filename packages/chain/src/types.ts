@@ -158,8 +158,16 @@ export interface ChainGateway {
   /**
    * The signer's transaction count as the node sees it: `confirmed` counts mined transactions,
    * `pending` also counts those waiting in the pool. The next free nonce is `pending`.
+   *
+   * With `blockNumber`, both `confirmed` and `pending` are the count mined up to and including
+   * that block (there is no pool at a past block). Read it at `head - depth + 1` to learn whether
+   * a nonce is FINALLY used: a nonce below that count can no longer be undone by a reorg of
+   * fewer than `depth` blocks.
    */
-  getNonce(signer: SignerName): Promise<{ confirmed: number; pending: number }>;
+  getNonce(
+    signer: SignerName,
+    blockNumber?: bigint,
+  ): Promise<{ confirmed: number; pending: number }>;
 
   /** A fee suggestion for the next block, from the node. */
   estimateFees(): Promise<Fees>;
@@ -188,6 +196,18 @@ export interface ChainGateway {
 
   /** The token's total supply, at a block or at the head. */
   readTotalSupply(blockNumber?: bigint): Promise<bigint>;
+
+  /**
+   * The contract's own single-use flag for a reference (`referenceUsed(ref)` on the token or on
+   * the registry; the two contracts keep separate sets), at a block or at the head. This is the
+   * authoritative answer: a `ReferenceAlreadyUsed` revert with no matching event in our index
+   * means the index is incomplete and the operation already happened on chain.
+   */
+  readReferenceUsed(
+    contract: 'token' | 'registry',
+    ref: Bytes32,
+    blockNumber?: bigint,
+  ): Promise<boolean>;
 
   /** The registry's verification and freeze flags for an account, at a block or at the head. */
   readCompliance(account: Address, blockNumber?: bigint): Promise<ComplianceStatus>;
