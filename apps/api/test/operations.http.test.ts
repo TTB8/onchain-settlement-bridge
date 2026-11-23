@@ -257,6 +257,30 @@ describe('deposit -> withdrawal -> transfer through the engine', () => {
   });
 });
 
+describe('UUID spelling', () => {
+  it('an uppercase user id is the same user: same operation on replay, self transfer refused', async () => {
+    const user = await createUser();
+    const upper = user.id.toUpperCase();
+    const first = await deposit(upper, '50', 'upper-1');
+    expect(first.status).toBe(201);
+    expect(first.body.userId).toBe(user.id);
+    const replay = await deposit(user.id, '50', 'upper-1');
+    expect(replay.status).toBe(200);
+    expect(replay.body.id).toBe(first.body.id);
+    const self = await http()
+      .post(`/v1/users/${upper}/transfers`)
+      .set(auth)
+      .set('Idempotency-Key', 'upper-self')
+      .send({ amount: '1', toUserId: user.id });
+    expect(self.status).toBe(400);
+    expect(self.body.code).toBe('SELF_TRANSFER');
+    const read = await http()
+      .get(`/v1/operations/${String(first.body.id).toUpperCase()}`)
+      .set(auth);
+    expect(read.body.id).toBe(first.body.id);
+  });
+});
+
 describe('idempotency', () => {
   it('a replay returns the same operation (200, Idempotent-Replayed) and writes nothing', async () => {
     const erin = await createUser();
