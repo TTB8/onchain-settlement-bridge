@@ -6,6 +6,13 @@
  * chain's hash at some of those heights differs. Everything above the highest block that still
  * matches (the fork point) must be rolled back: its events may no longer exist. If nothing in the
  * window matches, the reorg is deeper than the window and a person must re-sync from further back.
+ *
+ * A height where the node reports NO block is not evidence of a reorg: a lagging node, or a load
+ * balancer that sent this request to a node behind the last one, simply has not seen it yet.
+ * Rolling back on that would throw away good data and re-index it, and a flapping node would make
+ * the indexer oscillate. So "no block" is reported as `nodeBehind` and only a DIFFERENT hash at
+ * some height triggers a rollback. (A chain that really got shorter shows up as a different hash
+ * at the fork height once the node has the new branch.)
  */
 
 import { InvalidInputError } from './errors';
@@ -26,16 +33,25 @@ export type CanonicalLookup = ReadonlyMap<bigint, Hex> | ((blockNumber: bigint) 
 
 /** The result of comparing the stored window with the chain. */
 export interface ReorgReport {
-  /** Whether any stored block is no longer on the canonical chain. */
+  /** Whether some stored block has a DIFFERENT canonical hash now (proof of a reorg). */
   readonly reorged: boolean;
   /**
+   * Whether the node had no block at one or more stored heights above the fork point. With no
+   * differing hash, this alone causes no rollback: wait, or ask another node.
+   */
+  readonly nodeBehind: boolean;
+  /**
    * The highest stored block that still matches the chain, or `null` when none does (or the window
-   * is empty). Everything at or below it is safe.
+   * is empty, or the node has none of its heights). Everything at or below it is safe.
    */
   readonly forkPoint: bigint | null;
-  /** Stored block numbers that are no longer canonical, newest first (the order to undo them in). */
+  /**
+   * Stored block numbers to undo, newest first. Empty unless `reorged`. When `reorged`, it holds
+   * every stored block above the fork point, including heights the node had no block for (they
+   * descend from a replaced block, so they are not canonical either).
+   */
   readonly rollback: readonly bigint[];
-  /** True when no stored block matches: the fork is older than the window. Needs a person. */
+  /** True when a reorg was proven and no stored block matches: the fork is older than the window. */
   readonly beyondWindow: boolean;
 }
 
@@ -62,8 +78,9 @@ function assertWindow(window: readonly StoredBlock[]): void {
 
 /**
  * Compares the stored window with the chain and reports the fork point and what to roll back.
- * Handles: empty window, no reorg, a shallow reorg, a chain now shorter than the window (heights
- * with no block are rolled back), and a reorg deeper than the window (`beyondWindow`).
+ * Handles: empty window, no reorg, a shallow reorg, a node that has not reached some (or any) of
+ * the stored heights (`nodeBehind`, no rollback), and a reorg deeper than the window
+ * (`beyondWindow`).
  *
  * @param storedWindow The indexer's recent blocks, ascending and hash-linked.
  * @param canonicalHashAt The chain's current hash at a height, as a map or a function.
@@ -73,26 +90,29 @@ export function detectReorg(
   canonicalHashAt: CanonicalLookup,
 ): ReorgReport {
   assertWindow(storedWindow);
-  const rollback: bigint[] = [];
+  const above: bigint[] = [];
+  let differs = false;
+  let missing = false;
+  let forkPoint: bigint | null = null;
   // Walk down from the newest block. Blocks are hash-linked, so the first match from the top
   // implies every block below it matches too.
   for (let i = storedWindow.length - 1; i >= 0; i -= 1) {
     const block = storedWindow[i] as StoredBlock;
-    if (lookupHash(canonicalHashAt, block.number) === block.hash) {
-      return {
-        reorged: rollback.length > 0,
-        forkPoint: block.number,
-        rollback,
-        beyondWindow: false,
-      };
+    const canonical = lookupHash(canonicalHashAt, block.number);
+    if (canonical === block.hash) {
+      forkPoint = block.number;
+      break;
     }
-    rollback.push(block.number);
+    if (canonical === null) missing = true;
+    else differs = true;
+    above.push(block.number);
   }
   return {
-    reorged: rollback.length > 0,
-    forkPoint: null,
-    rollback,
-    beyondWindow: rollback.length > 0,
+    reorged: differs,
+    nodeBehind: missing,
+    forkPoint,
+    rollback: differs ? above : [],
+    beyondWindow: differs && forkPoint === null,
   };
 }
 
