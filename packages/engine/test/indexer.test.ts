@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 
 import type { BlockRef, ChainGateway } from '@bridge/chain';
 
-import { AlarmLog, Indexer } from '../src';
+import { AlarmLog, Indexer, type IndexerPolicy } from '../src';
 import { createTestDatabase, type TestDatabase } from './support/database';
 import { insertUser } from './support/fixtures';
 import { makeRig, type Rig, setOnChain } from './support/bridge';
@@ -42,7 +42,7 @@ function wrap(
 function indexerFor(
   rig: Rig,
   gateway: ChainGateway = rig.chain,
-  policy = { confirmationDepth: 2, maxBatch: 50, reorgWindow: 8 },
+  policy: IndexerPolicy = { confirmationDepth: 2, maxBatch: 50, reorgWindow: 8 },
 ): Indexer {
   return new Indexer({
     prisma: db.prisma,
@@ -168,6 +168,8 @@ describe('scanning', () => {
 describe('reorgs (obligation 14)', () => {
   it('a reorg rolls back the orphaned blocks and their events and rewinds the cursor, in one transaction with an audit row', async () => {
     const rig = await busyRig();
+    // The two newest blocks: one with a VerificationSet event, one empty.
+    await setOnChain(rig.chain, (await insertUser(db.prisma)).wallet, { verified: true });
     const ix = indexerFor(rig);
     await ix.runOnce();
     const before = await state(rig);
@@ -185,6 +187,31 @@ describe('reorgs (obligation 14)', () => {
       where: { entity: 'indexer', entityId: rig.deploymentId },
     });
     expect(audit).toHaveLength(1);
+    // Every deleted event is listed: txHash, logIndex, kind, ref, amount.
+    const orphaned = before.events.filter((e) => e.blockNumber > head - 2n);
+    expect(orphaned.length).toBeGreaterThan(0);
+    const detail = audit[0]?.detail as { deletedEvents: string; removedEvents: number };
+    expect(detail.removedEvents).toBe(orphaned.length);
+    const listed = JSON.parse(detail.deletedEvents) as {
+      txHash: string;
+      logIndex: number;
+      kind: string;
+      ref: string | null;
+      amount: string | null;
+    }[];
+    expect(listed.map((e) => `${e.txHash}:${e.logIndex}`).sort()).toEqual(
+      orphaned.map((e) => `${e.txHash}:${e.logIndex}`).sort(),
+    );
+    const minted = orphaned.find((e) => e.kind === 'Minted');
+    if (minted !== undefined) {
+      expect(listed).toContainEqual(
+        expect.objectContaining({
+          kind: 'Minted',
+          ref: minted.ref,
+          amount: minted.amount?.toFixed(),
+        }),
+      );
+    }
     // The next pass re-reads the new branch, with the node's new hashes.
     await ix.runOnce();
     for (const b of (await state(rig)).blocks) {
@@ -281,6 +308,60 @@ describe('reorgs (obligation 14)', () => {
     });
     expect(await indexerFor(rig, racing).runOnce()).toEqual({ status: 'unknown' });
     expect(await state(rig)).toEqual(s);
+  });
+});
+
+describe('review L-1, L-2: stalls and two indexers', () => {
+  it('passes without progress raise indexer_stalled', async () => {
+    const rig = await busyRig();
+    const ix = indexerFor(rig, rig.chain, {
+      confirmationDepth: 2,
+      maxBatch: 50,
+      reorgWindow: 8,
+      stallPasses: 2,
+    });
+    rig.chain.setUnavailable(true);
+    await ix.runOnce();
+    expect(rig.alarms.ofKind('indexer_stalled')).toHaveLength(0);
+    await ix.runOnce();
+    expect(rig.alarms.ofKind('indexer_stalled')).toHaveLength(1);
+    rig.chain.setUnavailable(false);
+    await ix.runOnce();
+    await ix.runOnce();
+    expect(rig.alarms.ofKind('indexer_stalled')).toHaveLength(1);
+  });
+
+  it('two indexers racing on one deployment: one writes, the other writes nothing, no corruption', async () => {
+    const rig = await busyRig();
+    const a = indexerFor(rig);
+    const b = indexerFor(rig);
+    const results = await Promise.all([a.runOnce(), b.runOnce()]);
+    expect(results.map((r) => r.status).sort()).toEqual(['scanned', 'unknown']);
+    const s = await state(rig);
+    expect(s.last).toBe(await rig.chain.getHeadBlock());
+    expect(new Set(s.events.map((e) => `${e.blockHash}:${e.logIndex}`)).size).toBe(s.events.length);
+  });
+
+  it('a cursor moved by another indexer after this one read it: nothing written (compare-and-set)', async () => {
+    const rig = await busyRig();
+    const ix = indexerFor(rig);
+    // Another indexer advances the cursor while this one is between its reads and its write.
+    const realGetEvents = rig.chain.getEvents.bind(rig.chain);
+    const sneaky = wrap(rig, {
+      getEvents: async (range) => {
+        await db.prisma.indexerState.upsert({
+          where: { deploymentId: rig.deploymentId },
+          create: { deploymentId: rig.deploymentId, lastIndexedBlock: 0n },
+          update: { lastIndexedBlock: 0n },
+        });
+        return realGetEvents(range);
+      },
+    });
+    expect(await indexerFor(rig, sneaky).runOnce()).toEqual({ status: 'unknown' });
+    expect(await db.prisma.indexedBlock.count({ where: { deploymentId: rig.deploymentId } })).toBe(
+      0,
+    );
+    expect((await ix.runOnce()).status).toBe('scanned');
   });
 });
 

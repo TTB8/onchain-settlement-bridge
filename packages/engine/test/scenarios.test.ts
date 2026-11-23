@@ -383,8 +383,12 @@ describe('unknown and rejected submissions (ADR 0009, obligations 3-4)', () => {
     for (const op of ops) expect(await statusOf(op.id)).toBe('submitted');
     const stuck = rig.alarms.ofKind('nonce_stuck');
     expect(new Set(stuck.map((a) => a.operationId))).toEqual(new Set(ops.map((o) => o.id)));
-    const [first] = await attemptsOf(db.prisma, ops[0]?.id ?? '');
-    expect(stuck[0]?.detail).toContain(`nonce ${first?.nonce} is the lowest non-final nonce`);
+    const nonces: number[] = [];
+    for (const op of ops) for (const a of await attemptsOf(db.prisma, op.id)) nonces.push(a.nonce);
+    const lowest = Math.min(...nonces);
+    expect(
+      stuck.every((a) => a.detail.includes(`nonce ${lowest} is the lowest non-final nonce`)),
+    ).toBe(true);
     expect(stuck[0]?.detail).toContain(rig.chain.signerAddress('settlement'));
   });
 
@@ -956,5 +960,136 @@ describe('redaction (review: literal secrets)', () => {
     const audits = await db.prisma.auditLog.findMany({ where: { entityId: dep.id } });
     expect(audits.some((a) => JSON.stringify(a.detail).includes('broadcast rejected'))).toBe(true);
     expect(audits.every((a) => !JSON.stringify(a.detail).includes(secret))).toBe(true);
+  });
+});
+
+describe('review M-1: the gateway signer must be the deployment signer', () => {
+  it('a rotated key: nothing is signed, nothing is decided, nothing is reversed; signer_mismatch is raised', async () => {
+    const rig = await makeRig(db.prisma);
+    const alice = await verifiedUser(rig);
+    const pending = await deposit(rig, alice, 3n);
+    // A failed operation that WOULD be reversible with the right key.
+    const cancelled = await deposit(rig, alice, 4n);
+    await rig.engine.operations.move({
+      operationId: cancelled.id,
+      from: 'ledger_reserved',
+      version: 0,
+      move: { event: 'FAIL', reason: 'rejected' },
+      at: rig.clock.now(),
+      note: 'cancelled',
+    });
+    const rotated = `0x${'5'.repeat(40)}` as `0x${string}`;
+    const original = rig.chain.signerAddress.bind(rig.chain);
+    rig.chain.signerAddress = (s) => (s === 'settlement' ? rotated : original(s));
+    const t = await rig.engine.tick();
+    expect(t.dispatch.retried).toBe(1);
+    expect(t.monitor.ran).toBe(false);
+    expect(await attemptsOf(db.prisma, pending.id)).toHaveLength(0);
+    expect(await statusOf(pending.id)).toBe('ledger_reserved');
+    expect(await statusOf(cancelled.id)).toBe('failed');
+    expect(rig.alarms.ofKind('signer_mismatch').length).toBeGreaterThanOrEqual(2);
+    expect(rig.signer.broadcasts).toHaveLength(0);
+
+    rig.chain.signerAddress = original;
+    rig.clock.advance(120_000);
+    await rig.engine.tick();
+    expect(await statusOf(cancelled.id)).toBe('reversed');
+    expect(await statusOf(pending.id)).toBe('confirmed');
+  });
+});
+
+describe('review M-4: reserved operations that never signed anything', () => {
+  async function deadBeforeSigning(rig: Rig) {
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 6n);
+    await db.prisma.outboxMessage.updateMany({
+      where: { operationId: dep.id },
+      data: { status: 'dead', lastError: 'attempts exhausted', lastErrorAt: rig.clock.now() },
+    });
+    return { alice, dep };
+  }
+
+  it('a dead-lettered row before signing: after orphanAfterSeconds the operation is failed and released', async () => {
+    const rig = await makeRig(db.prisma);
+    const { alice, dep } = await deadBeforeSigning(rig);
+    await rig.engine.monitor.runOnce();
+    expect(await statusOf(dep.id)).toBe('ledger_reserved'); // too young
+    rig.clock.advance(601_000);
+    const m = await rig.engine.monitor.runOnce();
+    expect(m.released).toBe(1);
+    const row = await opRow(db.prisma, dep.id);
+    expect(row.status).toBe('reversed');
+    expect(row.failureReason).toBe('rejected');
+    expect(await balanceOf(db.prisma, alice.incoming)).toBe(0n);
+    expect(rig.alarms.ofKind('orphan_released').map((a) => a.operationId)).toEqual([dep.id]);
+  });
+
+  it('the row claimed again meanwhile (or a live row at all): not released', async () => {
+    const rig = await makeRig(db.prisma);
+    const { dep } = await deadBeforeSigning(rig);
+    await db.prisma.outboxMessage.updateMany({
+      where: { operationId: dep.id },
+      data: { status: 'processing', lockedBy: 'someone/1', lockedAt: rig.clock.now() },
+    });
+    rig.clock.advance(601_000);
+    const m = await rig.engine.monitor.runOnce();
+    expect(m.released).toBe(0);
+    expect(await statusOf(dep.id)).toBe('ledger_reserved');
+  });
+
+  it('the reference already consumed on chain: failed, NOT released (never reverse on missing evidence)', async () => {
+    const rig = await makeRig(db.prisma);
+    const { alice, dep } = await deadBeforeSigning(rig);
+    const { pending } = await rig.chain.getNonce('settlement');
+    await rig.chain.submit({
+      signer: 'settlement',
+      call: {
+        kind: 'mint',
+        to: alice.wallet as `0x${string}`,
+        amount: 6n,
+        ref: dep.ref as `0x${string}`,
+      },
+      nonce: pending,
+      fees: await rig.chain.estimateFees(),
+    });
+    rig.clock.advance(601_000);
+    const m = await rig.engine.monitor.runOnce();
+    expect(m.released).toBe(0);
+    expect(await statusOf(dep.id)).toBe('failed'); // visible, held, and never released
+    await rig.engine.monitor.runOnce();
+    expect(await statusOf(dep.id)).toBe('failed');
+    expect(rig.alarms.ofKind('escalation').some((a) => a.operationId === dep.id)).toBe(true);
+  });
+});
+
+describe('review L-1, L-2: stalls and isolation', () => {
+  it('an unreachable node raises node_unreachable after headStallTicks failed passes', async () => {
+    const rig = await makeRig(db.prisma, { headStallTicks: 2 });
+    rig.chain.setUnavailable(true);
+    await rig.engine.monitor.runOnce();
+    expect(rig.alarms.ofKind('node_unreachable')).toHaveLength(0);
+    await rig.engine.monitor.runOnce();
+    expect(rig.alarms.ofKind('node_unreachable')).toHaveLength(1);
+    rig.chain.setUnavailable(false);
+  });
+
+  it('a throwing component does not stop the others; component_failed is raised', async () => {
+    const rig = await makeRig(db.prisma);
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 2n);
+    await rig.engine.tick(); // confirmed normally
+    const dep2 = await deposit(rig, alice, 3n);
+    const broken = jest
+      .spyOn(rig.engine.indexer, 'runOnce')
+      .mockRejectedValueOnce(new Error('indexer bug'));
+    const t = await rig.engine.tick();
+    broken.mockRestore();
+    expect(t.failed).toEqual(['index']);
+    expect(t.dispatch.done).toBe(1);
+    expect(t.monitor.ran).toBe(true);
+    expect(rig.alarms.ofKind('component_failed')[0]?.detail).toContain('indexer bug');
+    await rig.engine.tick();
+    expect(await statusOf(dep.id)).toBe('confirmed');
+    expect(await statusOf(dep2.id)).toBe('confirmed');
   });
 });
