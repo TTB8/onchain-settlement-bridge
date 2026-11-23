@@ -369,6 +369,27 @@ describe('legal moves', () => {
     });
   });
 
+  it("the caller's note is sanitized before it reaches the audit row", async () => {
+    const u = await insertUser(db.prisma);
+    const { operation } = await service.requestDeposit(u.id, 1n, key());
+    const note = 'sent via https://eth.example.org/v2/NOTEKEY77 (eth.example.org/v2/NOTEKEY77)';
+    expect(note).toContain('NOTEKEY77');
+    await service.move({
+      operationId: operation.id,
+      from: 'ledger_reserved',
+      version: 0,
+      move: { event: 'SUBMIT', kind: 'first' },
+      at: AT,
+      note,
+    });
+    const audit = await db.prisma.auditLog.findFirstOrThrow({
+      where: { entityId: operation.id },
+      orderBy: { id: 'desc' },
+    });
+    const written = (audit.detail as { note?: string }).note;
+    expect(written).toBe('sent via <redacted-url> (<redacted-url>)');
+  });
+
   it('CONFIRM writes the settle entry from the domain table, for each type', async () => {
     const u = await insertUser(db.prisma);
     const v = await insertUser(db.prisma);

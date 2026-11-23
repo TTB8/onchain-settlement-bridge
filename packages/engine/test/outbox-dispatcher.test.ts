@@ -10,6 +10,7 @@ import {
   backoffDelayMs,
   type BackoffPolicy,
   DEFAULT_BACKOFF,
+  HandlerTimeoutError,
   type HandlerContext,
   InvalidRequestError,
   OutboxDispatcher,
@@ -124,7 +125,15 @@ describe('claiming', () => {
       }),
     );
     const summary = await d.runOnce();
-    expect(summary).toEqual({ claimed: 1, done: 1, retried: 0, dead: 0, lostLease: 0, reaped: 0 });
+    expect(summary).toEqual({
+      claimed: 1,
+      done: 1,
+      retried: 0,
+      dead: 0,
+      lostLease: 0,
+      timedOut: 0,
+      reaped: 0,
+    });
     expect(seenFromOutside).toMatchObject({ status: 'processing', attemptsCount: 1 });
     expect((seenFromOutside as OutboxMessage | null)?.lockedBy).toMatch(/^w1\//);
     expect(await rowOf(id as string)).toMatchObject({
@@ -481,22 +490,51 @@ describe('leases are renewed per row and re-checkable (review M-2)', () => {
     expect(seen).toEqual([true, false, false]);
   });
 
-  it('a handler that never answers times out: unknown outcome, retried, signal aborted', async () => {
+  it('a timed-out handler keeps the row: no other worker can claim it until the lease is stale (review L-A)', async () => {
     const [id] = await enqueue(1);
     let signal: AbortSignal | undefined;
-    const d = dispatcher(
+    const calls: string[] = [];
+    // A hung handler that ignores its abort signal and never answers.
+    const hung = dispatcher(
       handlerOf((_row, ctx) => {
+        calls.push('hung');
         signal = ctx.signal;
         return new Promise<OutboxOutcome>(() => undefined);
       }),
-      { handlerTimeoutMs: 50 },
+      { workerId: 'hung', handlerTimeoutMs: 50 },
     );
-    expect(await d.runOnce()).toMatchObject({ claimed: 1, retried: 1, dead: 0 });
+    expect(await hung.runOnce()).toMatchObject({ claimed: 1, timedOut: 1, retried: 0, dead: 0 });
     expect(signal?.aborted).toBe(true);
-    const row = await rowOf(id as string);
-    expect(row).toMatchObject({ status: 'pending', attemptsCount: 1, lockedBy: null });
-    expect(row.lastError).toMatch(/^HandlerTimeoutError: handler did not answer within 50 ms$/);
-    expect(row.availableAt.getTime() - clock.now().getTime()).toBe(POLICY.baseMs);
+    const held = await rowOf(id as string);
+    expect(held).toMatchObject({ status: 'processing', attemptsCount: 1 });
+    expect(held.lockedBy).toMatch(/^hung\//);
+    expect(held.lastError).toBe('HandlerTimeoutError: handler did not answer within 50 ms');
+    expect(held.lastErrorAt).toEqual(clock.now());
+
+    const second = dispatcher(
+      handlerOf(async () => (calls.push('second'), 'done')),
+      { workerId: 'second' },
+    );
+    clock.advance(POLICY.baseMs * 8); // well past any backoff
+    expect((await second.runOnce()).claimed).toBe(0);
+    clock.advance(LOCK_TIMEOUT - POLICY.baseMs * 8 - 1); // one ms before the lease is stale
+    expect((await second.runOnce()).claimed).toBe(0);
+    clock.advance(1);
+    expect(await second.runOnce()).toMatchObject({ claimed: 1, done: 1 });
+    expect(await second.runOnce()).toMatchObject({ claimed: 0 });
+    expect(calls).toEqual(['hung', 'second']);
+    expect(await rowOf(id as string)).toMatchObject({ status: 'done', attemptsCount: 2 });
+  });
+
+  it('a handler that throws its own HandlerTimeoutError is an ordinary unknown outcome', async () => {
+    const [id] = await enqueue(1);
+    const d = dispatcher(
+      handlerOf(async () => {
+        throw new HandlerTimeoutError('upstream timed out');
+      }),
+    );
+    expect(await d.runOnce()).toMatchObject({ retried: 1, timedOut: 0 });
+    expect(await rowOf(id as string)).toMatchObject({ status: 'pending', lockedBy: null });
   });
 
   it('a handler that rejects after its timeout does not crash the dispatcher', async () => {
@@ -506,7 +544,7 @@ describe('leases are renewed per row and re-checkable (review M-2)', () => {
       handlerOf(() => new Promise<OutboxOutcome>((_, reject) => (rejectLate = reject))),
       { handlerTimeoutMs: 20 },
     );
-    expect(await d.runOnce()).toMatchObject({ retried: 1 });
+    expect(await d.runOnce()).toMatchObject({ timedOut: 1, retried: 0 });
     rejectLate(new Error('too late'));
     await new Promise((r) => setTimeout(r, 20));
   });
@@ -548,6 +586,19 @@ describe('error text is recorded redacted and bounded (review L-1, L-2)', () => 
       orderBy: { id: 'desc' },
     });
     expect((audit.detail as { note?: string }).note).toBe(row.lastError);
+  });
+
+  it('the configured secrets are removed by value from last_error', async () => {
+    const [id] = await enqueue(1);
+    const d = dispatcher(
+      handlerOf(async () => {
+        throw new Error('node said: key SECRETKEY9 is over quota');
+      }),
+      { secrets: ['https://rpc.example.org/v3/SECRETKEY9'] },
+    );
+    await d.runOnce();
+    const row = await rowOf(id as string);
+    expect(row.lastError).toBe('Error: node said: key <redacted> is over quota');
   });
 
   it('the dead letter at the attempt cap keeps the last error', async () => {

@@ -24,9 +24,11 @@
  *       handler call, so the batch size does not have to fit inside the lock timeout.
  *    c. Outcomes: `done`; `{ retryAt }` (a deliberate wait: the attempt is given back, the date is
  *       clamped to at least `now + baseMs`, and a row older than `maxWaitAgeMs` is dead-lettered
- *       with an audit row instead); `{ failed: code, detail? }` (dead + audit row). A thrown error,
- *       a timeout or a malformed outcome is an UNKNOWN outcome, never a failure (ADR 0009): the row
- *       is retried with exponential backoff, and dead at `maxAttempts`.
+ *       with an audit row instead); `{ failed: code, detail? }` (dead + audit row). A thrown error
+ *       or a malformed outcome is an UNKNOWN outcome, never a failure (ADR 0009): the row is retried
+ *       with exponential backoff, and dead at `maxAttempts`. A timeout is unknown too, but the
+ *       handler may still be running, so the row is NOT released: it stays `processing` under the
+ *       lease (only `last_error` is written) and returns through the stale-lease path.
  * 4. Finish, in one statement fenced by the lease token: only the worker that still holds the
  *    lease can record the outcome, so a row's outcome is recorded once.
  *
@@ -43,7 +45,7 @@ import { auditEntryFor } from '@bridge/domain';
 import { HandlerTimeoutError, InvalidRequestError } from './errors';
 import { writeAudit } from './ledger-writes';
 import type { Clock, IdSource } from './ports';
-import { describeError, sanitizeText } from './redact';
+import { describeError, sanitizeText, type SanitizeOptions } from './redact';
 import type { Tx } from './transaction';
 
 /** What the handler decided for one row. */
@@ -104,6 +106,11 @@ export interface OutboxDispatcherOptions {
   readonly maxWaitAgeMs?: number;
   /** Backoff for thrown handler errors. Default 1 s doubling to 10 min, 10 attempts. */
   readonly backoff?: BackoffPolicy;
+  /**
+   * Literal secrets to remove from every error text written (the RPC URL, its API key, its host),
+   * in every escaped or encoded spelling, on top of the generic URL and host/path patterns.
+   */
+  readonly secrets?: readonly string[];
 }
 
 /** What one `runOnce` did. */
@@ -118,6 +125,8 @@ export interface DispatchSummary {
   readonly dead: number;
   /** Rows whose lease another worker took before this one renewed or finished it. */
   readonly lostLease: number;
+  /** Rows whose handler hit its time limit; left `processing` until their lease goes stale. */
+  readonly timedOut: number;
   /** Stale rows dead-lettered in the reap step (their attempts were already used up). */
   readonly reaped: number;
 }
@@ -152,7 +161,10 @@ function validatePolicy(p: BackoffPolicy): void {
   }
 }
 
-type Handled = OutboxOutcome | { readonly thrown: unknown };
+/** The dispatcher's own timeout marker (a handler cannot produce it, even by throwing). */
+const TIMED_OUT: unique symbol = Symbol('handler timed out');
+
+type Handled = OutboxOutcome | { readonly thrown: unknown } | typeof TIMED_OUT;
 
 /** Claims outbox rows and hands them to a handler. See the file comment. */
 export class OutboxDispatcher {
@@ -166,6 +178,7 @@ export class OutboxDispatcher {
   private readonly handlerTimeoutMs: number;
   private readonly maxWaitAgeMs: number;
   private readonly backoff: BackoffPolicy;
+  private readonly redaction: SanitizeOptions;
 
   /** @param options Database, clock, ids, worker name, handler and policies. */
   constructor(options: OutboxDispatcherOptions) {
@@ -200,6 +213,7 @@ export class OutboxDispatcher {
     this.handlerTimeoutMs = handlerTimeoutMs;
     this.maxWaitAgeMs = maxWaitAgeMs;
     this.backoff = backoff;
+    this.redaction = { secrets: [...(options.secrets ?? [])] };
   }
 
   /** One reap-claim-handle-finish cycle. Rows are handled one after another, in claim order. */
@@ -210,14 +224,16 @@ export class OutboxDispatcher {
     let retried = 0;
     let dead = 0;
     let lostLease = 0;
+    let timedOut = 0;
     for (const row of rows) {
       const result = await this.process(row);
       if (result === 'lost') lostLease += 1;
+      else if (result === 'timedOut') timedOut += 1;
       else if (result === 'done') done += 1;
       else if (result === 'retry') retried += 1;
       else dead += 1;
     }
-    return { claimed: rows.length, done, retried, dead, lostLease, reaped };
+    return { claimed: rows.length, done, retried, dead, lostLease, timedOut, reaped };
   }
 
   /** Dead-letters stale `processing` rows that have no attempts left. */
@@ -303,12 +319,10 @@ export class OutboxDispatcher {
     // If the timeout wins, a later rejection of `work` must not become an unhandled rejection.
     work.catch(() => undefined);
     let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<never>((_, reject) => {
+    const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
       timer = setTimeout(() => {
         controller.abort();
-        reject(
-          new HandlerTimeoutError(`handler did not answer within ${this.handlerTimeoutMs} ms`),
-        );
+        resolve(TIMED_OUT);
       }, this.handlerTimeoutMs);
     });
     try {
@@ -322,18 +336,27 @@ export class OutboxDispatcher {
   }
 
   /** Renews, runs the handler (no transaction open) and records the outcome. */
-  private async process(row: OutboxMessage): Promise<'done' | 'retry' | 'dead' | 'lost'> {
+  private async process(
+    row: OutboxMessage,
+  ): Promise<'done' | 'retry' | 'dead' | 'lost' | 'timedOut'> {
     if (!(await this.renew(row))) return 'lost';
     const outcome = await this.runHandler(row);
     const now = this.clock.now();
+    if (outcome === TIMED_OUT) return this.keepAfterTimeout(row, now);
     if (outcome === 'done') {
       return (await this.finish(row, { status: 'done', processedAt: now })) ? 'done' : 'lost';
     }
     if (typeof outcome === 'object' && outcome !== null && 'failed' in outcome) {
-      const code = sanitizeText(String(outcome.failed), 100);
+      const code = sanitizeText(String(outcome.failed), { ...this.redaction, max: 100 });
       const detail =
-        outcome.detail === undefined ? '' : `: ${sanitizeText(String(outcome.detail))}`;
-      return (await this.deadLetter(row, now, sanitizeText(`failed:${code}${detail}`)))
+        outcome.detail === undefined
+          ? ''
+          : `: ${sanitizeText(String(outcome.detail), this.redaction)}`;
+      return (await this.deadLetter(
+        row,
+        now,
+        sanitizeText(`failed:${code}${detail}`, this.redaction),
+      ))
         ? 'dead'
         : 'lost';
     }
@@ -361,9 +384,33 @@ export class OutboxDispatcher {
       return this.retryOrDie(row, now, 'InvalidOutcome: retryAt is not a valid Date');
     }
     if (typeof outcome === 'object' && outcome !== null && 'thrown' in outcome) {
-      return this.retryOrDie(row, now, describeError(outcome.thrown));
+      return this.retryOrDie(row, now, describeError(outcome.thrown, this.redaction));
     }
     return this.retryOrDie(row, now, 'InvalidOutcome: the handler returned an unknown outcome');
+  }
+
+  /**
+   * A handler that hit its time limit may still be running: the abort signal is only a request.
+   * Releasing the row to `pending` would let another worker claim it after `baseMs`, long before
+   * this lease goes stale, and two handlers would run on one row (review L-A). So the row stays
+   * `processing` under this lease; only `last_error` is written. It comes back solely through the
+   * stale-lease path (`lockTimeoutMs` after the renewal), where the claim counts the attempt and
+   * the reaper dead-letters it at the cap. Simpler and safer than waiting for the handler to
+   * settle, which a hung handler never does. A handler that keeps running past that point is
+   * fenced by `stillHolds()` (stale or taken leases answer false).
+   */
+  private async keepAfterTimeout(row: OutboxMessage, now: Date): Promise<'timedOut' | 'lost'> {
+    const r = await this.prisma.outboxMessage.updateMany({
+      where: { id: row.id, status: 'processing', lockedBy: row.lockedBy },
+      data: {
+        lastError: sanitizeText(
+          `${HandlerTimeoutError.name}: handler did not answer within ${this.handlerTimeoutMs} ms`,
+          this.redaction,
+        ),
+        lastErrorAt: now,
+      },
+    });
+    return r.count === 1 ? 'timedOut' : 'lost';
   }
 
   /** An unknown outcome: back off, or dead-letter once the attempts are used up. */
@@ -373,7 +420,10 @@ export class OutboxDispatcher {
     error: string,
   ): Promise<'retry' | 'dead' | 'lost'> {
     if (row.attemptsCount >= this.backoff.maxAttempts) {
-      const why = sanitizeText(`attempts exhausted (${row.attemptsCount}); last: ${error}`);
+      const why = sanitizeText(
+        `attempts exhausted (${row.attemptsCount}); last: ${error}`,
+        this.redaction,
+      );
       return (await this.deadLetter(row, now, why)) ? 'dead' : 'lost';
     }
     const delay = backoffDelayMs(this.backoff, row.attemptsCount);

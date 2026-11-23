@@ -71,6 +71,7 @@ import {
   writeAudit,
   writeEntry,
 } from './ledger-writes';
+import { sanitizeText } from './redact';
 import type { Tx } from './transaction';
 
 /** What kind of send a SUBMIT records. */
@@ -118,7 +119,7 @@ export interface MoveOperationInput {
   readonly at: Date;
   /** The transaction involved, when there is one (goes to the audit row). */
   readonly txHash?: TxHash;
-  /** A short human-readable note for the audit row (no secrets, no PII). */
+  /** A short human-readable note for the audit row; sanitized (URLs, hosts) before it is written. */
   readonly note: string;
 }
 
@@ -356,7 +357,8 @@ export async function moveOperation(tx: Tx, input: MoveOperationInput): Promise<
     fromState: input.from,
     toState: next,
     ...(input.txHash !== undefined ? { txHash: input.txHash } : {}),
-    detail: input.note,
+    // The caller's note is free text: it may quote an error that carries a URL or a key.
+    detail: sanitizeText(input.note),
     at: input.at,
   });
   await writeAudit(tx, audit, {
