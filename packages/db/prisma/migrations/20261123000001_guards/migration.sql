@@ -353,7 +353,7 @@ CREATE TRIGGER chain_attempt_no_truncate
 --    version = old version + 1, so the second writer of a stale row is refused by the database even
 --    if it forgot its `WHERE version = ?`.
 --    failed -> confirmed is legal here; its gate (a final, matching on-chain event) is the
---    engine's, via @bridge/domain lateConfirmation(). The database cannot see the chain.
+--    engine's, via @bridge/domain lateConfirmation() and confirmLate(). The database cannot see the chain.
 -- -------------------------------------------------------------------------------------------------
 
 CREATE FUNCTION trg_operation_insert() RETURNS trigger
