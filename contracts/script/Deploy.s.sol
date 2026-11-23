@@ -2,22 +2,32 @@
 pragma solidity ^0.8.28;
 
 import {Script} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
+import {console} from "forge-std/console.sol";
 import {ComplianceRegistry} from "../src/ComplianceRegistry.sol";
 import {SettlementToken} from "../src/SettlementToken.sol";
 
 /// @title Deploy
-/// @notice Deploys the compliance registry and the settlement token, wires their roles, and writes
-/// the addresses to `deployments/<chainId>.json`.
+/// @notice Deploys the compliance registry and the settlement token, wires their roles, checks the
+/// wiring, and (only when broadcasting) writes the addresses to `deployments/<chainId>.pending.json`.
 /// @dev Everything comes from environment variables, and the deployer key is passed to `forge
 /// script` on the command line (`--private-key`, `--account` for a keystore, or `--unlocked` for
 /// Anvil's built-in accounts). No key is ever read from the environment by this script.
 ///
-/// Required: COMPLIANCE_ADDRESS, MINTER_ADDRESS, SETTLER_ADDRESS, PAUSER_ADDRESS.
-/// Optional: ADMIN_ADDRESS (final admin; the deployer hands over and steps down if it differs),
-/// TOKEN_NAME, TOKEN_SYMBOL, ALLOW_MAINNET, ALLOW_UNKNOWN_CHAIN.
+/// Required: COMPLIANCE_ADDRESS, MINTER_ADDRESS, SETTLER_ADDRESS, PAUSER_ADDRESS, and on every chain
+/// but local Anvil (31337) also ADMIN_ADDRESS.
+/// Optional: ADMIN_ADDRESS on Anvil (final admin; the deployer hands over and steps down if it
+/// differs), TOKEN_NAME, TOKEN_SYMBOL, ALLOW_MAINNET, ALLOW_UNKNOWN_CHAIN, ALLOW_EOA_ADMIN,
+/// HOLDER_TRANSFERS_ENABLED (default false: the holder-signed ERC-20 path stays off).
 ///
 /// Refuses to run on a known mainnet unless ALLOW_MAINNET=true, and on a chain it does not
 /// recognize unless ALLOW_UNKNOWN_CHAIN=true. Local and the two documented testnets always work.
+/// Off Anvil it also requires an admin with code (a multisig) unless ALLOW_EOA_ADMIN=true, a
+/// compliance address different from the minter, and no service role held by the deployer.
+///
+/// A dry run writes nothing; a broadcast writes the PENDING record, because forge writes it while
+/// the transactions are still being sent. `script/promote-deployment.sh` checks the record against
+/// the chain and only then renames it to `deployments/<chainId>.json`.
 contract Deploy is Script {
     /// @notice Everything the deployment needs, read from the environment.
     struct Config {
@@ -30,6 +40,8 @@ contract Deploy is Script {
         string tokenSymbol;
         bool allowMainnet;
         bool allowUnknownChain;
+        bool allowEoaAdmin;
+        bool holderTransfersEnabled;
     }
 
     /// @notice The chain is a known production network and ALLOW_MAINNET is not set.
@@ -41,11 +53,28 @@ contract Deploy is Script {
     /// @notice A required role address is the zero address.
     error ZeroRoleAddress(string role);
 
+    /// @notice ADMIN_ADDRESS is unset or zero on a chain other than local Anvil.
+    error AdminRequired(uint256 chainId);
+
+    /// @notice The admin has no code (an EOA, not a multisig) and ALLOW_EOA_ADMIN is not set.
+    error AdminHasNoCode(address admin);
+
+    /// @notice The compliance address is also the minter: one key could then verify an address
+    /// and mint to it.
+    error ComplianceIsMinter(address account);
+
+    /// @notice The deployer would keep a service role on a chain other than local Anvil.
+    error DeployerHoldsServiceRole(string role);
+
+    /// @notice The deployed contracts are not wired as configured; no record is produced.
+    error DeploymentCheckFailed(string check);
+
     uint256 internal constant ANVIL = 31_337;
     uint256 internal constant SEPOLIA = 11_155_111;
     uint256 internal constant BASE_SEPOLIA = 84_532;
 
-    /// @notice Deploys and wires everything. Run with `--broadcast` to send the transactions.
+    /// @notice Deploys, wires and checks everything. Run with `--broadcast` to send the
+    /// transactions and write the pending record.
     function run() external returns (ComplianceRegistry registry, SettlementToken token) {
         Config memory cfg = _readConfig();
         _assertChainAllowed(block.chainid, cfg.allowMainnet, cfg.allowUnknownChain);
@@ -53,10 +82,12 @@ contract Deploy is Script {
         vm.startBroadcast();
         // After startBroadcast, msg.sender is the account that signs the transactions.
         (, address deployer,) = vm.readCallers();
+        _assertRoleSeparation(block.chainid, deployer, cfg);
         (registry, token) = _deploy(deployer, cfg);
+        _assertWiring(deployer, cfg, registry, token);
         vm.stopBroadcast();
 
-        _writeDeployment(deployer, cfg, registry, token);
+        _recordDeployment(deployer, cfg, registry, token);
     }
 
     /// @dev Reads and validates the environment.
@@ -70,6 +101,8 @@ contract Deploy is Script {
         cfg.tokenSymbol = vm.envOr("TOKEN_SYMBOL", string("STK"));
         cfg.allowMainnet = vm.envOr("ALLOW_MAINNET", false);
         cfg.allowUnknownChain = vm.envOr("ALLOW_UNKNOWN_CHAIN", false);
+        cfg.allowEoaAdmin = vm.envOr("ALLOW_EOA_ADMIN", false);
+        cfg.holderTransfersEnabled = vm.envOr("HOLDER_TRANSFERS_ENABLED", false);
 
         if (cfg.compliance == address(0)) revert ZeroRoleAddress("compliance");
         if (cfg.minter == address(0)) revert ZeroRoleAddress("minter");
@@ -88,6 +121,24 @@ contract Deploy is Script {
             return;
         }
         if (!allowUnknown) revert UnknownChain(chainId);
+    }
+
+    /// @dev Off local Anvil: a real admin is required and must have code unless ALLOW_EOA_ADMIN is
+    /// set, compliance and minter are different keys, and the deployer keeps no service role.
+    /// Minter and settler may be the same address (one settlement signer can hold both). On Anvil
+    /// nothing here applies, so local development works with a single account.
+    function _assertRoleSeparation(uint256 chainId, address deployer, Config memory cfg)
+        internal
+        view
+    {
+        if (chainId == ANVIL) return;
+        if (cfg.admin == address(0)) revert AdminRequired(chainId);
+        if (!cfg.allowEoaAdmin && cfg.admin.code.length == 0) revert AdminHasNoCode(cfg.admin);
+        if (cfg.compliance == cfg.minter) revert ComplianceIsMinter(cfg.compliance);
+        if (cfg.compliance == deployer) revert DeployerHoldsServiceRole("compliance");
+        if (cfg.minter == deployer) revert DeployerHoldsServiceRole("minter");
+        if (cfg.settler == deployer) revert DeployerHoldsServiceRole("settler");
+        if (cfg.pauser == deployer) revert DeployerHoldsServiceRole("pauser");
     }
 
     /// @dev Production networks this script refuses by default. Not exhaustive on purpose: the
@@ -109,8 +160,9 @@ contract Deploy is Script {
     }
 
     /// @dev Creates both contracts with `deployer` as the temporary admin, grants the service
-    /// roles, then optionally hands the admin role to `cfg.admin` and steps down. Every call here
-    /// is made by `deployer`, which is the broadcaster when run as a script.
+    /// roles, switches the holder-signed path on if asked (while the deployer is still admin),
+    /// then optionally hands the admin role to `cfg.admin` and steps down. Every call here is made
+    /// by `deployer`, which is the broadcaster when run as a script.
     function _deploy(address deployer, Config memory cfg)
         internal
         returns (ComplianceRegistry registry, SettlementToken token)
@@ -123,6 +175,8 @@ contract Deploy is Script {
         token.grantRole(token.SETTLER_ROLE(), cfg.settler);
         token.grantRole(token.PAUSER_ROLE(), cfg.pauser);
 
+        if (cfg.holderTransfersEnabled) token.setHolderTransfersEnabled(true);
+
         if (cfg.admin != address(0) && cfg.admin != deployer) {
             bytes32 adminRole = registry.DEFAULT_ADMIN_ROLE();
             registry.grantRole(adminRole, cfg.admin);
@@ -132,13 +186,88 @@ contract Deploy is Script {
         }
     }
 
-    /// @dev Where the deployment record is written. Overridden in tests so they never touch it.
-    function _outputPath() internal view virtual returns (string memory) {
-        return string.concat("./deployments/", vm.toString(block.chainid), ".json");
+    /// @dev Reads the deployed state back and reverts on the first thing that is not as
+    /// configured, so a mis-wired deployment never produces a record.
+    function _assertWiring(
+        address deployer,
+        Config memory cfg,
+        ComplianceRegistry registry,
+        SettlementToken token
+    ) internal view {
+        if (address(token.registry()) != address(registry)) {
+            revert DeploymentCheckFailed("token registry");
+        }
+        if (!registry.hasRole(registry.COMPLIANCE_ROLE(), cfg.compliance)) {
+            revert DeploymentCheckFailed("compliance role");
+        }
+        if (!token.hasRole(token.MINTER_ROLE(), cfg.minter)) {
+            revert DeploymentCheckFailed("minter role");
+        }
+        if (!token.hasRole(token.SETTLER_ROLE(), cfg.settler)) {
+            revert DeploymentCheckFailed("settler role");
+        }
+        if (!token.hasRole(token.PAUSER_ROLE(), cfg.pauser)) {
+            revert DeploymentCheckFailed("pauser role");
+        }
+
+        bytes32 adminRole = registry.DEFAULT_ADMIN_ROLE();
+        address finalAdmin = _finalAdmin(deployer, cfg);
+        if (!registry.hasRole(adminRole, finalAdmin)) {
+            revert DeploymentCheckFailed("registry admin");
+        }
+        if (!token.hasRole(adminRole, finalAdmin)) revert DeploymentCheckFailed("token admin");
+        if (finalAdmin != deployer) {
+            if (registry.hasRole(adminRole, deployer)) {
+                revert DeploymentCheckFailed("deployer kept registry admin");
+            }
+            if (token.hasRole(adminRole, deployer)) {
+                revert DeploymentCheckFailed("deployer kept token admin");
+            }
+        }
+
+        if (token.holderTransfersEnabled() != cfg.holderTransfersEnabled) {
+            revert DeploymentCheckFailed("holder transfers switch");
+        }
     }
 
-    /// @dev Records what was deployed. `deploymentBlock` is the chain head when the script started,
-    /// a safe lower bound for where an indexer should begin reading events.
+    /// @dev The account that ends up with `DEFAULT_ADMIN_ROLE` on both contracts.
+    function _finalAdmin(address deployer, Config memory cfg) internal pure returns (address) {
+        return cfg.admin == address(0) ? deployer : cfg.admin;
+    }
+
+    /// @dev Whether forge is broadcasting (`forge script --broadcast`). Only then is a record
+    /// written. Overridden in tests so both branches can be exercised.
+    function _isBroadcast() internal view virtual returns (bool) {
+        return vm.isContext(VmSafe.ForgeContext.ScriptBroadcast);
+    }
+
+    /// @dev Where the pending deployment record is written. Overridden in tests so they never
+    /// touch it.
+    function _outputPath() internal view virtual returns (string memory) {
+        return string.concat("./deployments/", vm.toString(block.chainid), ".pending.json");
+    }
+
+    /// @dev Prints the addresses, and writes the pending record only when broadcasting: a dry run
+    /// deployed nothing, so it must leave nothing behind that looks like a deployment.
+    function _recordDeployment(
+        address deployer,
+        Config memory cfg,
+        ComplianceRegistry registry,
+        SettlementToken token
+    ) internal {
+        console.log("ComplianceRegistry:", address(registry));
+        console.log("SettlementToken:", address(token));
+        if (!_isBroadcast()) {
+            console.log("Dry run: no deployment record written.");
+            return;
+        }
+        _writeDeployment(deployer, cfg, registry, token);
+        console.log("Pending record written; promote it with script/promote-deployment.sh.");
+    }
+
+    /// @dev Records what was deployed and who should hold each role, so the promotion step can
+    /// check it against the chain. `deploymentBlock` is the chain head when the script started, a
+    /// safe lower bound for where an indexer should begin reading events.
     function _writeDeployment(
         address deployer,
         Config memory cfg,
@@ -151,8 +280,12 @@ contract Deploy is Script {
         vm.serializeAddress(key, "complianceRegistry", address(registry));
         vm.serializeAddress(key, "settlementToken", address(token));
         vm.serializeAddress(key, "deployer", deployer);
-        string memory json =
-            vm.serializeAddress(key, "admin", cfg.admin == address(0) ? deployer : cfg.admin);
+        vm.serializeAddress(key, "compliance", cfg.compliance);
+        vm.serializeAddress(key, "minter", cfg.minter);
+        vm.serializeAddress(key, "settler", cfg.settler);
+        vm.serializeAddress(key, "pauser", cfg.pauser);
+        vm.serializeBool(key, "holderTransfersEnabled", cfg.holderTransfersEnabled);
+        string memory json = vm.serializeAddress(key, "admin", _finalAdmin(deployer, cfg));
         vm.writeJson(json, _outputPath());
     }
 }

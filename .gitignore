@@ -14,3 +14,5 @@ contracts/broadcast/
 # Deployments to a local Anvil are throwaway; testnet deployments are committed deliberately.
 contracts/deployments/31337.json
 contracts/deployments/test-output.json
+# A broadcast writes a pending record; promote-deployment.sh checks it on-chain before it becomes real.
+*.pending.json
