@@ -35,8 +35,20 @@ independent review and is the engine's acceptance checklist; each item has a tes
 
 **Records and compliance**
 12. `confirmedBlock` is the receipt or event block, never the head, and only once final.
-13. Derive each address's expected compliance flags from final events in (block, log index) order and
-    the bridge's latest decision, never from the order changes were confirmed in the database.
+13. Never derive expected compliance flags from the order changes were confirmed in the database
+    (nor from the app clock). Chain order lives in the OBSERVED side: the registry's flags read at
+    the final block are, by construction, the result of every final event applied in (block, log
+    index) order. The EXPECTED value per (account, flag) is the bridge's APPLIED decision (confirmed,
+    or matched exactly by a final canonical registry event) with the highest database-assigned
+    `decision_seq`; a newer decision that failed or is in flight is filtered out BEFORE the choice.
+    Why this is equivalent for hidden changes: an old decision landing after a newer one leaves the
+    registry (observed) at the old value while the expectation is the newer one, so it shows as a
+    `compliance_mismatch`; every registry event that no known change explains (a rogue or front-run
+    change) is reported separately as `compliance_event_mismatch`, and the flag it moved shows as a
+    `compliance_mismatch` because no decision expects it. The engine also alarms
+    `compliance_out_of_order` (an applied change out of decision order, compared by block then log
+    index) and `compliance_unapplied` (a failed newest decision that nothing newer superseded, which
+    the reconciler cannot see because the registry still matches the older decision).
 
 **Indexer and reconciliation**
 14. Build `detectReorg`'s lookup from the node. On `nodeBehind`, neither roll back nor advance; on

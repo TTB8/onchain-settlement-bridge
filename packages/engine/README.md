@@ -377,13 +377,19 @@ its mismatches) and `latestRuns(limit)`:
    up to `finalBlock`; balances for exactly the ledger addresses plus both sides of every indexed
    `Transfer`, and the supply; registry flags for that set plus every account a registry event or
    a known change touched (checklist 16).
-5. Expected flags (`deriveExpectedCompliance`, checklist 13, review M-1): per account and flag,
-   the latest APPLIED decision by `decision_seq`. Applied = `confirmed`, or matched by a final
-   canonical registry event (the monitor may simply not have caught up). The filter comes BEFORE
-   the choice: a newer failed or in-flight decision never hides an older applied one. The
-   registry already holds the chain-ordered result (what is observed), so an old decision landing
-   after a newer one becomes a `compliance_mismatch`. Never the database's confirmation order,
-   never the app clock (`decision_seq` is assigned by the database at insert).
+5. Expected flags (`deriveExpectedCompliance`, checklist 13, review M-1). Chain order lives in the
+   OBSERVED side: the registry's flags read at `finalBlock` already are every final event applied
+   in (block, log index) order. The EXPECTED value per account and flag is the APPLIED decision
+   (`confirmed`, or matched exactly by a final canonical registry event: the monitor may simply
+   not have caught up) with the highest `decision_seq` (assigned by the database at insert). The
+   filter comes BEFORE the choice: a newer failed or in-flight decision never hides an older
+   applied one. Why this catches every hidden change: an old decision landing after a newer one
+   leaves the registry at the old value while the expectation is the newer one
+   (`compliance_mismatch`); a registry event no known change explains is always reported on its
+   own (`compliance_event_mismatch`), and the flag it moved shows as `compliance_mismatch` too.
+   Never the database's confirmation order, never the app clock. What the reconciler cannot see
+   (a failed newest decision: the registry still matches the older one) is alarmed by the monitor
+   as `compliance_unapplied`.
 6. Domain `reconcile`, then one transaction: `reconciliation_run`, one `reconciliation_mismatch`
    row per mismatch, an audit row; then one alarm per kind (`reconciliation_<kind>`). A failing
    alarm sink after the commit is recorded as an audit row (`alarm_failed`), never as a second run.
@@ -412,6 +418,16 @@ deployment block.
   before anything else, it is the change that stops a sanctioned account from moving funds.
   `compliance_out_of_order` (an applied change landed out of decision order) always needs a
   person: the registry holds the older decision's value.
+- **`compliance_unapplied`**: a failed change that no confirmed change with a higher
+  `decision_seq` supersedes is the bridge's newest decision for that flag and never reached the
+  chain. It is alarmed on every pass, at most every `complianceUnappliedAlarmSeconds` (default
+  1 h) per change, freezes first, regardless of the failed look-back, until a newer decision for
+  that flag is applied. `compliance_out_of_order` compares event positions by block, then log
+  index (an inversion inside one block counts).
+- **`compliance_change.deployment_id` is not covered by the piece C immutability guard.** The
+  generic rebind guard (6a, `deployment_rebind`) already refuses moving the row to another
+  deployment; the compliance identity check itself does not list the column (noted by review, no
+  migration added).
 - **Failed compliance changes** are re-examined only within `complianceFailedLookbackSeconds`
   (default 7 days) of their last update, or while an indexed event carries their reference (the
   only thing that can late-confirm one or show a conflict).
