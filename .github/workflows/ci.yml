@@ -18,6 +18,21 @@ jobs:
     name: TypeScript (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The db package attacks its SQL guards on real Postgres, one fresh database per test file.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bridge
+          POSTGRES_PASSWORD: bridge
+          POSTGRES_DB: postgres
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U bridge" --health-interval 5s --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_TEST_ADMIN_URL: postgresql://bridge:bridge@localhost:5434/postgres
     strategy:
       fail-fast: false
       matrix:
@@ -95,6 +110,10 @@ jobs:
         run: forge test -vvv
 
       # Fuzz and invariant gas varies run to run, so the snapshot covers the deterministic tests.
+      # Runs the deployment promotion script against its own Anvil (about 15 seconds).
+      - name: Deployment promotion script
+        run: bash contracts/script/test-promote.sh
+
       - name: Gas snapshot has not regressed
         working-directory: contracts
         run: forge snapshot --check --no-match-test "testFuzz|invariant"
