@@ -13,12 +13,12 @@
   "dependencies": {
     "@bridge/chain": "workspace:*",
     "@bridge/db": "workspace:*",
-    "@bridge/domain": "workspace:*"
+    "@bridge/domain": "workspace:*",
+    "viem": "2.57.16"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",
     "jest": "^29.7.0",
-    "ts-jest": "^29.4.15",
-    "viem": "2.57.16"
+    "ts-jest": "^29.4.15"
   }
 }
