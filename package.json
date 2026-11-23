@@ -35,6 +35,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "test:cov": "pnpm -r test:cov",
+    "db:generate": "pnpm --filter @bridge/db db:generate",
+    "db:seed": "pnpm --filter @bridge/db db:seed",
     "contracts:build": "cd contracts && forge build",
     "contracts:test": "cd contracts && forge test",
     "contracts:snapshot": "cd contracts && forge snapshot --no-match-test \"testFuzz|invariant\"",

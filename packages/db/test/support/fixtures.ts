@@ -44,9 +44,10 @@ export async function insertDeployment(
 
 /** The system account id, created if missing. */
 export async function fiatClearing(sql: Sql): Promise<string> {
+  // Deliberately not ON CONFLICT: the fixtures must not depend on the singleton index they test.
   await sql.query(
-    `INSERT INTO account (kind) VALUES ('fiat_clearing')
-     ON CONFLICT (kind) WHERE kind = 'fiat_clearing' DO NOTHING`,
+    `INSERT INTO account (kind)
+     SELECT 'fiat_clearing' WHERE NOT EXISTS (SELECT 1 FROM account WHERE kind = 'fiat_clearing')`,
   );
   const r = await sql.query<{ id: string }>(`SELECT id FROM account WHERE kind = 'fiat_clearing'`);
   return r.rows[0]!.id;
