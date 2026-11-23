@@ -409,6 +409,32 @@ describe('reconcile', () => {
       expect(kinds({ ...w, events })).toEqual(['unexplained_transfer']);
     });
 
+    it('needs the amount to match: a mint that moves more than its Minted event claims is unexplained', () => {
+      const w = cleanWorld();
+      const events = w.events.map((e) =>
+        e.kind === 'Transfer' && e.txHash === txh(1) ? { ...e, amount: 1_000n } : e,
+      );
+      const r = reconcile({
+        ...w,
+        events,
+        observedBalances: new Map([...w.observedBalances, [alice, 970n]]),
+        observedSupply: 990n,
+      });
+      expect(r.mismatches).toEqual([
+        {
+          kind: 'unexplained_transfer',
+          from: ZERO_ADDRESS,
+          to: alice,
+          amount: 1_000n,
+          txHash: txh(1),
+          logIndex: 0,
+          blockNumber: 10n,
+        },
+        { kind: 'balance_mismatch', address: alice, expected: 70n, observed: 970n },
+        { kind: 'supply_mismatch', expected: 90n, observed: 990n },
+      ]);
+    });
+
     it('counts zero-value and self transfers as noise instead of reporting them', () => {
       const w = cleanWorld();
       const r = reconcile({
