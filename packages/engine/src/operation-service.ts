@@ -65,7 +65,7 @@ import {
 } from './ledger-writes';
 import { moveOperation, type MovedOperation, type MoveOperationInput } from './move-operation';
 import type { Clock, IdSource } from './ports';
-import { runTransaction, type TransactionOptions } from './transaction';
+import { runTransaction, type TransactionOptions, type Tx } from './transaction';
 
 /** A request to move money. Every request carries a caller-chosen idempotency key. */
 export type OperationRequest =
@@ -227,6 +227,30 @@ function accountsToLock(
     .map((p) => accountIdFor(p.account, users, fiatId));
 }
 
+/** The deployment fields a request binds to. */
+interface BoundDeployment {
+  readonly id: string;
+  readonly chainId: bigint;
+  readonly tokenAddress: string;
+}
+
+/**
+ * The active deployment of `chainId`, locked FOR SHARE until the transaction ends, or null.
+ * A plain read is not enough: the foreign key from operation only takes FOR KEY SHARE, which does
+ * not conflict with an UPDATE of `active`.
+ */
+async function lockActiveDeployment(tx: Tx, chainId: bigint): Promise<BoundDeployment | null> {
+  const rows = await tx.$queryRaw<{ id: string; chain_id: bigint; token_address: string }[]>`
+    SELECT id::text AS id, chain_id, token_address
+      FROM deployment
+     WHERE chain_id = ${chainId} AND active
+       FOR SHARE`;
+  const row = rows[0];
+  return row === undefined
+    ? null
+    : { id: row.id, chainId: BigInt(row.chain_id), tokenAddress: row.token_address };
+}
+
 /** Whether a stored operation is the same request as `op` (same type, parties and amount). */
 function sameContent(stored: Operation, op: LedgerOperation): boolean {
   const { owner, counterparty } = partiesOfRequest(op);
@@ -318,9 +342,10 @@ export class OperationService {
       async (tx) => {
         const at = this.clock.now();
         // 1. The active deployment of the configured chain, and it must be the configured token.
-        const deployment = await tx.deployment.findFirst({
-          where: { chainId: this.chainId, active: true },
-        });
+        //    FOR SHARE holds the row until commit: a concurrent deactivation waits for us (and is
+        //    then refused by the database because our operation is not final), or, if it got
+        //    there first, we wait and then see the row as inactive. Never both commit (review M-1).
+        const deployment = await lockActiveDeployment(tx, this.chainId);
         if (deployment === null) {
           throw new NoActiveDeploymentError(`no active deployment on chain ${this.chainId}`);
         }

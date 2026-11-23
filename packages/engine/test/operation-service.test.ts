@@ -435,6 +435,91 @@ describe('deployment binding (ADR 0011, ADR 0012 item 17)', () => {
   });
 });
 
+describe('a deactivation racing a request (review M-1)', () => {
+  /** Waits until `n` backends of this database are blocked on a lock. */
+  async function waitForBlocked(n: number): Promise<void> {
+    for (let i = 0; i < 200; i += 1) {
+      const [row] = await db.prisma.$queryRaw<{ n: bigint }[]>`
+        SELECT count(*) AS n FROM pg_stat_activity
+         WHERE wait_event_type = 'Lock' AND datname = current_database()`;
+      if ((row?.n ?? 0n) >= BigInt(n)) return;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error(`fewer than ${n} backends became blocked on a lock`);
+  }
+
+  const outcome = <T>(p: Promise<T>) =>
+    p.then(
+      (v) => ({ ok: true as const, v }),
+      (e: unknown) => ({ ok: false as const, e }),
+    );
+
+  it('request first: the deactivation waits for the commit, then is refused', async () => {
+    const d = await insertDeployment(db.prisma);
+    const svc = serviceFor(db.prisma, d);
+    const u = await insertUser(db.prisma);
+    // Pause the request after step 1: hold the account it will lock in step 3.
+    const holder = db.client();
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let holding!: () => void;
+    const isHolding = new Promise<void>((r) => (holding = r));
+    const hold = holder.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM account WHERE id = ${u.incoming}::uuid FOR UPDATE`;
+        holding();
+        await released;
+      },
+      { timeout: 30_000 },
+    );
+    await isHolding;
+    const request = outcome(svc.requestDeposit(u.id, 3n, 'race-m1-a'));
+    await waitForBlocked(1); // the request holds the deployment FOR SHARE and waits on the account
+    const admin = db.client();
+    const deactivation = outcome(
+      admin.$executeRaw`UPDATE deployment SET active = false WHERE id = ${d.id}::uuid`,
+    );
+    await waitForBlocked(2); // the deactivation waits on the request's FOR SHARE
+    release();
+    await hold;
+    const [r, x] = await Promise.all([request, deactivation]);
+    expect(r.ok).toBe(true);
+    expect(x.ok).toBe(false);
+    if (!x.ok) expect(String(x.e)).toContain('deployment_in_flight');
+    const row = await db.prisma.deployment.findUniqueOrThrow({ where: { id: d.id } });
+    expect(row.active).toBe(true);
+  });
+
+  it('deactivation first: the request waits, then is refused with NoActiveDeploymentError', async () => {
+    const d = await insertDeployment(db.prisma);
+    const svc = serviceFor(db.prisma, d);
+    const u = await insertUser(db.prisma);
+    const admin = db.client();
+    let commit!: () => void;
+    const committed = new Promise<void>((r) => (commit = r));
+    let updated!: () => void;
+    const isUpdated = new Promise<void>((r) => (updated = r));
+    const deactivation = admin.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`UPDATE deployment SET active = false WHERE id = ${d.id}::uuid`;
+        updated();
+        await committed;
+      },
+      { timeout: 30_000 },
+    );
+    await isUpdated;
+    const before = await counts(db.prisma);
+    const request = outcome(svc.requestDeposit(u.id, 3n, 'race-m1-b'));
+    await waitForBlocked(1);
+    commit();
+    await deactivation;
+    const r = await request;
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.e).toBeInstanceOf(NoActiveDeploymentError);
+    expect(await counts(db.prisma)).toEqual(before);
+  });
+});
+
 describe('serialization failures (40001)', () => {
   /**
    * Makes the request's first try fail with 40001, deterministically: under SERIALIZABLE the
