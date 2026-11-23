@@ -800,7 +800,7 @@ describe('deriveExpectedCompliance (checklist 13, pure)', () => {
     expect(out.get(A)).toEqual({ verified: false, frozen: false });
   });
 
-  it("Review PoC: a newer FAILED or IN-FLIGHT freeze never hides a late-landing old unfreeze", () => {
+  it('Review PoC: a newer FAILED or IN-FLIGHT freeze never hides a late-landing old unfreeze', () => {
     const f2Ref = `0x${'03'.repeat(32)}` as `0x${string}`;
     const f3Ref = `0x${'04'.repeat(32)}` as `0x${string}`;
     const u1: KnownComplianceChange = { ...unfreeze, decisionSeq: 1n };
