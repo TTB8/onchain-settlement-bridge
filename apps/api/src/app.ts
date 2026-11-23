@@ -264,6 +264,18 @@ export async function createApiApp(
   return app;
 }
 
+/**
+ * The database did not answer `SELECT 1` at startup. The message names no host, user or
+ * password (the URL is a secret); the Prisma error is kept as `cause` for debugging only.
+ */
+export class DatabaseUnreachableError extends Error {
+  /** @param cause The Prisma error. */
+  constructor(cause: unknown) {
+    super('the database is not reachable: check DATABASE_URL and that Postgres is up', { cause });
+    this.name = 'DatabaseUnreachableError';
+  }
+}
+
 /** Factories `startApi` uses; tests replace them. */
 export interface StartDeps {
   /** Builds the database client. */
@@ -280,7 +292,8 @@ const DEFAULT_DEPS: StartDeps = {
 };
 
 /**
- * Validates the environment, checks the node, builds and starts the API. Rejects (and leaves
+ * Validates the environment, checks the database (`SELECT 1`) and the node, builds and starts
+ * the API. Rejects (and leaves
  * nothing running) on any failure.
  *
  * @param env The environment.
@@ -299,6 +312,12 @@ export async function startApi(
   });
   const prisma = deps.createPrisma(config.databaseUrl.reveal());
   try {
+    // Fail fast: an API that cannot reach its database must not report itself as listening.
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+    } catch (err) {
+      throw new DatabaseUnreachableError(err);
+    }
     const gateway = deps.createGateway(config);
     assertNodeChainId(config.chain.chainId, await gateway.getChainId());
     const app = await createApiApp(

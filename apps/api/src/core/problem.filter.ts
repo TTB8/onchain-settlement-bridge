@@ -14,7 +14,7 @@ import type { Request, Response } from 'express';
 import { requestIdOf } from './request-context';
 import type { JsonLogger } from './logger';
 import { LOGGER } from './tokens';
-import { toProblem } from './problem';
+import { isDatabaseUnavailable, toProblem } from './problem';
 
 /** Catches everything and answers with a problem. */
 @Catch()
@@ -50,6 +50,12 @@ export function sendProblem(
   const mapped = toProblem(exception, requestId);
   if (mapped.unexpected) {
     logger.emit('error', 'unhandled error', {
+      requestId: requestId ?? null,
+      error: describeError(exception),
+    });
+  } else if (isDatabaseUnavailable(exception)) {
+    // Expected and retryable, but an operator must see it: one warn line, redacted.
+    logger.emit('warn', 'database unavailable', {
       requestId: requestId ?? null,
       error: describeError(exception),
     });

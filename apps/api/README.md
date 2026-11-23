@@ -16,7 +16,11 @@ pnpm --filter @bridge/api start
 
 Startup fails fast, before serving a request: the environment is validated (every problem listed
 by name, never a value; `packages/engine/src/env.ts`), a mainnet / testnet / unknown chain is
-refused unless its `ALLOW_*` flag is `true`, and the node must report `CHAIN_ID`.
+refused unless its `ALLOW_*` flag is `true`, the database must answer `SELECT 1` ("the database is
+not reachable: check DATABASE_URL and that Postgres is up", exit 1), and the node must report
+`CHAIN_ID`. If the database goes away while serving, requests answer 503 `NOT_READY` with
+`Retry-After` (Prisma initialization errors and P1001 / P1002 / P1017), never 500, and the API logs
+one `database unavailable` warn line per request.
 
 OpenAPI: `GET /docs` (UI) and `GET /docs/openapi.json`. Served by default only on a local chain;
 elsewhere set `API_DOCS_ENABLED=true` explicitly (and `false` turns them off anywhere).

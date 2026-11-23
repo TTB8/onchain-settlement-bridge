@@ -53,8 +53,10 @@ import { AMOUNT_PATTERN, formatAmount, parseAmount } from '../src/core/amount';
 import { parseIdempotencyKey } from '../src/core/idempotency-key';
 import { JsonLogger, LoggingAlarmSink } from '../src/core/logger';
 import { parseLimit } from '../src/core/params';
+import { Prisma } from '@bridge/db';
 import {
   ApiProblem,
+  isDatabaseUnavailable,
   PROBLEMS,
   type ProblemCode,
   problemBody,
@@ -123,6 +125,35 @@ describe('toProblem', () => {
     expect(mapped.body.detail).toBe(PROBLEMS[code].detail);
     expect(mapped.body.instance).toBe('urn:request:req-1');
     expect(mapped.unexpected).toBe(code === 'INTERNAL');
+  });
+
+  it('Prisma "database unreachable" errors are a retryable 503, other Prisma errors are internal', () => {
+    for (const err of [
+      new Prisma.PrismaClientInitializationError("Can't reach database server", '6.19.3', 'P1001'),
+      new Prisma.PrismaClientInitializationError('timed out', '6.19.3', 'P1002'),
+      new Prisma.PrismaClientKnownRequestError('closed', {
+        code: 'P1017',
+        clientVersion: '6.19.3',
+      }),
+    ]) {
+      expect(isDatabaseUnavailable(err)).toBe(true);
+      const mapped = toProblem(err);
+      expect([mapped.body.status, mapped.body.code, mapped.unexpected]).toEqual([
+        503,
+        'NOT_READY',
+        false,
+      ]);
+      expect(mapped.headers).toEqual({ 'Retry-After': '5' });
+    }
+    for (const err of [
+      new Prisma.PrismaClientKnownRequestError('unique', {
+        code: 'P2002',
+        clientVersion: '6.19.3',
+      }),
+    ]) {
+      expect(isDatabaseUnavailable(err)).toBe(false);
+      expect(toProblem(err).body.code).toBe('INTERNAL');
+    }
   });
 
   it('never carries the error message, only the fixed detail', () => {

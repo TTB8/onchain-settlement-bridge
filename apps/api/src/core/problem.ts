@@ -14,6 +14,7 @@
  */
 
 import { HttpException } from '@nestjs/common';
+import { Prisma } from '@bridge/db';
 import { EngineError } from '@bridge/engine';
 
 /** The stable problem codes (also the last segment of each `type`). */
@@ -176,7 +177,8 @@ export const PROBLEMS: Readonly<Record<ProblemCode, ProblemSpec>> = Object.freez
   NOT_READY: {
     status: 503,
     title: 'Not ready',
-    detail: 'A dependency is not available; see checks.',
+    detail:
+      'A dependency (the database or the node) is not available right now. Nothing was written; retry later.',
     retryAfterSeconds: 5,
   },
   INTERNAL: {
@@ -263,6 +265,27 @@ function conflictExtensions(err: EngineError): Record<string, unknown> {
     return { existingComplianceChangeId: existing.existingChangeId };
   }
   return {};
+}
+
+/**
+ * Prisma's "the database is unreachable" codes: P1001 can't reach the server, P1002 timed out
+ * reaching it, P1017 the server closed the connection. A request that meets one wrote nothing
+ * (the transaction never committed), so it is a retryable 503, not an internal error.
+ *
+ * At query time Prisma reports an unreachable server as a `PrismaClientInitializationError`
+ * WITHOUT an `errorCode` (observed with 6.19), so every initialization error counts: the client
+ * never connected, nothing ran (an authentication failure lands here too; it is 503 as well,
+ * and the warn log line says why).
+ */
+export const DATABASE_UNAVAILABLE_CODES: ReadonlySet<string> = new Set(['P1001', 'P1002', 'P1017']);
+
+/** Whether `err` is Prisma reporting the database as unreachable. */
+export function isDatabaseUnavailable(err: unknown): boolean {
+  if (err instanceof Prisma.PrismaClientInitializationError) return true;
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    return DATABASE_UNAVAILABLE_CODES.has(err.code);
+  }
+  return false;
 }
 
 /**
@@ -359,6 +382,8 @@ export function toProblem(err: unknown, requestId?: string): MappedProblem {
     if (code === 'IDEMPOTENCY_CONFLICT') extensions = conflictExtensions(err);
   } else if (err instanceof HttpException) {
     code = httpProblem(err.getStatus());
+  } else if (isDatabaseUnavailable(err)) {
+    code = 'NOT_READY';
   } else {
     code = bodyParserProblem(err);
   }
