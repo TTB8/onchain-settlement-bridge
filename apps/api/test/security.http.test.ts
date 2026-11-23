@@ -377,6 +377,12 @@ describe('OpenAPI', () => {
     expect(amount.type).toBe('string');
     expect(amount.example).toBe('1500000');
     expect(doc.paths['/v1/admin/reconciliations']?.post?.security).toEqual([{ 'admin-token': [] }]);
+    // The deposit route says plainly that it mints and when it may be called.
+    const depositDoc = deposit as unknown as { summary: string; description: string };
+    expect(depositDoc.summary).toContain('MINT');
+    expect(depositDoc.description).toMatch(/^MINT AUTHORITY\./);
+    expect(depositDoc.description).toContain('ONLY after the platform has confirmed');
+    expect(depositDoc.description).toMatch(/mint cap.*proof-of-reserve/);
   });
 
   it('is not served by default off a local chain, and is when explicitly enabled', async () => {

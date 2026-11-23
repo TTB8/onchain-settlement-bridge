@@ -440,6 +440,19 @@ deployment block.
 - `SigningExpectation.gasLimit` was REMOVED (the smaller change): nobody set it, the gateway
   chooses the limit, and a wrong limit can only make a transaction revert out of gas.
 
+## Trust assumptions
+
+- **A deposit is the platform's assertion that fiat arrived.** `OperationService.requestDeposit`
+  reserves and the submitter mints whatever amount the caller names; nothing here can check that
+  the money exists. The reconciler compares the ledger with the chain, and an unbacked deposit is
+  recorded in BOTH (the ledger credit and the mint come from the same request), so it reconciles
+  cleanly. The caller of a deposit is therefore a mint authority: it must call only after its own
+  fiat settlement is confirmed. Production mitigations, out of scope for this reference: a unique
+  fiat receipt reference per deposit (one payment, one mint), a rolling mint cap per period, and a
+  proof-of-reserve gate (supply never above attested reserves) in front of the mint.
+- **The engine trusts its own callers' evidence** (see "Accepted risk: evidence is self-attested"
+  above) and its database role (guards hold only for a non-owner role).
+
 ## Tests
 
 Real PostgreSQL 16 (the db package's migrations, so every SQL guard is live). Each test file

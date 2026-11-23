@@ -79,6 +79,27 @@ yet); a transfer reserves only on the sender's side (`available -> held`) and cr
 recipient at settlement. `expectedOnChain = available + held` is what the wallet holds once
 everything pending is settled or reversed, the figure the reconciler checks.
 
+## Trust assumptions
+
+- **A deposit is a MINT AUTHORITY.** `POST /v1/users/:userId/deposits` is the platform asserting
+  that fiat arrived; the worker then mints that amount. The bridge cannot verify the fiat leg, and
+  the reconciler cannot see an unbacked deposit: the ledger and the chain agree with each other.
+  Call the route only after the platform has confirmed the fiat payment settled. Anyone holding
+  `API_PLATFORM_TOKEN` can create supply. Production mitigations, out of scope here: a unique fiat
+  receipt reference per deposit, a rolling mint cap, a proof-of-reserve gate on minting (engine
+  README, "Trust assumptions").
+- **All admin operations share ONE operator identity.** With a single static admin token every
+  compliance change is recorded with `requestedBy = "admin-token"`, and idempotency keys are scoped
+  to that one identity, so the audit trail cannot attribute a freeze or a reconciliation to a
+  person. Production needs per-operator identities from an identity provider (the subject claim
+  becomes `requestedBy`), with MFA for compliance actions.
+- **Alarms are log lines only**: there is no transport (pager, webhook, table). Ship stdout to a log
+  pipeline and alert on `"msg":"alarm"`.
+- **The non-owner database role is not enforced by the app**: it is an operator obligation (above).
+- **`pnpm dev` gives both processes one environment**, so locally the API process also holds the
+  signer keys in its environment (it never reads them). In production the API's environment must
+  not contain `SETTLEMENT_SIGNER_KEY` / `COMPLIANCE_SIGNER_KEY`.
+
 ## Authentication and authorisation
 
 Two static bearer tokens from the environment, compared in constant time (SHA-256 of both sides,

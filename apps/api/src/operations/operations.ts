@@ -55,6 +55,20 @@ import { API_CONFIG, OPERATION_SERVICE, PRISMA } from '../core/tokens';
 
 const AMOUNT_EXAMPLE = '1500000';
 
+/**
+ * The deposit route's OpenAPI description. WHY so blunt: a deposit is the platform ASSERTING that
+ * fiat arrived; the bridge then mints that amount. The reconciler cannot catch an unbacked
+ * deposit, because the ledger and the chain agree with each other (README "Trust assumptions").
+ */
+export const DEPOSIT_DESCRIPTION = [
+  'MINT AUTHORITY. Calling this route mints `amount` tokens to the user once the worker settles it.',
+  'Call it ONLY after the platform has confirmed that the fiat payment has settled (not merely',
+  'been initiated). The bridge cannot verify that fiat arrived: an unbacked deposit is consistent',
+  'in the ledger AND on chain, so reconciliation will not flag it. Whoever holds the platform',
+  'token can create supply. Production mitigations (out of scope here): a unique fiat receipt',
+  'reference per deposit, a rolling mint cap, and a proof-of-reserve gate on minting.',
+].join(' ');
+
 /** Body of a deposit or withdrawal. */
 export class AmountDto {
   /** The amount, decimal string of the smallest unit. */
@@ -339,7 +353,10 @@ export class OperationsController {
 
   /** Requests a deposit (fiat received; tokens minted to the user's wallet). */
   @Post('users/:userId/deposits')
-  @ApiOperation({ summary: 'Request a deposit (fiat received off-chain; mint on chain)' })
+  @ApiOperation({
+    summary: 'Request a deposit (fiat received off-chain; MINT on chain)',
+    description: DEPOSIT_DESCRIPTION,
+  })
   @ApiHeader(KEY_HEADER)
   @ApiCreatedResponse({ type: OperationDto, description: 'New operation (ledger_reserved).' })
   @ApiOkResponse({ type: OperationDto, description: 'Replay: the stored operation.' })
