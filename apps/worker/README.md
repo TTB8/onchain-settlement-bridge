@@ -8,16 +8,17 @@ SIGINT.
 ## Run
 
 ```bash
-docker compose up -d postgres anvil
-cp .env.example .env      # DEV ONLY Anvil keys, labelled as such
+docker compose up -d
+pnpm install
+pnpm setup:local          # writes .env (DEV ONLY Anvil keys, labelled as such)
 pnpm dev                  # api + worker; or only this app:
 pnpm --filter @bridge/worker start
 ```
 
 The database needs an ACTIVE `deployment` row for `CHAIN_ID` whose token and registry are
 `TOKEN_ADDRESS` / `REGISTRY_ADDRESS`, with `signer_state` rows holding the addresses of
-`SETTLEMENT_SIGNER_KEY` and `COMPLIANCE_SIGNER_KEY` (the local setup script of phase 3b writes
-them). Connect as a **non-owner** database role in production (see `apps/api/README.md`).
+`SETTLEMENT_SIGNER_KEY` and `COMPLIANCE_SIGNER_KEY` (`pnpm setup:local` writes them; see
+[docs/local-development.md](../../docs/local-development.md)). Connect as a **non-owner** database role in production (see `apps/api/README.md`).
 
 ## Startup: every refusal exits 1 with one log line saying why
 

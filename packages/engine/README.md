@@ -264,7 +264,7 @@ eviction or a load balancer flap; a transaction every node keeps dropping after 
 person, and a resubmission can never pay twice (single-use reference), so the limit only bounds
 noise and gas. `start()`/`stop()` loop around `tick()` without overlap.
 
-### Review fixes (Patrick, round 1)
+### Review fixes (round 1)
 
 - **H-1, drops and give-ups.** A dropped attempt is retried at most every `dropRetrySeconds`
   (time, never pass count). If its `maxFeePerGas` is below the node's current estimate, the same
@@ -499,7 +499,7 @@ pnpm --filter @bridge/engine test:cov    # with thresholds (90% statements/lines
 | C / 1-4: unknown, rejected                | compliance: "unknown outcome, then mined ...", "unknown outcome and NOT taken ...", "rejected by our node but mined elsewhere ..." |
 | C / 8, 9, 12: event-only confirmation     | compliance: "a stale event from an orphaned block never confirms ...", "... under ANOTHER reference never confirms ...", "a front-run under OUR reference ..."; compliance-paths: "a final successful receipt without an indexed event is NOT a confirmation ..." |
 | C / attempt paths, orphans, refusals      | compliance-paths: 11 monitor tests, "ComplianceSubmitter refusals", "moveComplianceChange: ...", "SignerRouter" |
-| 13: expected flags, decision order (M-1)  | reconciler: "deriveExpectedCompliance" (6, incl. "Patrick's PoC ..."), "review M-1: ..." (3, Patrick's scenario end to end with failed and in-flight F3), "the bridge's latest confirmed decision disagrees ..." |
+| 13: expected flags, decision order (M-1)  | reconciler: "deriveExpectedCompliance" (6, incl. the review's proof-of-concept case), "review M-1: ..." (3, the review's scenario end to end with failed and in-flight F3), "the bridge's latest confirmed decision disagrees ..." |
 | C review L-1..L-3, run integrity          | reconciler: "review L-1: an index on another fork AT the final block ...", "a ledger user with operations on another deployment ...", "a failing alarm sink after the commit ..."; compliance-paths: "compliance_pending ...", "a failed change is re-examined only within the look-back ..." |
 | 15: final block, node hashes              | reconciler: "a reorg of NOT-final blocks leaves the run stable ...", "a stale index ...: stale_block from the NODE hashes ..." |
 | 16: exact address set                     | reconciler: "a rogue transfer to an OUTSIDER: its balance is read because it appears in a Transfer"         |

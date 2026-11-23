@@ -8,11 +8,15 @@ and its chain gateway is read-only (`src/chain/read-only-gateway.ts`).
 ## Run
 
 ```bash
-docker compose up -d postgres anvil
-cp .env.example .env              # DEV ONLY values; every variable is documented there
+docker compose up -d
+pnpm install
+pnpm setup:local                  # migrate, deploy, register, write .env (DEV ONLY values)
 pnpm dev                          # api + worker; or only this app:
 pnpm --filter @bridge/api start
 ```
+
+Every variable is documented in `.env.example`. The full walkthrough is
+[docs/local-development.md](../../docs/local-development.md).
 
 Startup fails fast, before serving a request: the environment is validated (every problem listed
 by name, never a value; `packages/engine/src/env.ts`), a mainnet / testnet / unknown chain is
