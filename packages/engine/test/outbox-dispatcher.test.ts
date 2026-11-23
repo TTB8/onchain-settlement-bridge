@@ -379,8 +379,11 @@ describe('crashes and stale locks', () => {
       const [id] = await enqueue(1);
       let finishSlow!: () => void;
       const gate = new Promise<void>((r) => (finishSlow = r));
+      let enter!: () => void;
+      const entered = new Promise<void>((r) => (enter = r));
       const slow = dispatcher(
         handlerOf(async () => {
+          enter();
           await gate;
           if (outcome === 'throw') throw new Error('late');
           return { failed: 'late' };
@@ -388,9 +391,12 @@ describe('crashes and stale locks', () => {
         { workerId: 'slow' },
       );
       const slowRun = slow.runOnce();
-      for (let i = 0; i < 100 && (await rowOf(id as string)).status !== 'processing'; i += 1) {
-        await new Promise((r) => setTimeout(r, 20));
-      }
+      // Wait until the slow handler RUNS, not until the row reads `processing`. The claim commits
+      // first and the dispatcher renews the lease (locked_at = clock.now()) only just before the
+      // handler call: under load that renewal could run after the clock.advance below, so the
+      // row was not stale for the fast worker and the slow one ended `dead`, not `lostLease`
+      // (the parallel-run flake). Entering the handler proves the renewal used the old time.
+      await entered;
       clock.advance(LOCK_TIMEOUT);
       await dispatcher(
         handlerOf(async () => 'done'),
