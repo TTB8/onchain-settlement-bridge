@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "strictPropertyInitialization": true,
+    "types": ["jest", "node"],
+    "baseUrl": ".",
+    "paths": {
+      "@bridge/domain": ["../../packages/domain/src"],
+      "@bridge/db": ["../../packages/db/src"],
+      "@bridge/chain": ["../../packages/chain/src"],
+      "@bridge/engine": ["../../packages/engine/src"],
+      "@bridge/engine/env": ["../../packages/engine/src/env"]
+    }
+  },
+  "ts-node": { "transpileOnly": true },
+  "include": ["src", "test"]
+}
