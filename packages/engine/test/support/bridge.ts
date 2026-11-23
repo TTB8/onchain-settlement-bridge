@@ -204,7 +204,7 @@ export function opRow(prisma: PrismaClient, id: string): Promise<Operation> {
 export function attemptsOf(prisma: PrismaClient, operationId: string): Promise<ChainAttempt[]> {
   return prisma.chainAttempt.findMany({
     where: { outbox: { operationId } },
-    orderBy: [{ submittedAt: 'asc' }, { id: 'asc' }],
+    orderBy: [{ nonce: 'asc' }, { bumpsSoFar: 'asc' }, { submittedAt: 'asc' }, { id: 'asc' }],
   });
 }
 

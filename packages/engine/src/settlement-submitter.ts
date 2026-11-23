@@ -131,7 +131,9 @@ export class SettlementSubmitter implements OutboxHandler {
 
     const [existing] = await this.prisma.chainAttempt.findMany({
       where: { outboxId: row.id },
-      orderBy: [{ submittedAt: 'desc' }, { id: 'desc' }],
+      // Newest = highest nonce, then most bumps (never by time alone: two attempts can share a
+      // timestamp, and then an id order would pick an arbitrary one).
+      orderBy: [{ nonce: 'desc' }, { bumpsSoFar: 'desc' }, { submittedAt: 'desc' }, { id: 'desc' }],
       take: 1,
     });
     if (existing !== undefined) {

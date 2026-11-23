@@ -334,7 +334,9 @@ export class TxMonitor {
     const attempts = await this.prisma.chainAttempt.findMany({
       where: { outbox: { operationId: op.id }, deploymentId: d.id },
       include: { outbox: { select: { call: true } } },
-      orderBy: [{ submittedAt: 'asc' }, { id: 'asc' }],
+      // Oldest first; the last one is the newest: highest nonce, then most bumps. Never by time
+      // alone (two attempts can share a timestamp, and then the id order is arbitrary).
+      orderBy: [{ nonce: 'asc' }, { bumpsSoFar: 'asc' }, { submittedAt: 'asc' }, { id: 'asc' }],
     });
     const receipts: (Receipt | null)[] = [];
     const observations: AttemptObservation[] = [];
