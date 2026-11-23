@@ -29,6 +29,7 @@ import {
   freePort,
   gatewayFor,
   holderTransferOnChain,
+  setHolderTransfersOnChain,
   setPausedOnChain,
   startAnvil,
   waitForReceipt,
@@ -240,7 +241,23 @@ describe('ViemChainGateway on anvil: the five calls and their events', () => {
     expect(await gw.getEvents({ fromBlock: -3n, toBlock: 0n })).toEqual([]);
   });
 
-  it('a holder-signed transfer shows up as a Transfer with no reference event', async () => {
+  it('a holder-signed transfer reverts HolderTransfersDisabled while the switch is off', async () => {
+    await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
+    const hash = (await holderTransferOnChain(
+      node,
+      deployment,
+      DEV_ROLES.alice,
+      bob,
+      ONE,
+    )) as TxHash;
+    expect(await waitForReceipt(gw, hash)).toMatchObject({
+      status: 'reverted',
+      revertReason: 'HolderTransfersDisabled',
+    });
+  });
+
+  it('with the switch on, a holder-signed transfer shows up as a Transfer with no reference event', async () => {
+    await setHolderTransfersOnChain(node, deployment, true);
     await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
     const hash = (await holderTransferOnChain(
       node,
@@ -266,6 +283,67 @@ describe('ViemChainGateway on anvil: the five calls and their events', () => {
     ]);
     // Not one of the bridge's transactions.
     expect(await gw.getTransaction(hash)).toBeNull();
+    await setHolderTransfersOnChain(node, deployment, false);
+  });
+
+  it("readReferenceUsed reads each contract's own set, at the head and at a past block", async () => {
+    const r = nextRef();
+    const before = await gw.getHeadBlock();
+    await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: r });
+    const afterToken = await gw.getHeadBlock();
+    expect(await gw.readReferenceUsed('token', r)).toBe(true);
+    expect(await gw.readReferenceUsed('registry', r)).toBe(false);
+    expect(await gw.readReferenceUsed('token', r, before)).toBe(false);
+    // The same ref is still free on the registry: the sets are separate.
+    await sendOk({ kind: 'setFrozen', account: carol, frozen: false, ref: r });
+    expect(await gw.readReferenceUsed('registry', r)).toBe(true);
+    expect(await gw.readReferenceUsed('registry', r, afterToken)).toBe(false);
+    // A reverted operation does not consume its reference.
+    const unused = nextRef();
+    await waitForReceipt(
+      gw,
+      await send({ kind: 'mint', to: devAddress('deployer'), amount: ONE, ref: unused }),
+    );
+    expect(await gw.readReferenceUsed('token', unused)).toBe(false);
+    await expect(gw.readReferenceUsed('token', '0x12')).rejects.toBeInstanceOf(ChainError);
+    await expect(gw.readReferenceUsed('vault' as 'token', r)).rejects.toBeInstanceOf(ChainError);
+  });
+
+  it('getNonce at a block is the count mined up to and including that block', async () => {
+    const start = await gw.getNonce('settlement');
+    const h1 = await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
+    const b1 = (await gw.getReceipt(h1))!.blockNumber;
+    await sendOk({ kind: 'mint', to: alice, amount: ONE, ref: nextRef() });
+    expect(await gw.getNonce('settlement', b1 - 1n)).toEqual({
+      confirmed: start.confirmed,
+      pending: start.confirmed,
+    });
+    expect(await gw.getNonce('settlement', b1)).toEqual({
+      confirmed: start.confirmed + 1,
+      pending: start.confirmed + 1,
+    });
+    // With a transaction waiting in the pool, a block read still ignores the pool.
+    await automine(false);
+    try {
+      await gw.submit({
+        signer: 'settlement',
+        call: { kind: 'mint', to: alice, amount: ONE, ref: nextRef() },
+        nonce: start.confirmed + 2,
+        fees: FEES,
+      });
+      const head = await gw.getHeadBlock();
+      expect(await gw.getNonce('settlement')).toEqual({
+        confirmed: start.confirmed + 2,
+        pending: start.confirmed + 3,
+      });
+      expect(await gw.getNonce('settlement', head)).toEqual({
+        confirmed: start.confirmed + 2,
+        pending: start.confirmed + 2,
+      });
+    } finally {
+      await mine();
+      await automine(true);
+    }
   });
 
   it('reads balances, supply and flags at a past block', async () => {
@@ -651,5 +729,103 @@ describe('ViemChainGateway on anvil: lookups', () => {
     expect(info).toMatchObject({ hash, signer: 'compliance', fees: FEES });
     expect(info?.blockNumber).toBe((await gw.getReceipt(hash))?.blockNumber);
     expect(carol as Address).toBe(devAddress('carol'));
+  });
+});
+
+describe('ViemChainGateway: the RPC URL never leaks', () => {
+  const TOKEN = 'tok3n-path-secret';
+  const everything = (value: unknown): string => {
+    const parts: string[] = [];
+    let current: unknown = value;
+    for (let depth = 0; current && depth < 12; depth += 1) {
+      parts.push(String(current), inspect(current, { depth: 8 }));
+      if (current instanceof Error) parts.push(current.stack ?? '', JSON.stringify(current));
+      current = (current as { cause?: unknown }).cause;
+    }
+    return parts.join('\n');
+  };
+
+  it('not in errors from a closed port, nor in inspect or JSON of the gateway', async () => {
+    const port = await freePort();
+    const dead = gatewayFor(node, deployment, {
+      rpcUrl: `http://127.0.0.1:${port}/v3/${TOKEN}?key=${TOKEN}`,
+      timeoutMs: 2_000,
+    });
+    const failures = await Promise.all(
+      [
+        dead.getChainId(),
+        dead.getHeadBlock(),
+        dead.readBalance(alice),
+        dead.submit({
+          signer: 'settlement',
+          call: { kind: 'mint', to: alice, amount: ONE, ref: nextRef() },
+          nonce: 0,
+          fees: FEES,
+        }),
+      ].map((p) =>
+        p.then(
+          () => new Error('unexpected success'),
+          (e: unknown) => e,
+        ),
+      ),
+    );
+    for (const failure of failures) {
+      expect(failure).toBeInstanceOf(ChainUnavailableError);
+      expect(everything(failure)).not.toContain(TOKEN);
+    }
+    expect(inspect(dead, { depth: 10, showHidden: true })).not.toContain(TOKEN);
+    expect(JSON.stringify(dead)).not.toContain(TOKEN);
+  });
+
+  it('not in errors from a live node that answers on that path', async () => {
+    const live = gatewayFor(node, deployment, { rpcUrl: `${node.url}/v3/${TOKEN}` });
+    // Whether anvil serves the path or refuses it, nothing the gateway throws may carry the URL.
+    const outcomes = await Promise.all(
+      [
+        live.getHeadBlock(),
+        live.readReferenceUsed('token', '0x12'),
+        live.submit({
+          signer: 'settlement',
+          call: { kind: 'mint', to: alice, amount: ONE, ref: nextRef() },
+          nonce: 0,
+          fees: FEES,
+        }),
+      ].map((p) =>
+        p.then(
+          (v) => v,
+          (e: unknown) => e,
+        ),
+      ),
+    );
+    const errors = outcomes.filter((o) => o instanceof Error);
+    expect(errors.length).toBeGreaterThan(0);
+    for (const error of errors) expect(everything(error)).not.toContain(TOKEN);
+  });
+});
+
+describe('ViemChainGateway: the chain-id check retries after an outage', () => {
+  it('a node unreachable on the first call is checked again once it is up', async () => {
+    const port = await freePort();
+    const late = new ViemChainGateway({
+      rpcUrl: `http://127.0.0.1:${port}`,
+      chainId: 31337,
+      registryAddress: deployment.registry,
+      tokenAddress: deployment.token,
+      signers: { settlement: devAccount(1), compliance: devAccount(2) },
+      timeoutMs: 2_000,
+    });
+    await expect(late.getHeadBlock()).rejects.toBeInstanceOf(ChainUnavailableError);
+    const second = await startAnvil([], { port });
+    try {
+      await expect(late.getHeadBlock()).resolves.toBe(0n);
+    } finally {
+      await second.stop();
+    }
+  });
+
+  it('a mismatch found once is remembered even after the node comes back with the same id', async () => {
+    const wrong = gatewayFor(node, deployment, { chainId: 7 });
+    await expect(wrong.getHeadBlock()).rejects.toBeInstanceOf(ChainIdMismatchError);
+    await expect(wrong.readTotalSupply()).rejects.toBeInstanceOf(ChainIdMismatchError);
   });
 });

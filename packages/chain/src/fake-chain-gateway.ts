@@ -135,7 +135,10 @@ interface ControlTx {
   seq: number;
   action:
     | { kind: 'transfer'; from: Address; to: Address; amount: bigint }
-    | { kind: 'pause'; paused: boolean };
+    | { kind: 'transferFrom'; spender: Address; from: Address; to: Address; amount: bigint }
+    | { kind: 'approve'; owner: Address; spender: Address; amount: bigint }
+    | { kind: 'pause'; paused: boolean }
+    | { kind: 'holderTransfers'; enabled: boolean };
 }
 
 type FakeTx = BridgeTx | ControlTx;
@@ -161,6 +164,10 @@ class WorldState {
   balances = new Map<Address, bigint>();
   totalSupply = 0n;
   paused = false;
+  /** `SettlementToken.holderTransfersEnabled`: false after deployment. */
+  holderTransfersEnabled = false;
+  /** ERC-20 allowances, keyed `owner:spender`. */
+  allowances = new Map<string, bigint>();
   nonces: Record<SignerName, number> = { settlement: 0, compliance: 0 };
 
   clone(): WorldState {
@@ -172,6 +179,8 @@ class WorldState {
     copy.balances = new Map(this.balances);
     copy.totalSupply = this.totalSupply;
     copy.paused = this.paused;
+    copy.holderTransfersEnabled = this.holderTransfersEnabled;
+    copy.allowances = new Map(this.allowances);
     copy.nonces = { ...this.nonces };
     return copy;
   }
@@ -182,6 +191,10 @@ class WorldState {
 
   isAllowed(account: Address): boolean {
     return this.verified.has(account) && !this.frozen.has(account);
+  }
+
+  allowance(owner: Address, spender: Address): bigint {
+    return this.allowances.get(`${owner}:${spender}`) ?? 0n;
   }
 }
 
@@ -347,9 +360,17 @@ export class FakeChainGateway implements ChainGateway {
     return address;
   }
 
-  async getNonce(signer: SignerName): Promise<{ confirmed: number; pending: number }> {
+  async getNonce(
+    signer: SignerName,
+    blockNumber?: bigint,
+  ): Promise<{ confirmed: number; pending: number }> {
     this.ensureAvailable();
     this.signerAddress(signer);
+    if (blockNumber !== undefined) {
+      // At a block, there is no pool: both counts are what was mined up to and including it.
+      const mined = this.stateAt(blockNumber).nonces[signer];
+      return { confirmed: mined, pending: mined };
+    }
     const confirmed = this.head.state.nonces[signer];
     let pending = confirmed;
     while (this.findPooled(signer, pending)) pending += 1;
@@ -420,6 +441,21 @@ export class FakeChainGateway implements ChainGateway {
   async readTotalSupply(blockNumber?: bigint): Promise<bigint> {
     this.ensureAvailable();
     return this.stateAt(blockNumber).totalSupply;
+  }
+
+  async readReferenceUsed(
+    contract: 'token' | 'registry',
+    ref: Bytes32,
+    blockNumber?: bigint,
+  ): Promise<boolean> {
+    this.ensureAvailable();
+    if (contract !== 'token' && contract !== 'registry') {
+      throw new ChainError(`unknown contract: ${String(contract)}`);
+    }
+    if (!isBytes32(ref)) throw new ChainError('readReferenceUsed: ref must be 32 bytes');
+    const state = this.stateAt(blockNumber);
+    const key = ref.toLowerCase() as Bytes32;
+    return contract === 'token' ? state.tokenRefs.has(key) : state.registryRefs.has(key);
   }
 
   async readCompliance(account: Address, blockNumber?: bigint): Promise<ComplianceStatus> {
@@ -508,9 +544,11 @@ export class FakeChainGateway implements ChainGateway {
   }
 
   /**
-   * A holder-signed plain ERC-20 `transfer` from `from` to `to`, outside the bridge: it emits only
-   * the standard `Transfer` event and no reference event. It is mined in the next block (at once
-   * under automine) and is still subject to the token's rules, so it can revert. Returns its hash.
+   * A holder-signed plain ERC-20 `transfer` from `from` to `to`, outside the bridge. It is mined in
+   * the next block (at once under automine). While holder transfers are switched off (the
+   * default, see `setHolderTransfersEnabled`) it reverts `HolderTransfersDisabled`; when on, it is
+   * subject to the token's other rules and, if it succeeds, emits only the standard `Transfer`
+   * event and no reference event. Returns its hash.
    */
   injectTransfer(from: Address, to: Address, amount: bigint): TxHash {
     if (!isPlainAddress(from) || !isPlainAddress(to) || !isUint256(amount)) {
@@ -522,6 +560,54 @@ export class FakeChainGateway implements ChainGateway {
       to: to.toLowerCase() as Address,
       amount,
     });
+  }
+
+  /**
+   * A holder-signed `approve(spender, amount)` by `owner`, mined in the next block (at once under
+   * automine). Reverts `HolderTransfersDisabled` while the switch is off, then `EnforcedPause`,
+   * then `NotAllowed` for the owner, then `ERC20InvalidSpender`. Emits no bridge event.
+   */
+  injectApprove(owner: Address, spender: Address, amount: bigint): TxHash {
+    if (!isPlainAddress(owner) || !isPlainAddress(spender) || !isUint256(amount)) {
+      throw new RangeError('injectApprove: invalid address or amount');
+    }
+    return this.addControl({
+      kind: 'approve',
+      owner: owner.toLowerCase() as Address,
+      spender: spender.toLowerCase() as Address,
+      amount,
+    });
+  }
+
+  /**
+   * A holder-approved `transferFrom(from, to, amount)` sent by `spender`, mined in the next block.
+   * Reverts `HolderTransfersDisabled` while the switch is off, then `NotAllowed` for the spender,
+   * then `ERC20InsufficientAllowance`, then the usual transfer checks. Emits only `Transfer`.
+   */
+  injectTransferFrom(spender: Address, from: Address, to: Address, amount: bigint): TxHash {
+    if (
+      !isPlainAddress(spender) ||
+      !isPlainAddress(from) ||
+      !isPlainAddress(to) ||
+      !isUint256(amount)
+    ) {
+      throw new RangeError('injectTransferFrom: invalid address or amount');
+    }
+    return this.addControl({
+      kind: 'transferFrom',
+      spender: spender.toLowerCase() as Address,
+      from: from.toLowerCase() as Address,
+      to: to.toLowerCase() as Address,
+      amount,
+    });
+  }
+
+  /**
+   * The admin calls `setHolderTransfersEnabled(enabled)`, mined in the next block (at once under
+   * automine). It never reverts and emits no bridge event. Off after deployment.
+   */
+  setHolderTransfersEnabled(enabled: boolean): TxHash {
+    return this.addControl({ kind: 'holderTransfers', enabled });
   }
 
   /**
@@ -555,6 +641,19 @@ export class FakeChainGateway implements ChainGateway {
   complianceOf(account: Address): ComplianceStatus {
     const key = account.toLowerCase() as Address;
     return { verified: this.head.state.verified.has(key), frozen: this.head.state.frozen.has(key) };
+  }
+
+  /** Whether the holder-signed ERC-20 path is switched on at the head. */
+  holderTransfersEnabled(): boolean {
+    return this.head.state.holderTransfersEnabled;
+  }
+
+  /** An ERC-20 allowance at the head. */
+  allowance(owner: Address, spender: Address): bigint {
+    return this.head.state.allowance(
+      owner.toLowerCase() as Address,
+      spender.toLowerCase() as Address,
+    );
   }
 
   /** Whether the token is paused at the head. */
@@ -787,17 +886,35 @@ export class FakeChainGateway implements ChainGateway {
     const events: EventBody[] = [];
     if (tx.type === 'control') {
       const { action } = tx;
-      if (action.kind === 'pause') {
-        if (action.paused && s.paused) throw new Revert('EnforcedPause');
-        if (!action.paused && !s.paused) throw new Revert('ExpectedPause');
-        s.paused = action.paused;
-        return events; // Paused/Unpaused are not bridge events
+      switch (action.kind) {
+        case 'pause':
+          if (action.paused && s.paused) throw new Revert('EnforcedPause');
+          if (!action.paused && !s.paused) throw new Revert('ExpectedPause');
+          s.paused = action.paused;
+          return events; // Paused/Unpaused are not bridge events
+        case 'holderTransfers':
+          s.holderTransfersEnabled = action.enabled;
+          return events; // HolderTransfersSet is not a bridge event
+        case 'transfer':
+          // SettlementToken.transfer -> ERC20.transfer -> _transfer(msg.sender, to, value)
+          if (!s.holderTransfersEnabled) throw new Revert('HolderTransfersDisabled');
+          this.transferInternal(s, action.from, action.to, action.amount, events);
+          return events;
+        case 'transferFrom':
+          // SettlementToken.transferFrom: switch, spender, then ERC20.transferFrom
+          if (!s.holderTransfersEnabled) throw new Revert('HolderTransfersDisabled');
+          if (!s.isAllowed(action.spender)) throw new Revert('NotAllowed');
+          this.spendAllowance(s, action.from, action.spender, action.amount);
+          this.transferInternal(s, action.from, action.to, action.amount, events);
+          return events;
+        case 'approve':
+          // SettlementToken.approve: switch, pause, owner, then ERC20._approve
+          if (!s.holderTransfersEnabled) throw new Revert('HolderTransfersDisabled');
+          if (s.paused) throw new Revert('EnforcedPause');
+          if (!s.isAllowed(action.owner)) throw new Revert('NotAllowed');
+          this.approveInternal(s, action.owner, action.spender, action.amount);
+          return events; // Approval is not a bridge event
       }
-      // ERC20.transfer -> _transfer(msg.sender, to, value)
-      if (action.from === zeroAddress) throw new Revert('ERC20InvalidSender');
-      if (action.to === zeroAddress) throw new Revert('ERC20InvalidReceiver');
-      this.update(s, action.from, action.to, action.amount, events);
-      return events;
     }
 
     const { call } = tx;
@@ -840,9 +957,8 @@ export class FakeChainGateway implements ChainGateway {
         return events;
       case 'settleTransfer':
         this.consumeTokenRef(s, call.ref, call.amount);
-        if (call.from === zeroAddress) throw new Revert('ERC20InvalidSender');
-        if (call.to === zeroAddress) throw new Revert('ERC20InvalidReceiver');
-        this.update(s, call.from, call.to, call.amount, events);
+        if (call.from === call.to) throw new Revert('SelfTransfer');
+        this.transferInternal(s, call.from, call.to, call.amount, events);
         events.push({
           kind: 'SettledTransfer',
           from: call.from,
@@ -852,6 +968,34 @@ export class FakeChainGateway implements ChainGateway {
         });
         return events;
     }
+  }
+
+  /** OpenZeppelin `ERC20._transfer`: zero sender, zero receiver, then `_update`. */
+  private transferInternal(
+    s: WorldState,
+    from: Address,
+    to: Address,
+    value: bigint,
+    events: EventBody[],
+  ): void {
+    if (from === zeroAddress) throw new Revert('ERC20InvalidSender');
+    if (to === zeroAddress) throw new Revert('ERC20InvalidReceiver');
+    this.update(s, from, to, value, events);
+  }
+
+  /** OpenZeppelin `ERC20._approve` (no event needed: Approval is not a bridge event). */
+  private approveInternal(s: WorldState, owner: Address, spender: Address, value: bigint): void {
+    if (owner === zeroAddress) throw new Revert('ERC20InvalidApprover');
+    if (spender === zeroAddress) throw new Revert('ERC20InvalidSpender');
+    s.allowances.set(`${owner}:${spender}`, value);
+  }
+
+  /** OpenZeppelin `ERC20._spendAllowance`: an infinite allowance is never decreased. */
+  private spendAllowance(s: WorldState, owner: Address, spender: Address, value: bigint): void {
+    const current = s.allowance(owner, spender);
+    if (current === maxUint256) return;
+    if (current < value) throw new Revert('ERC20InsufficientAllowance');
+    this.approveInternal(s, owner, spender, current - value);
   }
 
   /** `ComplianceRegistry._consume`. */

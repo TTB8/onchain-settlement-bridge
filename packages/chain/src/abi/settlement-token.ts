@@ -250,6 +250,19 @@ export const settlementTokenAbi = [
   },
   {
     type: 'function',
+    name: 'holderTransfersEnabled',
+    inputs: [],
+    outputs: [
+      {
+        name: '',
+        type: 'bool',
+        internalType: 'bool',
+      },
+    ],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     name: 'mint',
     inputs: [
       {
@@ -367,6 +380,19 @@ export const settlementTokenAbi = [
         name: 'account',
         type: 'address',
         internalType: 'address',
+      },
+    ],
+    outputs: [],
+    stateMutability: 'nonpayable',
+  },
+  {
+    type: 'function',
+    name: 'setHolderTransfersEnabled',
+    inputs: [
+      {
+        name: 'enabled',
+        type: 'bool',
+        internalType: 'bool',
       },
     ],
     outputs: [],
@@ -551,6 +577,19 @@ export const settlementTokenAbi = [
         type: 'bytes32',
         indexed: true,
         internalType: 'bytes32',
+      },
+    ],
+    anonymous: false,
+  },
+  {
+    type: 'event',
+    name: 'HolderTransfersSet',
+    inputs: [
+      {
+        name: 'enabled',
+        type: 'bool',
+        indexed: false,
+        internalType: 'bool',
       },
     ],
     anonymous: false,
@@ -856,8 +895,24 @@ export const settlementTokenAbi = [
   },
   {
     type: 'error',
+    name: 'HolderTransfersDisabled',
+    inputs: [],
+  },
+  {
+    type: 'error',
     name: 'InvalidReference',
     inputs: [],
+  },
+  {
+    type: 'error',
+    name: 'NotAContract',
+    inputs: [
+      {
+        name: 'account',
+        type: 'address',
+        internalType: 'address',
+      },
+    ],
   },
   {
     type: 'error',
@@ -880,6 +935,16 @@ export const settlementTokenAbi = [
         internalType: 'bytes32',
       },
     ],
+  },
+  {
+    type: 'error',
+    name: 'SelfTransfer',
+    inputs: [],
+  },
+  {
+    type: 'error',
+    name: 'ZeroAddress',
+    inputs: [],
   },
   {
     type: 'error',
