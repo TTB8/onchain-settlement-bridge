@@ -1,5 +1,6 @@
 import {
   canTransition,
+  InvalidInputError,
   InvalidTransitionError,
   isTerminal,
   journalKindFor,
@@ -276,6 +277,45 @@ describe('resolveRevert: the duplicate-submission rule', () => {
     expect(
       settlementDifferences(deposit, { kind: 'Minted', to: alice, amount: 999n }),
     ).toHaveLength(1);
+  });
+});
+
+describe('an operation whose type disagrees with its parties', () => {
+  const alice = addr(0xa);
+  const bob = addr(0xb);
+  // A deposit typed operation carrying transfer parties: the `from` check would silently vanish.
+  const inconsistent: SettlementExpectation = {
+    type: 'deposit',
+    amount: 5n,
+    parties: { type: 'transfer', from: bob, to: alice },
+  };
+  const mint = { kind: 'Minted', to: alice, amount: 5n } as const;
+
+  it('settlementDifferences throws InvalidInputError instead of comparing', () => {
+    expect(() => settlementDifferences(inconsistent, mint)).toThrow(InvalidInputError);
+    expect(() => settlementDifferences(inconsistent, mint)).toThrow(/disagrees/);
+  });
+
+  it('resolveRevert throws on every branch, never confirming', () => {
+    expect(() => resolveRevert(inconsistent, REFERENCE_ALREADY_USED, mint)).toThrow(
+      InvalidInputError,
+    );
+    expect(() => resolveRevert(inconsistent, REFERENCE_ALREADY_USED, null)).toThrow(
+      InvalidInputError,
+    );
+    expect(() =>
+      resolveRevert(
+        { type: 'withdrawal', amount: 5n, parties: { type: 'deposit', to: alice } },
+        undefined,
+        null,
+      ),
+    ).toThrow(InvalidInputError);
+  });
+
+  it('a consistent operation is still compared normally', () => {
+    expect(
+      settlementDifferences({ ...inconsistent, parties: { type: 'deposit', to: alice } }, mint),
+    ).toEqual([]);
   });
 });
 

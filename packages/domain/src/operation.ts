@@ -12,7 +12,7 @@
  *                               +--------FAIL------------+--FAIL--> failed --REVERSE--> reversed (terminal)
  */
 
-import { InvalidTransitionError } from './errors';
+import { InvalidInputError, InvalidTransitionError } from './errors';
 import type { Address } from './primitives';
 
 /** What an operation does with money. */
@@ -35,7 +35,8 @@ export type JournalKind = 'reserve' | 'settle' | 'reverse';
  * - `compliance_rejected`: a party was not allowed (caught before sending or by the chain).
  * - `duplicate_reference`: the chain says the reference is used, but shows no event for it.
  * - `reference_conflict`: the chain shows a settling event for the reference that does NOT match
- *   the operation (kind, party or amount). Never confirmed, never reversed: a person decides.
+ *   the operation (kind, party or amount). Decision: the engine FAILs the operation with this
+ *   reason so it is visible, and never reverses it (`mayReverse` refuses): a person decides.
  * - `retries_exhausted`: fee bumps or resubmissions ran out.
  * - `rejected`: refused before it was ever mined (by our own checks or by the node).
  */
@@ -156,14 +157,29 @@ export type SettlementDifference =
   | { readonly field: 'from' | 'to'; readonly expected: Address; readonly observed: Address };
 
 /**
+ * Throws `InvalidInputError` when an operation's `type` and `parties.type` disagree. Such an
+ * operation has no well-defined settling event: comparing a deposit's type with a transfer's
+ * parties could silently skip the `from` check and confirm the wrong event.
+ */
+function assertConsistentExpectation(op: SettlementExpectation): void {
+  if (op.type !== op.parties.type) {
+    throw new InvalidInputError(
+      `operation type '${op.type}' disagrees with its parties type '${op.parties.type}'`,
+    );
+  }
+}
+
+/**
  * Every way `event` fails to settle `op`: wrong kind, wrong amount, wrong sender or recipient.
  * Empty means the event is exactly the settlement of this operation. A wrong kind is reported
  * alone: comparing the fields of a different kind of event would be meaningless.
+ * Throws `InvalidInputError` when `op.type` and `op.parties.type` disagree.
  */
 export function settlementDifferences(
   op: SettlementExpectation,
   event: SettlingEventLike,
 ): readonly SettlementDifference[] {
+  assertConsistentExpectation(op);
   const expectedKind = SETTLING_EVENT[op.type];
   if (event.kind !== expectedKind) {
     return [{ field: 'kind', expected: expectedKind, observed: event.kind }];
@@ -191,9 +207,9 @@ export type RevertResolution =
   /** A real failure: apply FAIL with `reason`. Reversal is still gated by `mayReverse`. */
   | { readonly verdict: 'failed'; readonly event: 'FAIL'; readonly reason: FailureReason }
   /**
-   * The reference was consumed by an event that is NOT this operation's settlement. Do not CONFIRM
-   * and do not REVERSE: escalate to a person. If the operation is moved to `failed` for visibility,
-   * it is with reason `reference_conflict`, and `mayReverse` refuses it.
+   * The reference was consumed by an event that is NOT this operation's settlement. Never CONFIRM.
+   * Decision: the engine applies FAIL with reason `reference_conflict` (so the operation is visibly
+   * failed), never applies REVERSE (`mayReverse` refuses this reason), and escalates to a person.
    */
   | {
       readonly verdict: 'reference_conflict';
@@ -220,10 +236,14 @@ export const NOT_ALLOWED = 'NotAllowed';
  * reference" is not proof of settlement. The rule:
  *
  * - the event for the reference matches the operation exactly (kind for its type, every party, the
- *   amount): `confirm`, whatever this attempt reverted with (the chain is the record);
+ *   amount): `confirm`, whatever this attempt reverted with. Decision: the chain is the record, so
+ *   an exact settlement confirms even when this attempt failed for some other reason (e.g. it
+ *   arrived after the first attempt settled and the sender had since been frozen);
  * - an event exists but differs in any of those: `reference_conflict`, never auto-resolved;
  * - no event: a real failure, classified by the revert reason (`ReferenceAlreadyUsed` without an
  *   event is `duplicate_reference`, `NotAllowed` is `compliance_rejected`, anything else `reverted`).
+ *
+ * Throws `InvalidInputError` when `op.type` and `op.parties.type` disagree, whichever branch runs.
  *
  * @param op The operation the attempt was for.
  * @param reason The decoded contract error name, or undefined when it could not be decoded.
@@ -234,6 +254,7 @@ export function resolveRevert(
   reason: string | undefined,
   observedEvent: SettlingEventLike | null,
 ): RevertResolution {
+  assertConsistentExpectation(op);
   if (observedEvent !== null) {
     const differences = settlementDifferences(op, observedEvent);
     if (differences.length === 0) {
