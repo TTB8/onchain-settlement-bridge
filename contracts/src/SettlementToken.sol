@@ -22,7 +22,8 @@ import {ISettlementToken} from "./interfaces/ISettlementToken.sol";
 /// other check. The admin may switch it on with `setHolderTransfersEnabled`. When on, it is
 /// compliance-checked like every other movement, plus the `transferFrom` spender and the `approve`
 /// owner must be allowed and `approve` refuses while paused; it emits no reference event, which is
-/// how a reconciler recognizes it as a movement the ledger did not authorize. `mint`, `burn` and
+/// how a reconciler recognizes it as a movement the ledger did not authorize. The one exception is
+/// `approve(spender, 0)`: revoking an allowance is always accepted from the owner, in every state. `mint`, `burn` and
 /// `settleTransfer` use the internal `_mint`, `_burn` and `_transfer` and ignore the switch.
 ///
 /// Role blast radius: `DEFAULT_ADMIN_ROLE` grants and revokes every role and toggles the
@@ -137,15 +138,20 @@ contract SettlementToken is ISettlementToken, ERC20, AccessControl, Pausable {
         return super.transferFrom(from, to, value);
     }
 
-    /// @notice Sets the caller's allowance for `spender`. Reverts `HolderTransfersDisabled` unless
-    /// the holder-signed path is on, then `EnforcedPause` while paused, then `NotAllowed(owner)`
-    /// unless the owner (the caller) is allowed by the registry.
-    /// @dev The spender is checked when it spends, in `transferFrom`, not here.
+    /// @notice Sets the caller's allowance for `spender`. A non-zero `value` reverts
+    /// `HolderTransfersDisabled` unless the holder-signed path is on, then `EnforcedPause` while
+    /// paused, then `NotAllowed(owner)` unless the owner (the caller) is allowed by the registry.
+    /// A zero `value` (revoking) is always accepted from the owner, whatever the switch, the pause
+    /// or the owner's status, so a stale allowance can always be withdrawn; revoking grants nothing.
+    /// @dev The spender is checked when it spends, in `transferFrom`, not here. A zero spender still
+    /// reverts `ERC20InvalidSpender`.
     function approve(address spender, uint256 value) public override(ERC20, IERC20) returns (bool) {
-        _requireHolderTransfersEnabled();
-        _requireNotPaused();
-        address owner = _msgSender();
-        if (!registry.isAllowed(owner)) revert NotAllowed(owner);
+        if (value != 0) {
+            _requireHolderTransfersEnabled();
+            _requireNotPaused();
+            address owner = _msgSender();
+            if (!registry.isAllowed(owner)) revert NotAllowed(owner);
+        }
         return super.approve(spender, value);
     }
 

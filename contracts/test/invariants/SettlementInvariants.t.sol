@@ -17,7 +17,7 @@ contract SettlementInvariantsTest is BridgeTest {
         handler = new SettlementHandler(registry, token, admin, minter, settler, compliance, pauser);
         targetContract(address(handler));
 
-        bytes4[] memory selectors = new bytes4[](12);
+        bytes4[] memory selectors = new bytes4[](13);
         selectors[0] = SettlementHandler.mint.selector;
         selectors[1] = SettlementHandler.burn.selector;
         selectors[2] = SettlementHandler.settleTransfer.selector;
@@ -30,6 +30,7 @@ contract SettlementInvariantsTest is BridgeTest {
         selectors[9] = SettlementHandler.setFrozen.selector;
         selectors[10] = SettlementHandler.setPaused.selector;
         selectors[11] = SettlementHandler.setHolderTransfers.selector; // weighted: toggled often
+        selectors[12] = SettlementHandler.revoke.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 

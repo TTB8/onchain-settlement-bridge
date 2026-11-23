@@ -16,7 +16,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// before any other check until the admin calls `setHolderTransfersEnabled(true)`. When enabled,
 /// that path is compliance-checked (not paused; sender, receiver, `transferFrom` spender and
 /// `approve` owner all allowed by the registry) but emits no reference event, which is how an
-/// off-chain reconciler recognizes it as a movement the ledger did not authorize.
+/// off-chain reconciler recognizes it as a movement the ledger did not authorize. The single
+/// exception is `approve(spender, 0)`: revoking an allowance is accepted from the owner in every
+/// state, so a stale allowance can always be withdrawn.
 interface ISettlementToken is IERC20 {
     /// @notice Tokens were minted to `to` to settle a ledger deposit.
     event Minted(address indexed to, uint256 amount, bytes32 indexed ref);
@@ -87,7 +89,9 @@ interface ISettlementToken is IERC20 {
     /// @notice Switches the holder-signed ERC-20 path (`transfer`, `transferFrom`, `approve`) on or
     /// off. Restricted to `DEFAULT_ADMIN_ROLE`. Emits `HolderTransfersSet`.
     /// @dev Does not affect `mint`, `burn` or `settleTransfer`. Allowances granted while the path
-    /// was on survive a switch off and become usable again if it is switched back on.
+    /// was on survive a switch off and become usable again if it is switched back on, unless the
+    /// owner revokes them: `approve(spender, 0)` is accepted in every state (switch off, paused,
+    /// owner frozen or unverified).
     function setHolderTransfersEnabled(bool enabled) external;
 
     /// @notice Whether the holder-signed ERC-20 path is on. False after deployment.

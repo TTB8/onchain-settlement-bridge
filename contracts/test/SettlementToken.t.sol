@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {Vm} from "forge-std/Vm.sol";
@@ -713,5 +714,95 @@ contract SettlementTokenTest is BridgeTest {
         vm.expectRevert(abi.encodeWithSelector(ISettlementToken.ReferenceAlreadyUsed.selector, ref));
         token.settleTransfer(bob, bob, ONE, ref);
         vm.stopPrank();
+    }
+
+    // --- revoking an allowance is always possible ----------------------------------------------
+
+    /// @dev Grants carol an allowance from alice while everything is permissive.
+    function _grantCarol() internal {
+        _verify(carol);
+        _enableHolderTransfers();
+        vm.prank(alice);
+        token.approve(carol, ONE);
+        assertEq(token.allowance(alice, carol), ONE);
+    }
+
+    function _revokeCarol() internal {
+        vm.expectEmit(true, true, false, true, address(token));
+        emit IERC20.Approval(alice, carol, 0);
+        vm.prank(alice);
+        assertTrue(token.approve(carol, 0));
+        assertEq(token.allowance(alice, carol), 0);
+    }
+
+    function test_revokeWorksWithTheSwitchOff() public {
+        _grantCarol();
+        vm.prank(admin);
+        token.setHolderTransfersEnabled(false);
+        _revokeCarol();
+    }
+
+    function test_revokeWorksWhilePaused() public {
+        _grantCarol();
+        vm.prank(pauser);
+        token.pause();
+        _revokeCarol();
+    }
+
+    function test_revokeWorksForAFrozenOwner() public {
+        _grantCarol();
+        _freeze(alice);
+        _revokeCarol();
+    }
+
+    function test_revokeWorksForAnUnverifiedOwner() public {
+        _grantCarol();
+        vm.prank(compliance);
+        registry.setVerified(alice, false, _nextRef());
+        _revokeCarol();
+    }
+
+    function test_revokeWorksInEveryRestrictedStateAtOnce() public {
+        _grantCarol();
+        _freeze(alice);
+        vm.prank(pauser);
+        token.pause();
+        vm.prank(admin);
+        token.setHolderTransfersEnabled(false);
+        _revokeCarol();
+    }
+
+    function test_aZeroApprovalGrantsNothingAndStillRejectsAZeroSpender() public {
+        // Revoking when nothing was granted is a harmless no-op.
+        vm.prank(mallory);
+        assertTrue(token.approve(carol, 0));
+        assertEq(token.allowance(mallory, carol), 0);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InvalidSpender.selector, address(0))
+        );
+        vm.prank(alice);
+        token.approve(address(0), 0);
+    }
+
+    function test_aNonZeroApprovalIsStillRefusedInEachRestrictedState() public {
+        // The exemption is for zero only: one unit is refused with the switch off...
+        vm.expectRevert(ISettlementToken.HolderTransfersDisabled.selector);
+        vm.prank(alice);
+        token.approve(carol, 1);
+        // ...while paused...
+        _enableHolderTransfers();
+        vm.prank(pauser);
+        token.pause();
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vm.prank(alice);
+        token.approve(carol, 1);
+        vm.prank(pauser);
+        token.unpause();
+        // ...and for a restricted owner.
+        _freeze(alice);
+        vm.expectRevert(_notAllowed(alice));
+        vm.prank(alice);
+        token.approve(carol, 1);
     }
 }

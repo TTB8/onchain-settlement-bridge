@@ -276,6 +276,28 @@ contract DeployTest is Test {
         harness.exposedAssertRoleSeparation(84_532, deployer, cfg);
     }
 
+    function test_offAnvilComplianceMustDifferFromTheSettler() public {
+        Deploy.Config memory cfg = _config(_multisigAdmin());
+        cfg.settler = compliance;
+        vm.expectRevert(abi.encodeWithSelector(Deploy.ComplianceIsSettler.selector, compliance));
+        harness.exposedAssertRoleSeparation(84_532, deployer, cfg);
+    }
+
+    function test_offAnvilComplianceMustDifferFromThePauser() public {
+        Deploy.Config memory cfg = _config(_multisigAdmin());
+        cfg.pauser = compliance;
+        vm.expectRevert(abi.encodeWithSelector(Deploy.ComplianceIsPauser.selector, compliance));
+        harness.exposedAssertRoleSeparation(11_155_111, deployer, cfg);
+    }
+
+    function test_onAnvilComplianceMayShareEveryKey() public view {
+        Deploy.Config memory cfg = _config(address(0));
+        cfg.minter = compliance;
+        cfg.settler = compliance;
+        cfg.pauser = compliance;
+        harness.exposedAssertRoleSeparation(31_337, deployer, cfg);
+    }
+
     function test_offAnvilTheDeployerHoldsNoServiceRole() public {
         address multisig = _multisigAdmin();
         string[4] memory roles = ["compliance", "minter", "settler", "pauser"];
