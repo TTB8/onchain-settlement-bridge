@@ -20,10 +20,13 @@ balances, flags, nonces and historical reads all match.
 | `getChainId()`                                              | The chain id the node reports.                                                                                  |
 | `getHeadBlock()`                                            | The newest block number.                                                                                        |
 | `getBlock(n)`                                               | `{ number, hash, parentHash, timestamp }`, or `null` if there is no block `n` (for example after a reorg).      |
+| `deployment()`                                              | `{ chainId, token, registry }` this gateway is bound to (lowercase, local, never changes).                     |
 | `signerAddress(signer)`                                     | The lowercase address of `settlement` or `compliance`.                                                          |
 | `getNonce(signer, block?)`                                  | `{ confirmed, pending }`. The next free nonce is `pending`. At a block, both are the count mined up to and including it (no pool). |
 | `estimateFees()`                                            | `{ maxFeePerGas, maxPriorityFeePerGas }`: twice the base fee plus the tip.                                      |
 | `submit({ signer, call, nonce, fees })`                     | The tx hash, or a typed `ChainError` (see `src/errors.ts`). A call sent with the wrong signer is rejected. See "When a submit fails" below. |
+| `signTransaction({ signer, call, nonce, fees })`            | `{ hash, raw }`, with `hash = keccak256(raw)`. Signs only: nothing is sent, no nonce is allocated, no node needed. Identical input gives identical bytes. |
+| `sendRaw(raw)`                                              | Broadcasts exactly those bytes and returns the hash. Idempotent: bytes the node already holds or has mined return the hash. |
 | `getReceipt(hash)`                                          | `{ status, blockNumber, blockHash, revertReason? }`, or `null` while not mined. A revert is a receipt, not an error. |
 | `getTransaction(hash)`                                      | `{ signer, nonce, fees, blockNumber \| null }`, or `null` if the node does not know the hash (or it is not ours). |
 | `getEvents({ fromBlock, toBlock })`                         | `Minted`, `Burned`, `SettledTransfer`, `Transfer`, `VerificationSet` and `FrozenSet` from both contracts, in chain order. |
@@ -41,12 +44,39 @@ that cannot free it again.
 reverts `ReferenceAlreadyUsed` and your event index has no event for that reference, the index is
 incomplete: the operation (and the money) already moved.
 
+## Persist before broadcasting
+
+`submit` signs and sends in one call, so a crash between the two leaves no record of bytes that
+may already be on their way to a block. The engine uses the two halves instead:
+
+1. `signTransaction(request)` returns `{ hash, raw }`. It allocates nothing (the nonce and fees
+   are exactly the ones in the request) and contacts no node.
+2. Persist `{ hash, raw, nonce, fees, reference }` with the operation.
+3. `sendRaw(raw)`.
+4. After a crash, a timeout or any unknown outcome, `sendRaw(raw)` again with the SAME stored
+   bytes. That is always safe, any number of times:
+   - bytes the node already holds, or has already mined, return the hash;
+   - bytes it has forgotten (dropped, or reorged out and evicted) are accepted again.
+
+   It can never create a second transaction, because the bytes, and so the hash, are the same.
+
+`sendRaw` throws `NonceTooLowError` only when OTHER bytes used the nonce: it checks the node for
+this exact hash before it says so. Every other failure follows the same discipline as `submit`,
+below. Before signing, sending or reading for an operation, the engine compares the operation's
+binding with `deployment()`.
+
+The fake mirrors all of this, including `failNextSubmit` (which applies to `sendRaw` too),
+refusing bytes it cannot decode, bytes for another chain id, and senders it does not know. It
+has no keys, so its `raw` is a canonical encoding of the request rather than a real Ethereum
+transaction. The parity test checks that the behaviour matches Anvil and pins this one
+difference.
+
 ## When a submit fails
 
 The gateway fails safe. `SubmissionRejectedError` means only that THIS node refused THIS
 submission. It is used for an allowlist of answers: invalid signature or sender, intrinsic gas
 too low, a fee cap below the base fee, more gas than the block allows, a wrong chain id, a nonce
-gap, and a tip above the fee cap. It does not prove the transaction can never be mined: another
+gap, a tip above the fee cap, and bytes the node cannot decode. It does not prove the transaction can never be mined: another
 node, for example one behind the same load balancer, may already hold the same signed bytes. So
 an attempt that got `SubmissionRejectedError` STILL counts in the engine's `attemptCanStillMine`
 check and is kept until its nonce is final. Every other answer the gateway does not
