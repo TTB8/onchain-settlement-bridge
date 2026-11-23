@@ -154,6 +154,20 @@ expect_refusal "a tampered runtime code hash" "token runtime code differs from t
 cast rpc anvil_setCode "$token" "$original_code" --rpc-url "$rpc" >/dev/null
 mine 2
 
+# The token's immutable registry rewritten to another address in every slot: the masked code still
+# matches the artifact, so only the immutable check can catch it.
+immutable_offsets="$(python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1]))["deployedBytecode"]["immutableReferences"]; print(" ".join(str(x["start"]) for v in r.values() for x in v))' \
+  "$contracts_dir/out/SettlementToken.sol/SettlementToken.json")"
+rewired="$(python3 -I -c 'import sys; c=bytearray(bytes.fromhex(sys.argv[1][2:])); a=bytes(12)+bytes.fromhex(sys.argv[2][2:])
+for s in sys.argv[3].split(): c[int(s):int(s)+32]=a
+print("0x"+c.hex())' "$original_code" "$stranger" "$immutable_offsets")"
+cast rpc anvil_setCode "$token" "$rewired" --rpc-url "$rpc" >/dev/null
+mine 2
+expect_refusal "token code whose immutable points at another registry" \
+  "token immutable does not hold the recorded registry" 31337 "$rpc"
+cast rpc anvil_setCode "$token" "$original_code" --rpc-url "$rpc" >/dev/null
+mine 2
+
 # The genuine record.
 if run_promote 31337 "$rpc"; then
   if [[ ! -e "$P" ]] && python3 -I - "$F" "$T/pristine.json" <<'PY'; then
