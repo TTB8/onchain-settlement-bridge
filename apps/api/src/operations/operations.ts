@@ -102,9 +102,12 @@ export interface TransactionView {
   readonly hash: string;
   /** The signer's nonce. */
   readonly nonce: number;
-  /** signed, sent, mined, reverted, dropped or replaced (as last observed by the worker). */
+  /**
+   * The attempt row's status as the engine wrote it. The engine records signed / sent / dropped
+   * today, not mined: the operation's `status` and `confirmedBlock` are authoritative.
+   */
   readonly status: ChainAttempt['status'];
-  /** The block it was mined in, once observed; null before. Decimal string. */
+  /** The block it was mined in, when the engine recorded one (today it does not). */
   readonly blockNumber: string | null;
 }
 
@@ -115,7 +118,11 @@ export class TransactionDto {
   /** Nonce. */
   @ApiProperty({ example: 7 }) readonly nonce?: number;
   /** Status. */
-  @ApiProperty({ enum: ['signed', 'sent', 'mined', 'reverted', 'dropped', 'replaced'] })
+  @ApiProperty({
+    enum: ['signed', 'sent', 'mined', 'reverted', 'dropped', 'replaced'],
+    description:
+      "The attempt's last recorded status. Not a settlement signal: use the operation's status and confirmedBlock.",
+  })
   readonly status?: string;
   /** Block. */
   @ApiProperty({ nullable: true, type: String, example: '1234' })

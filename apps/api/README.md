@@ -78,8 +78,11 @@ Every operation response (`POST` deposits / withdrawals / transfers, `GET /v1/op
 user's list) carries `transactions`: each chain transaction the worker signed for it, as
 `{ hash, nonce, status, blockNumber }`, ordered by (nonce, fee bumps). It is empty until the worker
 signs; a fee bump or a resubmission adds an entry, and at most one of them settles the operation.
-`status` and `blockNumber` are what the worker last observed (`blockNumber` is a decimal string or
-null). The attempts are read through the operation's outbox rows, one query per page.
+`status` and `blockNumber` are the attempt row's observation columns as the engine wrote them; the
+engine currently records `signed` / `sent` / `dropped` but never `mined` or a block number, so a
+confirmed operation's transaction still shows `sent` with `blockNumber: null`. The operation's own
+`status` and `confirmedBlock` are authoritative; look the hash up on the node for the receipt. The
+attempts are read through the operation's outbox rows, one query per page.
 
 ### Balances
 

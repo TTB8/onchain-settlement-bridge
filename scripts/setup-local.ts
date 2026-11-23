@@ -21,9 +21,10 @@
  * the `@bridge/e2e` workspace package, which also holds its tests.
  */
 
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-import { parseSetupFlags } from './lib/local-env';
+import { parseEnvFile, parseSetupFlags } from './lib/local-env';
 import { RpcError, runSetupLocal, SetupRefusal } from './lib/setup';
 
 const USAGE = `usage: pnpm setup:local [--force] [--reset-db]
@@ -48,8 +49,11 @@ async function main(): Promise<number> {
     `setup:local: done. ${result.deployed ? 'Deployed' : 'Reused'} token ${result.token}, registry ${result.registry}.`,
   );
   console.log('');
+  const env = parseEnvFile(readFileSync(resolve(repoRoot, '.env'), 'utf8'));
+  const host = !env.API_HOST || env.API_HOST === '0.0.0.0' ? '127.0.0.1' : env.API_HOST;
+  const api = `http://${host}:${env.API_PORT || '3000'}`;
   console.log('Next:');
-  console.log('  pnpm dev     # API on http://127.0.0.1:3000 (Swagger at /docs) + the worker');
+  console.log(`  pnpm dev     # API on ${api} (Swagger at ${api}/docs) + the worker`);
   console.log('  pnpm demo    # in a second terminal, once pnpm dev is up');
   return 0;
 }
