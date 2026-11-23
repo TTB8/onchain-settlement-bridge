@@ -1128,7 +1128,8 @@ describe('review M-3: signed bytes are verified before they are stored', () => {
   });
 
   it('a nonce taken while signing outside the lock: the signature is discarded and the next nonce signed', async () => {
-    const rig = await makeRig(db.prisma);
+    // One row per claim, so the second worker can take B while the first is signing A.
+    const rig = await makeRig(db.prisma, { batchSize: 1 });
     const other = rig.makeEngine({ workerId: 'second-worker' });
     const alice = await verifiedUser(rig);
     const a = await deposit(rig, alice, 1n);
@@ -1139,10 +1140,12 @@ describe('review M-3: signed bytes are verified before they are stored', () => {
       await other.dispatcher.runOnce();
     };
     await rig.engine.dispatcher.runOnce();
+    expect(rig.chain.onSign).toBeUndefined(); // the hook ran
     const [ra] = await attemptsOf(db.prisma, a.id);
     const [rb] = await attemptsOf(db.prisma, b.id);
     expect(await attemptsOf(db.prisma, a.id)).toHaveLength(1);
     expect(ra?.nonce).not.toBe(rb?.nonce);
+    expect(ra?.nonce).toBe((rb?.nonce ?? 0) + 1); // B won the race for the first nonce
     // The stored bytes carry the stored nonce (never bytes signed for a nonce someone else took).
     const inspector = new FakeTransactionInspector(rig.chain);
     for (const at of [ra, rb]) {
