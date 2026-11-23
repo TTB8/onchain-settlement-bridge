@@ -98,7 +98,10 @@ export function detectReorg(
 
 /** Inputs to `nextScanRange`. */
 export interface ScanInputs {
-  /** The highest block whose events are stored. Use one below the deploy block to start. */
+  /**
+   * The highest block whose events are stored. To start, pass one below the first block to scan:
+   * `deployBlock - 1n`, or `-1n` to scan from genesis (block 0). Values below `-1n` are refused.
+   */
   readonly lastIndexed: bigint;
   /** The chain's newest block. */
   readonly head: bigint;
@@ -124,7 +127,8 @@ export interface ScanRange {
  * It never goes past `head` and never spans more than `maxBatch` blocks.
  *
  * `maxBatch` must be at least `depth`: otherwise, once caught up, every pass would start at the
- * tail and stop before the head, and the newest blocks would never be scanned.
+ * tail and stop before the head, and the newest blocks would never be scanned. `lastIndexed = -1n`
+ * means "nothing indexed yet, start from genesis". Both conventions were reviewed and accepted.
  */
 export function nextScanRange(inputs: ScanInputs): ScanRange | null {
   const { lastIndexed, head, depth, maxBatch } = inputs;

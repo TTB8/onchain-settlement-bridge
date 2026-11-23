@@ -387,7 +387,14 @@ function validateInput(input: ReconciliationInput): Map<Bytes32, LedgerOperation
  *
  * Operations still in flight (`ledger_reserved`, `submitted`) and confirmed after `atBlock` are
  * never reported missing: the chain is not expected to show them yet. A confirmed operation with no
- * recorded block is treated as due (fail closed: the ledger claims it settled).
+ * recorded block is treated as due (fail closed: the ledger claims it settled). An expected address
+ * whose chain balance was not read, or whose registry flags were not read, is reported with
+ * `observed: null` rather than assumed correct.
+ *
+ * What it does NOT check: that a settling event's block equals the operation's `confirmedBlock`,
+ * and that every settlement event has its matching ERC-20 `Transfer` (only the reverse direction,
+ * every Transfer explained by a settlement event, is checked). The balance and supply comparisons
+ * catch the money effect of either gap, but not its cause.
  */
 export function reconcile(input: ReconciliationInput): ReconciliationReport {
   const byRef = validateInput(input);
