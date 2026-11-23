@@ -528,6 +528,25 @@ contract DeployTest is Test {
         vm.setEnv("ALLOW_EOA_ADMIN", "false");
         vm.setEnv("HOLDER_TRANSFERS_ENABLED", "false");
 
+        // run() must check the wiring itself: make the token that is about to be deployed (its
+        // address follows from the broadcaster's nonce) deny that the minter holds its role.
+        Deploy script = new Deploy();
+        address nextToken = vm.computeCreateAddress(DEFAULT_SENDER, vm.getNonce(DEFAULT_SENDER) + 1);
+        vm.mockCall(
+            nextToken,
+            abi.encodeWithSignature(
+                "hasRole(bytes32,address)", keccak256("MINTER_ROLE"), DEFAULT_SENDER
+            ),
+            abi.encode(false)
+        );
+        vm.etch(nextToken, ""); // a mock gives an empty address stub code; the CREATE needs none
+        vm.expectRevert(
+            abi.encodeWithSelector(Deploy.DeploymentCheckFailed.selector, "minter role")
+        );
+        script.run();
+        vm.stopBroadcast(); // a reverted run leaves its broadcast open in a test
+        vm.clearMockedCalls();
+
         (ComplianceRegistry registry, SettlementToken token) = new Deploy().run();
         _assertRoles(
             registry,
