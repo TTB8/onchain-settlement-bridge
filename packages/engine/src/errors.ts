@@ -1,0 +1,181 @@
+/**
+ * @file Every way the engine can refuse a request or a state change, as typed errors.
+ *
+ * Why typed: the API maps each refusal to a different response (409 for an idempotency conflict,
+ * 422 for insufficient funds, 503 for "no active deployment"), and an operator alerts on some of
+ * them. Branching on message text would break the first time someone rewords one. Domain errors
+ * are translated here so callers of the engine never need to import `@bridge/domain` to react.
+ */
+
+import {
+  DomainError,
+  InsufficientFundsError as DomainInsufficientFunds,
+  InvalidTransitionError,
+  SelfTransferError,
+} from '@bridge/domain';
+
+/** Stable, machine-readable identifiers for each engine refusal. */
+export type EngineErrorCode =
+  | 'INVALID_REQUEST'
+  | 'INSUFFICIENT_FUNDS'
+  | 'SELF_TRANSFER'
+  | 'UNKNOWN_USER'
+  | 'NO_ACTIVE_DEPLOYMENT'
+  | 'DEPLOYMENT_MISMATCH'
+  | 'IDEMPOTENCY_CONFLICT'
+  | 'OPERATION_NOT_FOUND'
+  | 'VERSION_CONFLICT'
+  | 'ILLEGAL_TRANSITION'
+  | 'RETRIES_EXHAUSTED'
+  | 'LEDGER_SETUP';
+
+/** Base class of every error the engine throws on purpose. */
+export abstract class EngineError extends Error {
+  /** Stable identifier; safe to expose to API callers and to alert on. */
+  abstract readonly code: EngineErrorCode;
+
+  /**
+   * @param message What was refused and why (no secrets, no PII beyond ids).
+   * @param options `cause`: the underlying error, kept for logs.
+   */
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = new.target.name;
+  }
+}
+
+/** The request is malformed (bad amount, empty idempotency key, unknown type...). */
+export class InvalidRequestError extends EngineError {
+  readonly code = 'INVALID_REQUEST' as const;
+}
+
+/** A withdrawal or transfer asked for more than the user's available balance, read under lock. */
+export class InsufficientFundsError extends EngineError {
+  readonly code = 'INSUFFICIENT_FUNDS' as const;
+
+  /**
+   * @param available The available balance read under the row lock.
+   * @param requested The amount asked for.
+   */
+  constructor(
+    readonly available: bigint,
+    readonly requested: bigint,
+  ) {
+    super(`insufficient funds: available ${available}, requested ${requested}`);
+  }
+}
+
+/** A transfer names the same user on both sides. */
+export class SelfTransferRequestError extends EngineError {
+  readonly code = 'SELF_TRANSFER' as const;
+}
+
+/** A user, or one of their ledger accounts, does not exist. */
+export class UnknownUserError extends EngineError {
+  readonly code = 'UNKNOWN_USER' as const;
+}
+
+/**
+ * The configured chain has no active deployment. Fail closed: new work is never bound to a guess
+ * (ADR 0011). Usually means a redeploy is in progress.
+ */
+export class NoActiveDeploymentError extends EngineError {
+  readonly code = 'NO_ACTIVE_DEPLOYMENT' as const;
+}
+
+/**
+ * The chain's active deployment is not the token this engine was configured for. Switching
+ * deployment is a migration procedure, never something the engine follows silently (ADR 0011).
+ */
+export class DeploymentMismatchError extends EngineError {
+  readonly code = 'DEPLOYMENT_MISMATCH' as const;
+}
+
+/** The idempotency key was already used for a request with different content. */
+export class IdempotencyConflictError extends EngineError {
+  readonly code = 'IDEMPOTENCY_CONFLICT' as const;
+
+  /**
+   * @param idempotencyKey The reused key.
+   * @param existingOperationId The operation that already owns it.
+   */
+  constructor(
+    readonly idempotencyKey: string,
+    readonly existingOperationId: string,
+  ) {
+    super(
+      `idempotency key ${JSON.stringify(idempotencyKey)} was used for operation ` +
+        `${existingOperationId} with different content`,
+    );
+  }
+}
+
+/** No operation has the given id. */
+export class OperationNotFoundError extends EngineError {
+  readonly code = 'OPERATION_NOT_FOUND' as const;
+}
+
+/**
+ * The operation is not at the version (or status) the caller read: someone else moved it first.
+ * The caller must re-read and decide again; retrying blindly would act on stale evidence.
+ */
+export class VersionConflictError extends EngineError {
+  readonly code = 'VERSION_CONFLICT' as const;
+
+  /**
+   * @param operationId The operation.
+   * @param expectedVersion The version the caller read.
+   */
+  constructor(
+    readonly operationId: string,
+    readonly expectedVersion: number,
+  ) {
+    super(`operation ${operationId} is no longer at version ${expectedVersion}`);
+  }
+}
+
+/** The state machine has no such edge (checked before any database write). */
+export class IllegalTransitionError extends EngineError {
+  readonly code = 'ILLEGAL_TRANSITION' as const;
+}
+
+/** A transaction kept failing with a serialization failure or deadlock after every retry. */
+export class RetriesExhaustedError extends EngineError {
+  readonly code = 'RETRIES_EXHAUSTED' as const;
+
+  /**
+   * @param attempts How many times the transaction was tried.
+   * @param cause The last retryable error.
+   */
+  constructor(
+    readonly attempts: number,
+    cause: unknown,
+  ) {
+    super(`transaction still conflicting after ${attempts} attempt(s)`, { cause });
+  }
+}
+
+/** The ledger is not set up (no `fiat_clearing` account): run the seed. */
+export class LedgerSetupError extends EngineError {
+  readonly code = 'LEDGER_SETUP' as const;
+}
+
+/**
+ * Translates a domain refusal into the matching engine error, and returns anything else as it is.
+ * Unknown domain errors become `InvalidRequestError`: every domain refusal is about its input.
+ *
+ * @param err Whatever was thrown.
+ */
+export function fromDomainError(err: unknown): unknown {
+  if (!(err instanceof DomainError)) return err;
+  if (err instanceof DomainInsufficientFunds) {
+    return new InsufficientFundsError(err.available, err.requested);
+  }
+  if (err instanceof SelfTransferError) {
+    return new SelfTransferRequestError(err.message, { cause: err });
+  }
+  if (err instanceof InvalidTransitionError) {
+    return new IllegalTransitionError(err.message, { cause: err });
+  }
+  return new InvalidRequestError(err.message, { cause: err });
+}

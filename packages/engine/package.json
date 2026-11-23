@@ -1,0 +1,23 @@
+{
+  "name": "@bridge/engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The bridge engine, framework-free: the operation service (reserve funds, bind to the active deployment, enqueue the chain call, all in one transaction) and the outbox dispatcher (claim, hand off, back off, recover stale locks).",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "jest --runInBand",
+    "test:cov": "jest --runInBand --coverage"
+  },
+  "dependencies": {
+    "@bridge/chain": "workspace:*",
+    "@bridge/db": "workspace:*",
+    "@bridge/domain": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.15"
+  }
+}

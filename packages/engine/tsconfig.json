@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["jest", "node"],
+    "baseUrl": ".",
+    "paths": {
+      "@bridge/domain": ["../domain/src"],
+      "@bridge/db": ["../db/src"],
+      "@bridge/chain": ["../chain/src"]
+    }
+  },
+  "include": ["src", "test"]
+}
