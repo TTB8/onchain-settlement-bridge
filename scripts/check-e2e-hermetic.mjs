@@ -70,8 +70,10 @@ function cleanup() {
   if (cleaned) return;
   cleaned = true;
   for (const p of planted) {
-    // Only a file still holding exactly what we wrote is ours to remove.
-    if (existsSync(p) && readFileSync(p, 'utf8') === STALE[p.split('/').pop()]) unlinkSync(p);
+    // A path this script created is removed even if a leaking test rewrote it meanwhile (the
+    // snapshot comparison has already reported that as CHANGED): it never was the developer's.
+    // Paths that existed before are never touched.
+    if (existsSync(p)) unlinkSync(p);
   }
   server?.close();
 }
