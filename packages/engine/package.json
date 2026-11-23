@@ -14,7 +14,7 @@
     "@bridge/chain": "workspace:*",
     "@bridge/db": "workspace:*",
     "@bridge/domain": "workspace:*",
-    "viem": "2.57.16"
+    "viem": "2.58.3"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",
