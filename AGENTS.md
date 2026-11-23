@@ -10,7 +10,7 @@ This repo runs a **standard** harness (guides, in-session checks (guard, Stop ho
 - **Before you say done:** `python3 scripts/harness/verify.py fast` (the Stop hook and pre-commit run it for you). Before opening a PR: `python3 scripts/harness/verify.py full`. Never pass `--fix` to a check, and never edit a test just to make it pass.
 - **Stacks:**
   - `foundry`: `contracts`
-  - `node-ts`: `packages/domain`, `packages/chain`, `packages/db`, `packages/engine`
+  - `node-ts`: `packages/domain`, `packages/chain`, `packages/db`, `packages/engine`, `e2e`
   - `nestjs-prisma`: `apps/api`, `apps/worker`
 - **Risk zones:** changes here get stricter checks.
   - **onchain**: `contracts/src/**`, `contracts/script/**`, `packages/chain/src/**` (requires: zone-tests, reviewer-label)

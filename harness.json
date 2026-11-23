@@ -11,7 +11,7 @@
     },
     {
       "pack": "node-ts",
-      "paths": ["packages/domain", "packages/chain", "packages/db", "packages/engine"]
+      "paths": ["packages/domain", "packages/chain", "packages/db", "packages/engine", "e2e"]
     },
     {
       "pack": "nestjs-prisma",
