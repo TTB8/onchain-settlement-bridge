@@ -29,6 +29,8 @@
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "setup:local": "pnpm --silent --filter @bridge/e2e setup:local",
+    "demo": "pnpm --silent --filter @bridge/e2e demo",
     "start:api": "pnpm --filter @bridge/api start",
     "start:worker": "pnpm --filter @bridge/worker start",
     "lint": "eslint . && pnpm lint:sol",
@@ -38,6 +40,7 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "test:cov": "pnpm -r test:cov",
+    "test:e2e": "pnpm --filter @bridge/e2e test",
     "db:generate": "pnpm --filter @bridge/db db:generate",
     "db:seed": "pnpm --filter @bridge/db db:seed",
     "contracts:build": "cd contracts && forge build",
