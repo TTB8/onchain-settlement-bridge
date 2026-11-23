@@ -1,3 +1,11 @@
 packages:
   - 'packages/*'
   - 'apps/*'
+
+# Install scripts are denied by default. These are allowed because they fetch or build the
+# Prisma query engine and esbuild's native binary; nothing else may run code at install time.
+onlyBuiltDependencies:
+  - '@prisma/client'
+  - '@prisma/engines'
+  - esbuild
+  - prisma
