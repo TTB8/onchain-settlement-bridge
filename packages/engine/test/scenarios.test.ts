@@ -770,3 +770,83 @@ describe('submitter edges', () => {
     expect(rig.alarms.ofKind('settled_without_event')).toHaveLength(1);
   });
 });
+
+describe('each piece of reversal evidence blocks on its own (obligations 5, 6)', () => {
+  /** A failed deposit with no attempt (cancelled before sending), whose reference is then consumed by an exact mint outside the bridge. */
+  async function failedThenSettledOutside(rig: Rig) {
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 21n);
+    await rig.engine.operations.move({
+      operationId: dep.id,
+      from: 'ledger_reserved',
+      version: 0,
+      move: { event: 'FAIL', reason: 'rejected' },
+      at: rig.clock.now(),
+      note: 'cancelled before sending',
+    });
+    const { pending } = await rig.chain.getNonce('settlement');
+    await rig.chain.submit({
+      signer: 'settlement',
+      call: {
+        kind: 'mint',
+        to: alice.wallet as `0x${string}`,
+        amount: 21n,
+        ref: dep.ref as `0x${string}`,
+      },
+      nonce: pending,
+      fees: await rig.chain.estimateFees(),
+    });
+    return { alice, dep };
+  }
+
+  it('chainHasEventForRef: an indexed, not yet final settlement blocks the reversal; it then settles late', async () => {
+    const rig = await makeRig(db.prisma, { confirmationDepth: 3 });
+    const { alice, dep } = await failedThenSettledOutside(rig);
+    await rig.engine.indexer.runOnce();
+    // Not final: the contract's flag at the final block is still false, no attempt exists.
+    expect(
+      await rig.chain.readReferenceUsed(
+        'token',
+        dep.ref as `0x${string}`,
+        (await rig.chain.getHeadBlock()) - 2n,
+      ),
+    ).toBe(false);
+    await rig.engine.monitor.runOnce();
+    expect(await statusOf(dep.id)).toBe('failed');
+    rig.chain.mine(2);
+    await rig.engine.tick();
+    expect(await statusOf(dep.id)).toBe('confirmed');
+    expect(await balanceOf(db.prisma, alice.available)).toBe(21n);
+  });
+
+  it('referenceConsumedOnChain: a final consumed reference the index missed blocks the reversal', async () => {
+    const rig = await makeRig(db.prisma, { confirmationDepth: 2 });
+    const { dep } = await failedThenSettledOutside(rig);
+    rig.chain.mine(3);
+    for (let i = 0; i < 3; i += 1) await rig.engine.monitor.runOnce(); // no indexer pass
+    expect(await statusOf(dep.id)).toBe('failed');
+  });
+});
+
+describe('nonce allocation (obligation 1)', () => {
+  it('a nonce recorded but never broadcast is never handed to another operation', async () => {
+    const rig = await makeRig(db.prisma);
+    const alice = await verifiedUser(rig);
+    const a = await deposit(rig, alice, 1n);
+    rig.signer.crashNextBroadcast = new Error('died after the commit');
+    await rig.engine.dispatcher.runOnce();
+    const b = await deposit(rig, alice, 2n);
+    await rig.engine.dispatcher.runOnce(); // A is backing off; B is handled
+    const [ra] = await attemptsOf(db.prisma, a.id);
+    const [rb] = await attemptsOf(db.prisma, b.id);
+    expect(ra).toBeDefined();
+    expect(rb).toBeDefined();
+    expect(rb?.nonce).not.toBe(ra?.nonce);
+    rig.clock.advance(60_000);
+    await tickUntil(rig.engine, async () => (await statusOf(a.id)) === 'confirmed');
+    await rig.engine.tick();
+    expect(await statusOf(a.id)).toBe('confirmed');
+    expect(await statusOf(b.id)).toBe('confirmed');
+    expect(rig.chain.balanceOf(alice.wallet as `0x${string}`)).toBe(3n);
+  });
+});
