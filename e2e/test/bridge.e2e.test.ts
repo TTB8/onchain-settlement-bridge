@@ -143,12 +143,15 @@ describe('the bridge end to end on a real chain', () => {
       expect(view.transactions).toHaveLength(1);
       const tx = view.transactions[0];
       expect(tx.hash).toMatch(/^0x[0-9a-f]{64}$/);
-      const receipt = await s.rpc.call<{ status: string; to: string }>(
+      const receipt = await s.rpc.call<{ status: string; to: string; blockNumber: string }>(
         'eth_getTransactionReceipt',
         [tx.hash],
       );
       expect(receipt.status).toBe('0x1');
       expect(receipt.to.toLowerCase()).toBe(token());
+      // The confirming transaction is recorded as mined, at the receipt's block = confirmedBlock.
+      expect(tx).toMatchObject({ status: 'mined', blockNumber: view.confirmedBlock });
+      expect(BigInt(receipt.blockNumber).toString()).toBe(view.confirmedBlock);
       expect(await expectLedgerEqualsChain()).toEqual(expected);
     }
 
@@ -258,6 +261,11 @@ describe('the bridge end to end on a real chain', () => {
       view.transactions[0].hash,
     ]);
     expect(receipt.status).toBe('0x0'); // the registry refused it on chain
+    // A transaction that did not settle the operation is never shown as mined.
+    for (const t of view.transactions) {
+      expect(t.status).not.toBe('mined');
+      expect(t.blockNumber).toBeNull();
+    }
     const released = (await platform('GET', `/v1/users/${users.alice.id}/balances`)).body;
     expect(released).toMatchObject({ available: '650000', held: '0', expectedOnChain: '650000' });
     expect(await expectLedgerEqualsChain()).toEqual({ alice: 650_000n, bob: 250_000n });

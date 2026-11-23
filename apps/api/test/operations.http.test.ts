@@ -237,6 +237,12 @@ describe('deposit -> withdrawal -> transfer through the engine', () => {
       },
     ]);
     expect(read.body.transactions[0].hash).toMatch(/^0x[0-9a-f]{64}$/);
+    // The confirming transaction is recorded as mined at the operation's confirmed block.
+    expect(read.body.transactions[0]).toMatchObject({
+      status: 'mined',
+      blockNumber: read.body.confirmedBlock,
+    });
+    expect(read.body.confirmedBlock).toMatch(/^[0-9]+$/);
 
     // The list shows the same, and only this operation's attempts (one query for the page).
     const other = await deposit(erin.id, '5', 'dep-tx-2');

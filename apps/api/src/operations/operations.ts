@@ -103,11 +103,12 @@ export interface TransactionView {
   /** The signer's nonce. */
   readonly nonce: number;
   /**
-   * The attempt row's status as the engine wrote it. The engine records signed / sent / dropped
-   * today, not mined: the operation's `status` and `confirmedBlock` are authoritative.
+   * An observation: `mined` for the one transaction that carried the confirming event (recorded
+   * when the worker confirms the operation), otherwise the last broadcast status (signed / sent /
+   * dropped). The operation's `status` and `confirmedBlock` are authoritative.
    */
   readonly status: ChainAttempt['status'];
-  /** The block it was mined in, when the engine recorded one (today it does not). */
+  /** The confirming event's block for the `mined` transaction (= `confirmedBlock`); null otherwise. */
   readonly blockNumber: string | null;
 }
 
@@ -121,11 +122,17 @@ export class TransactionDto {
   @ApiProperty({
     enum: ['signed', 'sent', 'mined', 'reverted', 'dropped', 'replaced'],
     description:
-      "The attempt's last recorded status. Not a settlement signal: use the operation's status and confirmedBlock.",
+      "An observation, not a settlement signal: `mined` for the one transaction that carried the confirming event (recorded when the operation is confirmed), otherwise the last broadcast status (signed, sent, dropped). The operation's status and confirmedBlock are authoritative.",
   })
   readonly status?: string;
   /** Block. */
-  @ApiProperty({ nullable: true, type: String, example: '1234' })
+  @ApiProperty({
+    nullable: true,
+    type: String,
+    example: '1234',
+    description:
+      "For the `mined` transaction: the block of the confirming event (equal to the operation's confirmedBlock). Null for every other transaction.",
+  })
   readonly blockNumber?: string | null;
 }
 
