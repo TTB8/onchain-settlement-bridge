@@ -1,0 +1,439 @@
+// The bridge's PostgreSQL 16 schema.
+//
+// Prisma models the tables; the guarantees that matter for money live in SQL, in the migration
+// (`migrations/*/migration.sql`): balanced entries, no user overdraft, append-only history, legal
+// operation transitions, immutable chain attempts. Prisma cannot express those, so do not try to
+// change them here: change the SQL, and keep both in step with `prisma migrate diff`.
+//
+// Conventions: tables and columns are snake_case (raw SQL reads naturally); every timestamp is
+// `timestamptz` (UTC); every amount is a `bigint` in the token's smallest unit; every address and
+// hash is stored lowercase `0x`-prefixed hex and CHECKed.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountKind {
+  fiat_clearing
+  user_available
+  user_held
+  user_incoming
+
+  @@map("account_kind")
+}
+
+enum PostingSide {
+  debit
+  credit
+
+  @@map("posting_side")
+}
+
+enum JournalKind {
+  reserve
+  settle
+  reverse
+
+  @@map("journal_kind")
+}
+
+enum OperationType {
+  deposit
+  withdrawal
+  transfer
+
+  @@map("operation_type")
+}
+
+enum OperationStatus {
+  requested
+  ledger_reserved
+  submitted
+  confirmed
+  failed
+  reversed
+
+  @@map("operation_status")
+}
+
+enum FailureReason {
+  reverted
+  dropped
+  compliance_rejected
+  duplicate_reference
+  reference_conflict
+  retries_exhausted
+  rejected
+
+  @@map("failure_reason")
+}
+
+enum SignerName {
+  settlement
+  compliance
+
+  @@map("signer_name")
+}
+
+enum OutboxStatus {
+  pending
+  processing
+  done
+  dead
+
+  @@map("outbox_status")
+}
+
+enum AttemptStatus {
+  signed
+  sent
+  mined
+  reverted
+  dropped
+  replaced
+
+  @@map("attempt_status")
+}
+
+enum ComplianceAction {
+  verify
+  unverify
+  freeze
+  unfreeze
+
+  @@map("compliance_action")
+}
+
+enum ComplianceChangeStatus {
+  requested
+  submitted
+  confirmed
+  failed
+
+  @@map("compliance_change_status")
+}
+
+enum ChainEventKind {
+  Minted
+  Burned
+  SettledTransfer
+  Transfer
+  VerificationSet
+  FrozenSet
+
+  @@map("chain_event_kind")
+}
+
+enum ReconciliationStatus {
+  ok
+  mismatch
+
+  @@map("reconciliation_status")
+}
+
+/// One deployed pair of contracts (token + compliance registry) on one chain. Every operation,
+/// attempt, outbox row, indexed block and event is bound to exactly one deployment.
+model Deployment {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  chainId         BigInt   @map("chain_id")
+  tokenAddress    String   @map("token_address")
+  registryAddress String   @map("registry_address")
+  deploymentBlock BigInt   @map("deployment_block")
+  active          Boolean  @default(false)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operations         Operation[]
+  outboxMessages     OutboxMessage[]
+  signerStates       SignerState[]
+  chainAttempts      ChainAttempt[]
+  complianceChanges  ComplianceChange[]
+  indexedBlocks      IndexedBlock[]
+  indexerState       IndexerState?
+  chainEvents        ChainEvent[]
+  reconciliationRuns ReconciliationRun[]
+
+  @@unique([chainId, tokenAddress])
+  @@map("deployment")
+}
+
+/// A platform user, identified on chain by one wallet address.
+model User {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  walletAddress String   @unique @map("wallet_address")
+  verified      Boolean  @default(false)
+  frozen        Boolean  @default(false)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  accounts               Account[]
+  operations             Operation[]        @relation("OperationUser")
+  counterpartyOperations Operation[]        @relation("OperationCounterparty")
+  complianceChanges      ComplianceChange[]
+
+  @@map("app_user")
+}
+
+/// A ledger account. Its balance is never stored: read it from the `account_balance` view.
+/// `guardVersion` is NOT a balance: the overdraft guard bumps it to serialise concurrent spends
+/// of the same account (see the migration). Application code never writes it.
+model Account {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  kind         AccountKind
+  userId       String?     @map("user_id") @db.Uuid
+  guardVersion BigInt      @default(0) @map("guard_version")
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user     User?     @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  postings Posting[]
+
+  @@unique([kind, userId])
+  @@map("account")
+}
+
+/// A deposit, withdrawal or transfer. Status moves only along the legal edges (SQL trigger).
+model Operation {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  deploymentId       String          @map("deployment_id") @db.Uuid
+  type               OperationType
+  status             OperationStatus @default(requested)
+  userId             String          @map("user_id") @db.Uuid
+  counterpartyUserId String?         @map("counterparty_user_id") @db.Uuid
+  amount             BigInt
+  ref                String
+  confirmedBlock     BigInt?         @map("confirmed_block")
+  failureReason      FailureReason?  @map("failure_reason")
+  resubmitsSoFar     Int             @default(0) @map("resubmits_so_far")
+  idempotencyKey     String?         @unique @map("idempotency_key")
+  version            Int             @default(0)
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime        @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  deployment       Deployment      @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  user             User            @relation("OperationUser", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  counterpartyUser User?           @relation("OperationCounterparty", fields: [counterpartyUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  journalEntries   JournalEntry[]
+  outboxMessages   OutboxMessage[]
+
+  @@unique([deploymentId, ref])
+  @@unique([id, deploymentId, ref])
+  @@index([userId])
+  @@index([counterpartyUserId])
+  @@index([deploymentId, status])
+  @@map("operation")
+}
+
+/// One step (reserve, settle, reverse) of one operation. Append-only.
+/// `sealedTx` is the id of the transaction that created the entry (set by the database): postings
+/// may only be added in that same transaction, so a committed entry can never grow.
+model JournalEntry {
+  id          String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  operationId String              @map("operation_id") @db.Uuid
+  kind        JournalKind
+  sealedTx    Unsupported("xid8") @default(dbgenerated("pg_current_xact_id()")) @map("sealed_tx")
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  postings  Posting[]
+
+  @@unique([operationId, kind])
+  @@map("journal_entry")
+}
+
+/// One line of a journal entry. Append-only.
+model Posting {
+  id        String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entryId   String      @map("entry_id") @db.Uuid
+  accountId String      @map("account_id") @db.Uuid
+  side      PostingSide
+  amount    BigInt
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  entry   JournalEntry @relation(fields: [entryId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  account Account      @relation(fields: [accountId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([entryId])
+  @@index([accountId])
+  @@map("posting")
+}
+
+/// A contract call waiting to be signed and sent. Exactly one of operationId /
+/// complianceChangeId is set, and its deployment, ref and signer are bound to that row by
+/// composite foreign keys.
+model OutboxMessage {
+  id                 String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  deploymentId       String       @map("deployment_id") @db.Uuid
+  signer             SignerName
+  /// The typed ContractCall; bigint amounts are decimal strings.
+  call               Json
+  ref                String
+  operationId        String?      @map("operation_id") @db.Uuid
+  complianceChangeId String?      @map("compliance_change_id") @db.Uuid
+  status             OutboxStatus @default(pending)
+  attemptsCount      Int          @default(0) @map("attempts_count")
+  availableAt        DateTime     @default(now()) @map("available_at") @db.Timestamptz(6)
+  lockedAt           DateTime?    @map("locked_at") @db.Timestamptz(6)
+  lockedBy           String?      @map("locked_by")
+  createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  processedAt        DateTime?    @map("processed_at") @db.Timestamptz(6)
+
+  deployment       Deployment        @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  operation        Operation?        @relation(fields: [operationId, deploymentId, ref], references: [id, deploymentId, ref], onDelete: Restrict, onUpdate: Restrict)
+  complianceChange ComplianceChange? @relation(fields: [complianceChangeId, deploymentId, ref], references: [id, deploymentId, ref], onDelete: Restrict, onUpdate: Restrict)
+  attempts         ChainAttempt[]
+
+  @@unique([deploymentId, ref])
+  @@unique([id, deploymentId, signer, ref])
+  @@index([status, availableAt])
+  @@map("outbox_message")
+}
+
+/// The address each signer uses on a deployment. The engine locks this row FOR UPDATE while it
+/// allocates a nonce, so two workers never hand out the same nonce.
+model SignerState {
+  deploymentId String     @map("deployment_id") @db.Uuid
+  signer       SignerName
+  address      String
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([deploymentId, signer])
+  @@map("signer_state")
+}
+
+/// One signed transaction. Its identity (who, what, nonce, bytes, fees) never changes after
+/// insert and the row is never deleted; only the observation columns move.
+model ChainAttempt {
+  id                   String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  deploymentId         String        @map("deployment_id") @db.Uuid
+  outboxId             String        @map("outbox_id") @db.Uuid
+  signer               SignerName
+  nonce                Int
+  hash                 String        @unique
+  rawTransaction       String        @map("raw_transaction")
+  maxFeePerGas         BigInt        @map("max_fee_per_gas")
+  maxPriorityFeePerGas BigInt        @map("max_priority_fee_per_gas")
+  contractAddress      String        @map("contract_address")
+  ref                  String
+  status               AttemptStatus @default(signed)
+  blockNumber          BigInt?       @map("block_number")
+  blockHash            String?       @map("block_hash")
+  bumpsSoFar           Int           @default(0) @map("bumps_so_far")
+  submittedAt          DateTime      @default(now()) @map("submitted_at") @db.Timestamptz(6)
+  lastCheckedAt        DateTime?     @map("last_checked_at") @db.Timestamptz(6)
+
+  deployment Deployment    @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  outbox     OutboxMessage @relation(fields: [outboxId, deploymentId, signer, ref], references: [id, deploymentId, signer, ref], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([outboxId])
+  @@index([deploymentId, signer, nonce])
+  @@map("chain_attempt")
+}
+
+/// A requested change to a user's verified or frozen flag on the registry.
+model ComplianceChange {
+  id           String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  deploymentId String                 @map("deployment_id") @db.Uuid
+  userId       String                 @map("user_id") @db.Uuid
+  action       ComplianceAction
+  ref          String
+  status       ComplianceChangeStatus @default(requested)
+  createdAt    DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  deployment     Deployment      @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  user           User            @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  outboxMessages OutboxMessage[]
+
+  @@unique([deploymentId, ref])
+  @@unique([id, deploymentId, ref])
+  @@map("compliance_change")
+}
+
+/// A block the indexer has read. A reorg deletes the orphaned rows (and, by cascade, their events).
+model IndexedBlock {
+  deploymentId String   @map("deployment_id") @db.Uuid
+  number       BigInt
+  hash         String
+  parentHash   String   @map("parent_hash")
+  timestamp    DateTime @db.Timestamptz(6)
+
+  deployment Deployment   @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  events     ChainEvent[]
+
+  @@id([deploymentId, number])
+  @@unique([deploymentId, number, hash])
+  @@map("indexed_block")
+}
+
+/// How far the indexer has read, per deployment.
+model IndexerState {
+  deploymentId     String @id @map("deployment_id") @db.Uuid
+  lastIndexedBlock BigInt @map("last_indexed_block")
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@map("indexer_state")
+}
+
+/// One decoded log from an indexed block. Not append-only: a reorg removes it with its block.
+/// `amount` is numeric(78,0) so any uint256 the chain emits is stored faithfully; reconciliation,
+/// not the indexer, decides whether it is out of the ledger's range.
+model ChainEvent {
+  id           String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  deploymentId String         @map("deployment_id") @db.Uuid
+  blockNumber  BigInt         @map("block_number")
+  blockHash    String         @map("block_hash")
+  txHash       String         @map("tx_hash")
+  logIndex     Int            @map("log_index")
+  kind         ChainEventKind
+  fromAddress  String?        @map("from_address")
+  toAddress    String?        @map("to_address")
+  account      String?
+  amount       Decimal?       @db.Decimal(78, 0)
+  ref          String?
+  flagValue    Boolean?       @map("flag_value")
+
+  deployment Deployment   @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  block      IndexedBlock @relation(fields: [deploymentId, blockNumber, blockHash], references: [deploymentId, number, hash], onDelete: Cascade, onUpdate: Restrict)
+
+  @@unique([deploymentId, blockHash, logIndex])
+  @@index([deploymentId, blockNumber])
+  @@index([deploymentId, ref])
+  @@map("chain_event")
+}
+
+/// One reconciliation pass of the ledger against the chain.
+model ReconciliationRun {
+  id           String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  deploymentId String               @map("deployment_id") @db.Uuid
+  atBlock      BigInt               @map("at_block")
+  finalBlock   BigInt               @map("final_block")
+  status       ReconciliationStatus
+  mismatches   Json                 @default("[]")
+  summary      Json                 @default("{}")
+  startedAt    DateTime             @default(now()) @map("started_at") @db.Timestamptz(6)
+  finishedAt   DateTime?            @map("finished_at") @db.Timestamptz(6)
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([deploymentId, startedAt])
+  @@map("reconciliation_run")
+}
+
+/// Every state change, in order. Append-only.
+model AuditLog {
+  id        BigInt   @id @default(autoincrement())
+  at        DateTime @default(now()) @db.Timestamptz(6)
+  entity    String
+  entityId  String   @map("entity_id")
+  fromState String?  @map("from_state")
+  toState   String   @map("to_state")
+  txHash    String?  @map("tx_hash")
+  detail    Json     @default("{}")
+
+  @@index([entity, entityId])
+  @@map("audit_log")
+}

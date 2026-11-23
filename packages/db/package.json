@@ -1,0 +1,29 @@
+{
+  "name": "@bridge/db",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PostgreSQL schema for the bridge (Prisma) and the SQL guards that make the ledger's guarantees physical: balanced entries, no overdraft, append-only history, legal operation transitions.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "postinstall": "prisma generate",
+    "build": "prisma generate && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "jest --runInBand",
+    "test:cov": "jest --runInBand --coverage",
+    "db:generate": "prisma generate",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:seed": "pnpm run build && node dist/seed-cli.js"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/pg": "^8.23.1",
+    "jest": "^29.7.0",
+    "pg": "^8.23.1",
+    "prisma": "6.19.3",
+    "ts-jest": "^29.4.15"
+  }
+}
