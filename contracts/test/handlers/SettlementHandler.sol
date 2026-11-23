@@ -203,11 +203,23 @@ contract SettlementHandler is Test {
     }
 
     function approve(uint256 ownerSeed, uint256 spenderSeed, uint256 amount) external {
-        address owner = _actor(ownerSeed);
-        address spender = _actor(spenderSeed);
         // Sometimes an infinite approval, which transferFrom must not decrease.
-        amount = amount % 8 == 0 ? type(uint256).max : bound(amount, 0, 1e30);
-        bool expected = ghostHolderTransfers && !ghostPaused && ghostAllowed(owner);
+        _approve(
+            _actor(ownerSeed),
+            _actor(spenderSeed),
+            amount % 8 == 0 ? type(uint256).max : bound(amount, 0, 1e30)
+        );
+    }
+
+    /// @dev Kept as its own action so revocation is tried often, in every state: it must always
+    /// succeed.
+    function revoke(uint256 ownerSeed, uint256 spenderSeed) external {
+        _approve(_actor(ownerSeed), _actor(spenderSeed), 0);
+    }
+
+    function _approve(address owner, address spender, uint256 amount) private {
+        // A revocation (zero) is accepted in every state; anything else needs the full checks.
+        bool expected = amount == 0 || (ghostHolderTransfers && !ghostPaused && ghostAllowed(owner));
 
         vm.prank(owner);
         try token.approve(spender, amount) returns (bool ok) {

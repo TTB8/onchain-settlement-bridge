@@ -195,7 +195,8 @@ contract SettlementTokenFuzzTest is BridgeTest {
         address to,
         uint256 amount
     ) public {
-        amount = bound(amount, 0, MAX_AMOUNT);
+        // From 1: a zero approval is a revocation, which is accepted in every state (tested below).
+        amount = bound(amount, 1, MAX_AMOUNT);
         _mint(alice, MAX_AMOUNT);
 
         vm.startPrank(caller);
@@ -285,10 +286,13 @@ contract SettlementTokenFuzzTest is BridgeTest {
             token.pause();
         }
 
-        bool ok = !paused && verified && !frozen;
-        if (paused) {
+        // A zero approval (a revocation) is always accepted; anything else needs the full checks.
+        bool ok = amount == 0 || (!paused && verified && !frozen);
+        if (ok) {
+            // no revert expected
+        } else if (paused) {
             vm.expectRevert(Pausable.EnforcedPause.selector);
-        } else if (!ok) {
+        } else {
             vm.expectRevert(abi.encodeWithSelector(ISettlementToken.NotAllowed.selector, owner));
         }
         vm.prank(owner);
@@ -312,5 +316,38 @@ contract SettlementTokenFuzzTest is BridgeTest {
 
         assertFalse(token.referenceUsed(ref));
         assertEq(token.balanceOf(alice), MAX_AMOUNT);
+    }
+
+    function testFuzz_anOwnerCanAlwaysRevoke(
+        address owner,
+        address spender,
+        bool enabled,
+        bool verified,
+        bool frozen,
+        bool paused,
+        uint256 granted
+    ) public {
+        vm.assume(owner != address(0) && spender != address(0));
+        granted = bound(granted, 1, MAX_AMOUNT);
+        // Grant while everything is permissive, then move to the fuzzed state and revoke.
+        _enableHolderTransfers();
+        _verify(owner);
+        vm.prank(owner);
+        token.approve(spender, granted);
+
+        vm.prank(admin);
+        token.setHolderTransfersEnabled(enabled);
+        vm.startPrank(compliance);
+        registry.setVerified(owner, verified, _nextRef());
+        registry.setFrozen(owner, frozen, _nextRef());
+        vm.stopPrank();
+        if (paused) {
+            vm.prank(pauser);
+            token.pause();
+        }
+
+        vm.prank(owner);
+        assertTrue(token.approve(spender, 0));
+        assertEq(token.allowance(owner, spender), 0);
     }
 }
