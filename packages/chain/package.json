@@ -1,0 +1,22 @@
+{
+  "name": "@bridge/chain",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chain access behind one interface: a viem-backed gateway for real chains and an in-memory fake that can simulate reverts, dropped and stuck transactions, slow confirmations and reorgs.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "test:cov": "jest --coverage"
+  },
+  "dependencies": {
+    "viem": "2.57.16"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0"
+  }
+}
