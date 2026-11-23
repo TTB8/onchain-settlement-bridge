@@ -6,69 +6,134 @@ and an id source. No NestJS here; the API and worker apps wire these up.
 This is **piece A**: the operation service, the single status-move helper, and the outbox
 dispatcher. Piece B (submitter, confirmer, indexer, reconciler) builds on it.
 
-| Module                    | What it does                                                                                       |
-| ------------------------- | -------------------------------------------------------------------------------------------------- |
-| `operation-service.ts`    | `OperationService`: deposit / withdrawal / transfer requests, each ONE transaction                 |
-| `move-operation.ts`       | `moveOperation(tx, input)`: the only way an operation changes status                               |
-| `outbox-dispatcher.ts`    | `OutboxDispatcher`: claim, hand off to an `OutboxHandler`, back off, recover stale locks          |
-| `transaction.ts`          | `runTransaction`: one interactive transaction, retried a bounded number of times on 40001 / 40P01 |
-| `ledger-writes.ts`        | Shared writes: account resolution, journal entry + postings, audit row                             |
-| `errors.ts`               | Typed `EngineError`s, and the translation from domain errors                                       |
-| `ports.ts`                | `Clock`, `IdSource` and their production implementations                                         |
+| Module                 | What it does                                                                                       |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| `operation-service.ts` | `OperationService`: deposit / withdrawal / transfer requests, each ONE transaction                 |
+| `move-operation.ts`    | `moveOperation(tx, input)`: the only way an operation changes status, evidence checked             |
+| `outbox-dispatcher.ts` | `OutboxDispatcher`: claim, renew, hand off to an `OutboxHandler`, back off, recover stale leases   |
+| `transaction.ts`       | `runTransaction`: one interactive transaction, retried a bounded number of times on 40001 / 40P01 |
+| `ledger-writes.ts`     | Shared writes: account resolution, journal entry + postings, audit row                             |
+| `redact.ts`            | `sanitizeText` / `describeError`: URL-free, single-line, bounded error text                       |
+| `errors.ts`            | Typed `EngineError`s, and the translation from domain errors                                       |
+| `ports.ts`             | `Clock`, `IdSource` and their production implementations                                         |
 
 ## A request, step by step
 
 `OperationService.request` runs one transaction (READ COMMITTED by default, retried on conflicts):
 
-1. The **active** deployment of the configured chain, which must be the configured token
-   (`NoActiveDeploymentError`, `DeploymentMismatchError`). ADR 0011, obligation 17.
+1. The **active** deployment of the configured chain, read `FOR SHARE` (held until commit), which
+   must be the configured token (`NoActiveDeploymentError`, `DeploymentMismatchError`). ADR 0011,
+   obligation 17. The share lock means a racing deactivation either waits for this request and is
+   then refused by the database (the operation is not final), or commits first and this request
+   sees the row as inactive. The db insert guard takes the same lock, for every writer.
 2. The parties' accounts and wallets (`UnknownUserError`).
 3. `lockRows(tx, 'account', ...)` on every user account the reserve entry posts to, ascending id
    order. `fiat_clearing` is not locked: it is never overdraft-checked and locking it would
    serialise every deposit.
-4. Idempotency, after the lock: same key + same content returns the stored operation and writes
-   nothing (`replayed: true`); same key + different content is `IdempotencyConflictError`.
+4. Idempotency, after the lock, **per user** (unique on `(user_id, idempotency_key)`): same key and
+   same content returns the stored operation and writes nothing (`replayed: true`); same key and
+   different content is `IdempotencyConflictError`, which names only the requester's own operation
+   and never echoes the key. Two users may use the same key independently.
 5. The available balance read in the same transaction, under the lock, and the domain's
    `assertCanReserve` (`InsufficientFundsError`). Obligation 18.
 6. Operation (`ledger_reserved`, version 0, id = fresh UUID, `ref = referenceFromUuid(id)`), the
    domain's reserve entry and postings, ONE outbox row (signer `settlement`, the `ContractCall`
    with amounts as decimal strings), and an audit row. All or nothing.
 
+### Replays after a reconfiguration (review I-3)
+
+Step 1 runs before the idempotency lookup, so a replay is answered only while the engine's
+configured deployment is the chain's active one:
+
+- the engine still configured for an old token after a redeploy refuses every request, replays
+  included (`DeploymentMismatchError`); the caller retries once the engine is reconfigured;
+- an engine configured for the new deployment answers a replay of a request made on the old one
+  from the stored record: same operation, still bound to the OLD deployment (`deploymentId`,
+  `chainId`, `tokenAddress` in the result say so), nothing written, never re-bound;
+- while no deployment is active (mid-migration), every request, replays included, gets
+  `NoActiveDeploymentError`.
+
 ## Status moves
 
 `moveOperation(tx, { operationId, from, version, move, at, note, txHash? })`:
 
-- decides the next status with the domain's `transition`, or `confirmLate` for `CONFIRM_LATE`,
-  **before any query** (illegal edges never reach the database); `RESERVE` is refused (only the
-  service reserves, because only it reads the balance under lock);
-- updates with `WHERE id = ? AND version = <read> AND status = <read>` and writes
-  `version = <read> + 1` as a literal; zero rows means `VersionConflictError`;
+- decides the next status with the domain's `transition` (or `confirmLate`) and checks the move's
+  evidence **before any query**:
+  - `SUBMIT` is `{ kind: 'first' }` (from `ledger_reserved`), `'bump'` or
+    `{ kind: 'resubmit', resubmitsSoFar }` (from `submitted`);
+  - `CONFIRM` and `CONFIRM_LATE` need a `SettlementJudgement` with verdict `confirm` (from the
+    domain's `lateConfirmation` / `resolveRevert`); anything else, forged literals included, is
+    `EvidenceRefusedError`;
+  - `REVERSE` needs `ReversalEvidence`, and the domain's `mayReverse` must accept it;
+  - `RESERVE` is refused (only the service reserves, because only it reads the balance under lock);
+- updates with `WHERE id = ? AND version = <read> AND status = <read>` (plus, for REVERSE, the
+  stored `failure_reason` must equal `evidence.failureReason`; for a resubmit, `resubmits_so_far`
+  must equal the read value) and writes `version = <read> + 1` (and `resubmits_so_far = <read> + 1`)
+  as literals; zero rows is `VersionConflictError`, or `EvidenceRefusedError` when only the
+  failure reason differs;
 - writes the settle (CONFIRM, CONFIRM_LATE) or reverse (REVERSE) entry from `buildEntry`, after the
   status, in the same transaction;
+- on a FAIL from `ledger_reserved` and on every REVERSE, kills the operation's live outbox rows
+  (`pending` / `processing` -> `dead`, lease dropped, `last_error` says why), so nothing is ever
+  signed for an operation whose funds are released;
 - appends an audit row.
 
 It takes the caller's transaction, so piece B can write its chain attempt in the same commit.
 `OperationService.move(input)` wraps it in its own transaction for callers with nothing else to
-write. The caller of `REVERSE` must have checked `mayReverse`; of `CONFIRM_LATE`, `lateConfirmation`.
+write.
 
 ## The outbox dispatcher
 
 `runOnce()`:
 
-1. **Reap**: stale `processing` rows (lock older than `lockTimeoutMs`) with no attempts left become
-   `dead`, with an audit row.
+1. **Reap**: stale `processing` rows (lease older than `lockTimeoutMs`) with no attempts left
+   become `dead` ("lease expired"), with an audit row.
 2. **Claim**: one autocommit `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT n)`
    of due `pending` rows and stale `processing` rows: `processing`, `locked_at`, a per-claim lease
    token in `locked_by`, `attempts_count + 1`. Committed before any handler runs.
-3. **Handle** with no transaction open. `done`; `{ retryAt }` (a deliberate wait: the attempt is
-   given back); `{ failed }` (dead + audit row). A thrown error is an unknown outcome (ADR 0009):
-   retried after `baseMs * 2^(attempts-1)` capped at `maxMs`, and dead at `maxAttempts`.
-4. **Finish** fenced by the lease token: a worker whose lease was taken over changes nothing and
-   reports `lostLease`.
+3. Per row: **renew** the lease (`locked_at = now`, fenced by the token). If another worker took
+   the row while it waited behind slower rows of the batch, the renewal changes nothing and the
+   row is skipped: its handler is never called (`lostLease`).
+4. **Handle** with no transaction open, under a hard limit `handlerTimeoutMs` (must be below
+   `lockTimeoutMs`; the constructor refuses otherwise). The handler gets
+   `{ stillHolds(), signal }`: `stillHolds()` re-checks the lease (ours, still processing, not
+   stale) and `signal` aborts at the limit. Because each row is renewed just before its own
+   handler, a lease only has to cover one handler call, so `batchSize * handlerTimeoutMs` may
+   exceed `lockTimeoutMs`.
+5. **Outcomes**:
+   - `done`;
+   - `{ retryAt }`: a deliberate wait; the attempt is given back; the date is clamped to at least
+     `now + baseMs`; a row older than `maxWaitAgeMs` (since creation) is dead-lettered with an
+     audit row instead of waiting again;
+   - `{ failed: code, detail? }`: dead + audit row;
+   - a thrown error, a timeout, an Invalid Date or an unknown outcome is an UNKNOWN outcome
+     (ADR 0009): retried after `baseMs * 2^(attempts-1)` capped at `maxMs`, dead at `maxAttempts`.
+6. **Finish** fenced by the lease token: a worker whose lease was taken over changes nothing.
 
-The handler must be idempotent: a worker that stalls past `lockTimeoutMs` and then resumes, and the
-worker that took over, can both have called it. The single-use reference (ADR 0003) is what makes a
-second send harmless on chain; the lease fence makes sure only one outcome is recorded.
+Every error text written to `outbox_message.last_error` and to audit notes is
+`<ErrorClass>: <message>` (or `failed:<code>: <detail>`) with every URL replaced by
+`<redacted-url>` (plain, JSON-escaped and percent-encoded forms), control characters flattened,
+and at most 1000 characters.
+
+## Requirements for piece B (review I-2)
+
+The guarantees above hold only if the handler keeps to these:
+
+1. **Commit before broadcast.** Persist the signed attempt (`chain_attempt`, raw bytes, hash,
+   nonce, fees) and the SUBMIT move (`moveOperation`, kind `first` / `bump` / `resubmit`) in ONE
+   transaction, commit, and only then broadcast. A crash after the commit is recovered from the
+   stored bytes; a crash before it sent nothing.
+2. **Re-check the lease** with `context.stillHolds()` immediately before broadcasting, and stop if
+   it is false. Stop as well when `context.signal` is aborted.
+3. **Be idempotent per row.** A row can be handled again after a crash or a lease takeover; look
+   for an existing attempt for the row before signing a new one.
+4. **Never touch `resubmits_so_far`** except through `SUBMIT { kind: 'resubmit' }`.
+5. **Moves with evidence only.** CONFIRM / CONFIRM_LATE with the judgement from the domain,
+   REVERSE with `ReversalEvidence` gathered in the same pass (ADR 0012 items 5-8); a FAIL from
+   `ledger_reserved` and every REVERSE cancel the operation's live outbox row in the same
+   transaction (done by `moveOperation`), so do not re-enqueue for such an operation.
+6. **Outcomes.** Return `{ retryAt }` while waiting for finality, `{ failed: code }` only for a
+   definite refusal, and throw for anything unknown.
 
 ## Tests
 
@@ -83,19 +148,26 @@ pnpm --filter @bridge/engine test        # all tests
 pnpm --filter @bridge/engine test:cov    # with thresholds (90% statements/lines, 85% branches)
 ```
 
-| Obligation / property                         | Test (file: name)                                                                                     |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Exact journal + outbox per type               | operation-service: "deposit: ...", "withdrawal: ...", "transfer: ..."                                 |
-| 18: balance read under the lock               | operation-service: "N parallel withdrawals ...", "withdrawals and transfers racing ..."              |
-| Idempotent replay / conflict                  | operation-service: idempotency (5 tests, incl. concurrent copies and a same-key race across users)   |
-| 17: deployment binding                        | operation-service: "no active deployment ...", "the active token is not ...", "after a redeploy ..." |
-| 40001 retry and its bound                     | operation-service: "retries the whole transaction ...", "gives up with RetriesExhaustedError ..."    |
-| Atomicity                                     | operation-service: "a failure inserting into posting / outbox_message / audit_log ..."               |
-| Domain table first, version literal           | move-operation: "illegal edges are refused before the database is touched", "stale reads"            |
-| SKIP LOCKED, no double processing             | outbox-dispatcher: "skips a row another transaction has locked ...", "two dispatchers racing ..."   |
-| No transaction across the handler             | outbox-dispatcher: "claims due rows, commits the claim before the handler runs ..."                  |
-| Backoff, cap, unknown outcome = retry         | outbox-dispatcher: "doubles from baseMs ...", "a thrown error is a retry ... then dead at the cap"   |
-| Crash recovery, lease fence                   | outbox-dispatcher: "crashes and stale locks" (4 tests)                                              |
+| Obligation / property                     | Test (file: name)                                                                                          |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Exact journal + outbox per type           | operation-service: "deposit: ...", "withdrawal: ...", "transfer: ..."                                      |
+| 18: balance read under the lock           | operation-service: "N parallel withdrawals ...", "withdrawals and transfers racing ..."                    |
+| Idempotent replay / conflict, per user    | operation-service: idempotency (7 tests, incl. concurrent copies, per-user keys, no key echo)              |
+| 17: deployment binding                    | operation-service: "no active deployment ...", "the active token is not ...", "after a redeploy ..."       |
+| 17: deactivation racing a request         | operation-service: "request first: the deactivation waits ...", "deactivation first: the request waits ..." |
+| 40001 retry and its bound                 | operation-service: "retries the whole transaction ...", "gives up with RetriesExhaustedError ..."          |
+| Atomicity                                 | operation-service: "a failure inserting into posting / outbox_message / audit_log ..."                     |
+| Domain table first, version literal       | move-operation: "illegal edges are refused before the database is touched", "stale reads"                  |
+| Evidence-typed moves                      | move-operation: "evidence is checked by moveOperation itself (review M-3)"                                 |
+| Resubmit counter literal                  | move-operation: "SUBMIT first / bump / resubmit ..."                                                       |
+| Outbox cancelled on FAIL-before-send / REVERSE | move-operation: "FAIL records the reason ...", "a FAIL after sending leaves the outbox row alone ...", "a processing (claimed) outbox row is cancelled too ..." |
+| SKIP LOCKED, no double processing         | outbox-dispatcher: "skips a row another transaction has locked ...", "two dispatchers racing ..."         |
+| No transaction across the handler         | outbox-dispatcher: "claims due rows, commits the claim before the handler runs ..."                        |
+| Per-row renewal, stillHolds, timeout      | outbox-dispatcher: "leases are renewed per row and re-checkable (review M-2)" (4 tests)                    |
+| Backoff, cap, unknown outcome = retry     | outbox-dispatcher: "doubles from baseMs ...", "a thrown error is a retry ... then dead at the cap"         |
+| Redacted, bounded last_error              | outbox-dispatcher: "error text is recorded redacted and bounded"; units: "sanitizeText / describeError"   |
+| Bounded waits                             | outbox-dispatcher: "deliberate waits are bounded (review L-3)"                                             |
+| Crash recovery, lease fence               | outbox-dispatcher: "crashes and stale locks" (4 tests)                                                    |
 
 ## Using the workspace packages
 
