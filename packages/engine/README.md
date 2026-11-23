@@ -231,6 +231,12 @@ canonical hash of each event's block read from the node now.
 
 - A canonical settling event: `lateConfirmation` -> CONFIRM (CONFIRM_LATE if failed) with
   `confirmedBlock` = the event block; `reference_conflict` -> FAIL + escalation; `wait` -> wait.
+  In the CONFIRM / CONFIRM_LATE transaction, the attempt whose hash is the event's transaction
+  hash is marked `mined` with the event's block number and hash (`recordConfirmingAttempt`,
+  fenced on id and hash); other attempts of the operation keep their status. **Observation
+  only**: no decision reads an attempt's `status` / `block_number` / `block_hash` (verdicts come
+  from the node and the indexed events). Pinned by `attempt-observation.test.ts`, which runs the
+  same situations with those columns forged `mined` and cleared and requires identical decisions.
 - `submitted`, no event: `assessAttempt` per attempt. Mined (final or not) -> wait for the event
   (alarm `settled_without_event` if final). Final revert -> `resolveRevert` -> FAIL with its
   reason (`duplicate_reference` escalated). Newest attempt: `stuck_bump` -> same nonce, bumped

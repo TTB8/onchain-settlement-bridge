@@ -239,7 +239,16 @@ describe('pnpm setup:local', () => {
       const cleanOut = demoLogs.join('\n');
       expect(cleanOut).toContain('CLEAN: 0 mismatches');
       expect(cleanOut).toMatch(/deposit 100\.000000 to alice: ledger_reserved -> .*confirmed/);
-      expect(cleanOut.match(/ {2}tx 0x[0-9a-f]{64} \(nonce \d+, \w+\)/g)).toHaveLength(3);
+      // Each operation's confirming transaction, with its block, equal to the operation's.
+      const txLines = cleanOut.match(/ {2}tx 0x[0-9a-f]{64} \(nonce \d+, mined in block \d+\)/g);
+      expect(txLines).toHaveLength(3);
+      const pairs = [
+        ...cleanOut.matchAll(
+          /: [a-z_ ->]+ \(block (\d+)\)\n {2}tx 0x[0-9a-f]{64} \(nonce \d+, mined in block (\d+)\)/g,
+        ),
+      ];
+      expect(pairs).toHaveLength(3); // operation line + its confirming tx line, three times
+      for (const m of pairs) expect(m[2]).toBe(m[1]);
       expect(cleanOut).toMatch(/alice +60\.000000 \| +60\.000000 {2}equal/);
       expect(cleanOut).toMatch(/bob +25\.000000 \| +25\.000000 {2}equal/);
 

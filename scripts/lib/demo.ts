@@ -8,7 +8,8 @@
  *    both allowed through the admin route (`POST /v1/admin/compliance-changes`, idempotent per
  *    wallet), waiting until each change is `confirmed`.
  * 3. deposit (alice) -> transfer (alice -> bob) -> withdrawal (bob), each waited for until
- *    `confirmed`, printing every status it passes through and its transaction hash(es).
+ *    `confirmed`, printing every status it passes through and its transaction hash(es), the
+ *    confirming one with its block (`mined in block N`).
  * 4. Both users' ledger balance (`expectedOnChain`) next to the token's `balanceOf` on the node.
  * 5. `POST /v1/admin/reconciliations`: `CLEAN: 0 mismatches`, or the mismatches. A run that is
  *    `unknown` (the index has not caught up yet) is retried until the deadline; `unknown` is never
@@ -147,6 +148,29 @@ export function describeRun(run: RunBody): string[] {
     ];
   }
   return [`UNKNOWN: ${run.error ?? 'no reason given'} (never treated as clean)`];
+}
+
+/** One entry of an operation's `transactions`, as the API returns it. */
+export interface TxView {
+  /** Hash. */
+  readonly hash: string;
+  /** Nonce. */
+  readonly nonce: number;
+  /** mined for the confirming transaction; otherwise the last broadcast status. */
+  readonly status: string;
+  /** The confirming block (decimal string) for the mined one; null otherwise. */
+  readonly blockNumber: string | null;
+}
+
+/**
+ * `tx 0x… (nonce 3, mined in block 14)`, or `tx 0x… (nonce 3, sent)` for a transaction that did
+ * not settle the operation (a replaced bump, for example).
+ *
+ * @param tx The transaction.
+ */
+export function describeTransaction(tx: TxView): string {
+  const where = tx.blockNumber !== null ? ` in block ${tx.blockNumber}` : '';
+  return `tx ${tx.hash} (nonce ${tx.nonce}, ${tx.status}${where})`;
 }
 
 /** A failure the demo explains in one line and stops on. */
@@ -299,9 +323,7 @@ export async function runDemo(o: DemoOptions): Promise<0 | 1> {
         },
       );
       log(`${what}: ${seen.join(' -> ')} (block ${op.confirmedBlock})`);
-      for (const tx of op.transactions as { hash: string; nonce: number; status: string }[]) {
-        log(`  tx ${tx.hash} (nonce ${tx.nonce}, ${tx.status})`);
-      }
+      for (const tx of op.transactions as TxView[]) log(`  ${describeTransaction(tx)}`);
     }
     facts.operationsConfirmed = true;
 

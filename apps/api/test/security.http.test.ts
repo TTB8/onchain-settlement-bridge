@@ -386,8 +386,16 @@ describe('OpenAPI', () => {
       '#/components/schemas/TransactionDto',
     );
     expect(operation.required).toContain('transactions');
-    const tx = doc.components.schemas.TransactionDto as { properties: Record<string, unknown> };
+    const tx = doc.components.schemas.TransactionDto as {
+      properties: Record<string, { description?: string }>;
+    };
     expect(Object.keys(tx.properties).sort()).toEqual(['blockNumber', 'hash', 'nonce', 'status']);
+    // Described honestly: an observation; the operation's status and confirmedBlock decide.
+    expect(tx.properties.status?.description).toMatch(/not a settlement signal/);
+    expect(tx.properties.status?.description).toMatch(
+      /status and confirmedBlock are authoritative/,
+    );
+    expect(tx.properties.blockNumber?.description).toMatch(/confirmedBlock/);
     expect(doc.paths['/v1/admin/reconciliations']?.post?.security).toEqual([{ 'admin-token': [] }]);
     // The deposit route says plainly that it mints and when it may be called.
     const depositDoc = deposit as unknown as { summary: string; description: string };

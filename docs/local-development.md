@@ -84,8 +84,8 @@ add up.
 
 ### A real run
 
-This transcript is from a clean stack. The API was on port 3100 because port 3000 was taken on
-that machine (see Troubleshooting). Output is trimmed only where marked.
+This transcript is from a clean stack (dev database dropped, Anvil restarted). Output is trimmed
+only where marked.
 
 ```text
 $ pnpm setup:local
@@ -103,23 +103,27 @@ setup:local:   promote-deployment: checking chain 31337 at block 7 (head 8, 1 co
 setup:local:   promote-deployment: chain 31337 verified at block 7; registry 0x5fbdb2315678afecb367f032d93f642f64180aa3, token 0xe7f1725e7734ce288f8367e1bb143e90bb3f0512.
 setup:local:   promote-deployment: wrote deployments/31337.json and removed the pending record
 setup:local: [7/8] registering the deployment and its signers in the database
-setup:local:   deployment e452fcdb-4862-4ea2-ad53-84eea0d4f5e5: token 0xe7f1725e7734ce288f8367e1bb143e90bb3f0512, registry 0x5fbdb2315678afecb367f032d93f642f64180aa3
+setup:local:   deployment 92b74ce3-a621-4183-90af-7b6373810f53: token 0xe7f1725e7734ce288f8367e1bb143e90bb3f0512, registry 0x5fbdb2315678afecb367f032d93f642f64180aa3
 setup:local: [8/8] .env
 setup:local:   wrote .env from .env.example (TOKEN_ADDRESS, REGISTRY_ADDRESS filled)
 setup:local: done. Deployed token 0xe7f1725e7734ce288f8367e1bb143e90bb3f0512, registry 0x5fbdb2315678afecb367f032d93f642f64180aa3.
 
+Next:
+  pnpm dev     # API on http://127.0.0.1:3000 (Swagger at http://127.0.0.1:3000/docs) + the worker
+  pnpm demo    # in a second terminal, once pnpm dev is up
+
 $ pnpm demo
-API http://127.0.0.1:3100 is ready
-user alice: 0x15d34aaf54267db7d7c367839aaf71a00a2c6a65 (id 4394cbae-aeac-4ece-9cbd-16c8f9be0716)
-user bob: 0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc (id 9e02183f-7d5a-4a22-a2c6-d76408aeb637)
+API http://127.0.0.1:3000 is ready
+user alice: 0x15d34aaf54267db7d7c367839aaf71a00a2c6a65 (id df683cdb-30c0-4e90-b8ca-0910b760f936)
+user bob: 0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc (id e4f8daec-c07f-4274-8f87-c99a478794e4)
 allow alice: confirmed (block 9)
 allow bob: confirmed (block 10)
-deposit 100.000000 to alice: ledger_reserved -> submitted -> confirmed (block 11)
-  tx 0xe9b422d0a10f7fe3fd9cf2c47b8920247adc875de10e69dc7c61c34bf8c9377a (nonce 0, sent)
+deposit 100.000000 to alice: ledger_reserved -> confirmed (block 11)
+  tx 0x23ebed69958798650d7fb74a461e05605904fbfb3e5e1f995b14f652e1a77e73 (nonce 0, mined in block 11)
 transfer 40.000000 alice -> bob: ledger_reserved -> confirmed (block 12)
-  tx 0x7717de61aaf298b803e383f0ee3dc88d3868f0e695f550fd74c4f4131055211a (nonce 1, sent)
+  tx 0x6b761ae1a920a8817268c3aed4f2ed3b6d58433b866ebf7f2ac963a1613d042e (nonce 1, mined in block 12)
 withdrawal 15.000000 by bob: ledger_reserved -> confirmed (block 13)
-  tx 0x984d10c9b0e90f4ead5d782e521db5fcb4c1ba5a58094ce53b68674b50ac5964 (nonce 2, sent)
+  tx 0x5727a2af194f818b6956f7c4af86be5994e27fe44a3763c780d865a4e1136d28 (nonce 2, mined in block 13)
 balances (ledger expectedOnChain | on chain):
   alice      60.000000 |      60.000000  equal
   bob        25.000000 |      25.000000  equal
@@ -128,11 +132,9 @@ reconciliation:
 demo: OK
 
 $ pnpm demo --rogue
-[... the same flow again ...]
-reconciliation:
-  CLEAN: 0 mismatches (final block 16)
+[... the same flow again, CLEAN at final block 16 ...]
 rogue: the dev minter 0x70997970c51812dc3a010c7d01b50e0d17dc79c8 mints 5.000000 to alice directly on the token, outside the bridge
-  tx 0x1cee42f4c85ba2a601eb3e88e8cb80bf3812871cd89853018a11693f8382a7fa (mined in block 17)
+  tx 0xc95ef7ddb8d73d58983eab37a4cf647d8cf19cd516d0b3887e06bf56eaf8129c (mined in block 17)
 reconciliation after the rogue mint:
   MISMATCH: 3 mismatches (final block 17)
     - unexpected_onchain_event (why=unknown_reference)
@@ -144,8 +146,10 @@ demo: OK
 ```
 
 A status the poller never saw (for example `submitted` on a fast local chain) is skipped in the
-progress line. The `sent` next to a hash is the attempt's recorded status. The engine does not
-record `mined` on attempts, so the operation's `confirmed` status and block are what count.
+progress line. Under each operation is the transaction that settled it: `mined in block N`, the
+same block as the operation's. If an operation needed a fee bump or a resubmission, its other
+transactions are listed with their last broadcast status (`sent`, `dropped`) and no block. Those
+are observations; the operation's `confirmed` status and block are what count.
 
 ## Tests
 

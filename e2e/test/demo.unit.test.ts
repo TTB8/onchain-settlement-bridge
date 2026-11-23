@@ -9,6 +9,7 @@ import {
   demoExitCode,
   type DemoFacts,
   describeRun,
+  describeTransaction,
   formatTokens,
 } from '../../scripts/lib/demo';
 import { DEV_ROLE_ADDRESSES } from '../../scripts/lib/local-env';
@@ -130,5 +131,19 @@ describe('formatTokens and the demo wallets', () => {
     const signers = Object.values(DEV_ROLE_ADDRESSES) as string[];
     expect(signers).not.toContain(DEMO_WALLETS.alice);
     expect(signers).not.toContain(DEMO_WALLETS.bob);
+  });
+});
+
+describe('describeTransaction', () => {
+  const hash = `0x${'ab'.repeat(32)}`;
+  it('prints the confirming block next to the mined transaction', () => {
+    expect(describeTransaction({ hash, nonce: 3, status: 'mined', blockNumber: '14' })).toBe(
+      `tx ${hash} (nonce 3, mined in block 14)`,
+    );
+  });
+  it('prints only the status for a transaction that did not settle the operation', () => {
+    expect(describeTransaction({ hash, nonce: 3, status: 'sent', blockNumber: null })).toBe(
+      `tx ${hash} (nonce 3, sent)`,
+    );
   });
 });
