@@ -374,6 +374,7 @@ describe('final block, reorgs and unknown runs (never a clean pass on bad reads)
     const rig = await rigFor({ confirmationDepth: 3 });
     const alice = await funded(rig, 10n);
     const dep = (await rig.engine.operations.requestDeposit(alice.id, 4n, randomUUID())).operation;
+    rig.clock.advance(1); // the deposit is sent (and mined) before the freeze
     const freeze = await rig.engine.compliance.requestFreeze({
       address: alice.wallet,
       reason: 'review',
@@ -385,6 +386,7 @@ describe('final block, reorgs and unknown runs (never a clean pass on bad reads)
     expect((await changeRow(freeze.change.id)).status).toBe('submitted');
     // At the head alice is frozen and holds 14; at the final block she is neither.
     expect(rig.chain.complianceOf(wallet(alice)).frozen).toBe(true);
+    expect(rig.chain.balanceOf(wallet(alice))).toBe(14n);
     const before = await reconcile(rig);
     expect(before.status).toBe('ok');
     rig.chain.reorg({ depth: 1 });
