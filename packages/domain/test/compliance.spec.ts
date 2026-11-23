@@ -21,7 +21,7 @@ import {
   judgeComplianceEvent,
   transitionComplianceChange,
 } from '../src';
-import { addr } from './support/fixtures';
+import { addr, bh, refOf } from './support/fixtures';
 
 const OK: ComplianceState = { verified: true, frozen: false };
 const FROZEN: ComplianceState = { verified: true, frozen: true };
@@ -223,47 +223,53 @@ describe('compliance change state machine', () => {
   });
 });
 
-describe('compliance events against changes (review M-2)', () => {
-  const change: ComplianceChangeContent = { account: alice, flag: 'frozen', value: true };
+describe('compliance events against changes (review M-2, N-2)', () => {
+  const REF = refOf(0x51);
+  const change: ComplianceChangeContent = { ref: REF, account: alice, flag: 'frozen', value: true };
+  const at = (blockNumber: bigint) => ({ blockNumber, blockHash: bh(`b${blockNumber}`) });
   const frozenSet = (
     account: Address,
     frozen: boolean,
     blockNumber = 98n,
-  ): ComplianceEventLike => ({
-    kind: 'FrozenSet',
-    account,
-    frozen,
-    blockNumber,
-  });
-  const fin = { head: 100n, depth: 3 };
+    ref = REF,
+  ): ComplianceEventLike => ({ kind: 'FrozenSet', account, frozen, ref, ...at(blockNumber) });
+  const fin = {
+    head: 100n,
+    depth: 3,
+    canonicalBlockHashes: new Map([97n, 98n, 99n, 100n].map((n) => [n, bh(`b${n}`)] as const)),
+  };
 
-  it('reads the change an event records', () => {
+  it('reads the change an event records, reference included', () => {
     expect(complianceEventContent(frozenSet(alice, true))).toEqual(change);
     expect(
       complianceEventContent({
         kind: 'VerificationSet',
         account: bob,
         verified: false,
-        blockNumber: 1n,
+        ref: REF,
+        ...at(1n),
       }),
-    ).toEqual({ account: bob, flag: 'verified', value: false });
+    ).toEqual({ ref: REF, account: bob, flag: 'verified', value: false });
   });
 
-  it('matches only on the same flag, account and value', () => {
+  it('matches only on the same reference, flag, account and value (each changed alone)', () => {
     expect(complianceEventMatches(change, frozenSet(alice, true))).toBe(true);
     expect(complianceEventMatches(change, frozenSet(bob, true))).toBe(false); // front-run account
     expect(complianceEventMatches(change, frozenSet(alice, false))).toBe(false);
+    // An identical change carried by another reference is not this change.
+    expect(complianceEventMatches(change, frozenSet(alice, true, 98n, refOf(0x52)))).toBe(false);
     expect(
       complianceEventMatches(change, {
         kind: 'VerificationSet',
         account: alice,
         verified: true,
-        blockNumber: 98n,
+        ref: REF,
+        ...at(98n),
       }),
     ).toBe(false);
   });
 
-  it('judges: wait until final, then confirm on a match or conflict otherwise', () => {
+  it('judges: wait until final and canonical, then confirm on a match or conflict otherwise', () => {
     expect(judgeComplianceEvent(change, frozenSet(alice, true, 99n), fin)).toEqual({
       verdict: 'wait',
     });
@@ -274,6 +280,20 @@ describe('compliance events against changes (review M-2)', () => {
     expect(judgeComplianceEvent(change, frozenSet(bob, true, 98n), fin)).toEqual({
       verdict: 'conflict',
     });
+    expect(judgeComplianceEvent(change, frozenSet(alice, true, 98n, refOf(0x52)), fin)).toEqual({
+      verdict: 'conflict',
+    });
+  });
+
+  it('an event from an orphaned block, or a block with no canonical hash, gives wait (N-2)', () => {
+    const orphan = { ...frozenSet(alice, true, 98n), blockHash: bh('orphan98') };
+    expect(judgeComplianceEvent(change, orphan, fin)).toEqual({ verdict: 'wait' });
+    expect(
+      judgeComplianceEvent(change, frozenSet(alice, true, 98n), {
+        ...fin,
+        canonicalBlockHashes: new Map(),
+      }),
+    ).toEqual({ verdict: 'wait' });
   });
 
   it('a change refused before sending can fail, and a failed one can confirm late', () => {

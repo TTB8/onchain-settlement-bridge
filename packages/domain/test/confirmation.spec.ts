@@ -2,6 +2,7 @@ import {
   assessAttempt,
   attemptCanStillMine,
   isFinal,
+  isFinalAndCanonical,
   mayReverse,
   type AttemptObservation,
   type AttemptPolicy,
@@ -10,6 +11,7 @@ import {
   InvalidInputError,
   isConfirmed,
 } from '../src';
+import { bh } from './support/fixtures';
 
 describe('confirmationsOf', () => {
   it('counts the mined block itself as one confirmation', () => {
@@ -414,7 +416,22 @@ describe('attemptCanStillMine (review M-1)', () => {
 
 describe('isFinal', () => {
   it('is final at exactly depth confirmations', () => {
-    expect(isFinal(98n, { head: 100n, depth: 3 })).toBe(true);
-    expect(isFinal(99n, { head: 100n, depth: 3 })).toBe(false);
+    expect(isFinal(98n, { head: 100n, depth: 3, canonicalBlockHashes: new Map() })).toBe(true);
+    expect(isFinal(99n, { head: 100n, depth: 3, canonicalBlockHashes: new Map() })).toBe(false);
+  });
+});
+
+describe('isFinalAndCanonical (review N-2)', () => {
+  const fin = {
+    head: 100n,
+    depth: 3,
+    canonicalBlockHashes: new Map([[98n, bh('b98')] as const, [99n, bh('b99')] as const]),
+  };
+
+  it('needs both depth and the canonical hash', () => {
+    expect(isFinalAndCanonical({ blockNumber: 98n, blockHash: bh('b98') }, fin)).toBe(true);
+    expect(isFinalAndCanonical({ blockNumber: 99n, blockHash: bh('b99') }, fin)).toBe(false);
+    expect(isFinalAndCanonical({ blockNumber: 98n, blockHash: bh('orphan') }, fin)).toBe(false);
+    expect(isFinalAndCanonical({ blockNumber: 97n, blockHash: bh('b97') }, fin)).toBe(false);
   });
 });

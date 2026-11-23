@@ -1,5 +1,6 @@
 import {
   type Address,
+  type Bytes32,
   type ComplianceState,
   InvalidInputError,
   type LedgerOperationView,
@@ -382,7 +383,13 @@ describe('reconcile', () => {
   });
 
   describe('compliance events (M-3)', () => {
-    const change = (account: Address, flag: 'verified' | 'frozen', value: boolean) => ({
+    const change = (
+      ref: Bytes32,
+      account: Address,
+      flag: 'verified' | 'frozen',
+      value: boolean,
+    ) => ({
+      ref,
       account,
       flag,
       value,
@@ -402,7 +409,7 @@ describe('reconcile', () => {
             ref: refOf(51),
           },
         ],
-        knownComplianceChanges: new Map([[refOf(51), change(bob, 'verified', true)]]),
+        knownComplianceChanges: new Map([[refOf(51), change(refOf(51), bob, 'verified', true)]]),
       });
       expect(r.ok).toBe(true);
     });
@@ -430,7 +437,7 @@ describe('reconcile', () => {
           event: 'VerificationSet',
           ref: refOf(66),
           expected: null,
-          observed: change(mallory, 'verified', true),
+          observed: change(refOf(66), mallory, 'verified', true),
           txHash: txh(6),
           logIndex: 0,
           blockNumber: 15n,
@@ -446,21 +453,31 @@ describe('reconcile', () => {
           ...w.events,
           { ...pos(15, 6, 0), kind: 'FrozenSet', account: alice, frozen: true, ref: refOf(52) },
         ],
-        knownComplianceChanges: new Map([[refOf(52), change(mallory, 'frozen', true)]]),
+        knownComplianceChanges: new Map([[refOf(52), change(refOf(52), mallory, 'frozen', true)]]),
       });
       expect(r.mismatches).toEqual([
         expect.objectContaining({
           kind: 'compliance_event_mismatch',
           why: 'content_mismatch',
-          expected: change(mallory, 'frozen', true),
-          observed: change(alice, 'frozen', true),
+          expected: change(refOf(52), mallory, 'frozen', true),
+          observed: change(refOf(52), alice, 'frozen', true),
         }),
       ]);
     });
 
+    it('rejects a known-change map whose key is not the change reference (N-2)', () => {
+      const w = cleanWorld();
+      expect(() =>
+        reconcile({
+          ...w,
+          knownComplianceChanges: new Map([[refOf(55), change(refOf(56), bob, 'frozen', true)]]),
+        }),
+      ).toThrow(InvalidInputError);
+    });
+
     it('reports a known reference whose event writes another flag or value', () => {
       const w = cleanWorld();
-      const known = new Map([[refOf(53), change(bob, 'frozen', true)]]);
+      const known = new Map([[refOf(53), change(refOf(53), bob, 'frozen', true)]]);
       for (const ev of [
         { kind: 'FrozenSet', account: bob, frozen: false, ref: refOf(53) },
         { kind: 'VerificationSet', account: bob, verified: true, ref: refOf(53) },
@@ -723,7 +740,7 @@ describe('reconcile', () => {
           },
         ],
         knownComplianceChanges: new Map([
-          [refOf(54), { account: carol, flag: 'verified', value: true }],
+          [refOf(54), { ref: refOf(54), account: carol, flag: 'verified', value: true }],
         ]),
       });
       expect(r.mismatches).toEqual([

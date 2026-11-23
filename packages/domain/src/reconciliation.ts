@@ -348,29 +348,30 @@ function differenceMismatches(
 ): Mismatch[] {
   const where = { txHash: e.txHash, logIndex: e.logIndex, blockNumber: e.blockNumber };
   return differences.map((d): Mismatch => {
-    switch (d.field) {
-      case 'kind':
-        return unexpected(e, 'wrong_kind', op);
-      case 'amount':
-        return {
-          kind: 'amount_mismatch',
-          operationId: op.id,
-          ref: op.ref,
-          expected: d.expected,
-          observed: d.observed,
-          ...where,
-        };
-      default:
-        return {
-          kind: 'address_mismatch',
-          operationId: op.id,
-          ref: op.ref,
-          field: d.field,
-          expected: d.expected,
-          observed: d.observed,
-          ...where,
-        };
+    if (d.field === 'amount') {
+      return {
+        kind: 'amount_mismatch',
+        operationId: op.id,
+        ref: op.ref,
+        expected: d.expected,
+        observed: d.observed,
+        ...where,
+      };
     }
+    if (d.field === 'from' || d.field === 'to') {
+      return {
+        kind: 'address_mismatch',
+        operationId: op.id,
+        ref: op.ref,
+        field: d.field,
+        expected: d.expected,
+        observed: d.observed,
+        ...where,
+      };
+    }
+    // `kind` (or `ref`, which cannot differ here because events are looked up by reference): the
+    // event is not this operation's settlement at all.
+    return unexpected(e, 'wrong_kind', op);
   });
 }
 
@@ -416,6 +417,13 @@ function validateInput(input: ReconciliationInput): Map<Bytes32, LedgerOperation
       throw new InvalidInputError(`two operations share reference ${op.ref}`);
     }
     byRef.set(op.ref, op);
+  }
+  for (const [ref, change] of input.knownComplianceChanges) {
+    if (change.ref !== ref) {
+      throw new InvalidInputError(
+        `known compliance change keyed ${ref} carries reference ${change.ref}`,
+      );
+    }
   }
   let sum = 0n;
   for (const [address, amount] of input.expectedBalances) {

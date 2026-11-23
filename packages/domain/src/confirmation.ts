@@ -23,6 +23,7 @@
 
 import { FeeCapExceededError, InvalidInputError } from './errors';
 import { bumpFees, type Fees } from './gas';
+import type { Hex } from './primitives';
 
 function assertDepth(depth: number): bigint {
   if (!Number.isSafeInteger(depth) || depth < 1) {
@@ -46,17 +47,47 @@ export function isConfirmed(txBlock: bigint | null, head: bigint, depth: number)
   return confirmationsOf(txBlock, head) >= assertDepth(depth);
 }
 
-/** The chain position against which "final" is judged: the head and the confirmations required. */
+/**
+ * The chain position against which "final" is judged: the head, the confirmations required, and
+ * the canonical hash of the blocks an observation may come from.
+ */
 export interface Finality {
   /** The newest block number. */
   readonly head: bigint;
   /** Confirmations required before something counts (>= 1). */
   readonly depth: number;
+  /**
+   * The canonical hash at each block height an event may be from, read from the node at the time
+   * of the decision (never from the indexer's own records). A deep block number is not enough: a
+   * cached event from an orphaned block has a final-looking number and a different hash.
+   */
+  readonly canonicalBlockHashes: ReadonlyMap<bigint, Hex>;
 }
 
-/** Whether something in block `blockNumber` is final under `finality`. */
+/** Whether something in block `blockNumber` is deep enough under `finality` (by number only). */
 export function isFinal(blockNumber: bigint, finality: Finality): boolean {
   return isConfirmed(blockNumber, finality.head, finality.depth);
+}
+
+/** Where an observation was emitted: its block number and block hash. */
+export interface BlockPosition {
+  /** The block number. */
+  readonly blockNumber: bigint;
+  /** The block hash as observed. */
+  readonly blockHash: Hex;
+}
+
+/**
+ * Whether an observation is final AND on the canonical chain: its block is at least `depth` deep
+ * and its block hash is the canonical one at that height. A missing canonical hash counts as not
+ * canonical (fail closed). This is the test every settling or registry event must pass before the
+ * bridge acts on it.
+ */
+export function isFinalAndCanonical(position: BlockPosition, finality: Finality): boolean {
+  return (
+    isFinal(position.blockNumber, finality) &&
+    finality.canonicalBlockHashes.get(position.blockNumber) === position.blockHash
+  );
 }
 
 /** The fields of a receipt the classifier reads. Structurally compatible with the chain's `Receipt`. */

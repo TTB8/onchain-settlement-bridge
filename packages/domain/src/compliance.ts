@@ -8,7 +8,7 @@
  * treated as "not allowed": a check that cannot see its input must fail closed.
  */
 
-import { type Finality, isFinal } from './confirmation';
+import { type Finality, isFinalAndCanonical } from './confirmation';
 import {
   type ComplianceParty,
   ComplianceRejectedError,
@@ -17,7 +17,7 @@ import {
   InvalidTransitionError,
 } from './errors';
 import type { FailureReason, OperationParties, OperationStatus } from './operation';
-import type { Address } from './primitives';
+import type { Address, Bytes32, Hex } from './primitives';
 
 /** An address's standing in the registry. */
 export interface ComplianceState {
@@ -213,6 +213,8 @@ export function transitionComplianceChange(
  * what the bridge remembers per reference, so reconciliation can check every registry event.
  */
 export interface ComplianceChangeContent {
+  /** The change's single-use reference. Binds a registry event to exactly one change. */
+  readonly ref: Bytes32;
   /** The account whose flag changes. */
   readonly account: Address;
   /** Which registry flag. */
@@ -222,7 +224,14 @@ export interface ComplianceChangeContent {
 }
 
 /** The fields of a registry event that are compared with a change. Matches the chain's events. */
-export type ComplianceEventLike = { readonly blockNumber: bigint } & (
+export type ComplianceEventLike = {
+  /** The block the event is in. */
+  readonly blockNumber: bigint;
+  /** That block's hash as observed; judged against the canonical hash before it counts. */
+  readonly blockHash: Hex;
+  /** The reference the event carries. */
+  readonly ref: Bytes32;
+} & (
   | { readonly kind: 'VerificationSet'; readonly account: Address; readonly verified: boolean }
   | { readonly kind: 'FrozenSet'; readonly account: Address; readonly frozen: boolean }
 );
@@ -230,13 +239,14 @@ export type ComplianceEventLike = { readonly blockNumber: bigint } & (
 /** The change a registry event records: `VerificationSet` sets `verified`, `FrozenSet` sets `frozen`. */
 export function complianceEventContent(event: ComplianceEventLike): ComplianceChangeContent {
   return event.kind === 'VerificationSet'
-    ? { account: event.account, flag: 'verified', value: event.verified }
-    : { account: event.account, flag: 'frozen', value: event.frozen };
+    ? { ref: event.ref, account: event.account, flag: 'verified', value: event.verified }
+    : { ref: event.ref, account: event.account, flag: 'frozen', value: event.frozen };
 }
 
 /**
- * Whether a registry event is exactly the given change: the event kind's flag, the account and the
- * value all match. A known reference used for another account (a front-run) does not match.
+ * Whether a registry event is exactly the given change: the reference, the event kind's flag, the
+ * account and the value all match. A known reference used for another account (a front-run) does
+ * not match, and neither does an identical change carried by another reference.
  */
 export function complianceEventMatches(
   change: ComplianceChangeContent,
@@ -244,6 +254,7 @@ export function complianceEventMatches(
 ): boolean {
   const observed = complianceEventContent(event);
   return (
+    observed.ref === change.ref &&
     observed.flag === change.flag &&
     observed.account === change.account &&
     observed.value === change.value
@@ -257,7 +268,8 @@ export type ComplianceEventJudgement =
   | { readonly verdict: 'conflict' };
 
 /**
- * Judges a registry event carrying a change's reference: `wait` until it is final, then `confirm`
+ * Judges a registry event carrying a change's reference: `wait` until it is final and its block is
+ * canonical (an event cached from an orphaned block never counts), then `confirm`
  * if it matches the change exactly, else `conflict` (a person decides). The only evidence on which
  * the engine may apply `submitted:CONFIRM` or the gated `failed:CONFIRM`.
  */
@@ -266,7 +278,7 @@ export function judgeComplianceEvent(
   event: ComplianceEventLike,
   finality: Finality,
 ): ComplianceEventJudgement {
-  if (!isFinal(event.blockNumber, finality)) return { verdict: 'wait' };
+  if (!isFinalAndCanonical(event, finality)) return { verdict: 'wait' };
   return complianceEventMatches(change, event)
     ? { verdict: 'confirm', event: 'CONFIRM' }
     : { verdict: 'conflict' };

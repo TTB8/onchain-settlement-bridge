@@ -27,9 +27,9 @@
  * an absence of evidence.
  */
 
-import { type Finality, isFinal } from './confirmation';
+import { type Finality, isFinalAndCanonical } from './confirmation';
 import { InvalidInputError, InvalidTransitionError } from './errors';
-import type { Address } from './primitives';
+import type { Address, Bytes32, Hex } from './primitives';
 
 /** What an operation does with money. */
 export type OperationType = 'deposit' | 'withdrawal' | 'transfer';
@@ -148,7 +148,14 @@ export type SettlingEventKind = 'Minted' | 'Burned' | 'SettledTransfer';
  * its finality can be judged). Structurally a subset of the chain package's `Minted` / `Burned` /
  * `SettledTransfer` events, so those can be passed as they are.
  */
-export type SettlingEventLike = { readonly blockNumber: bigint } & (
+export type SettlingEventLike = {
+  /** The block the event is in. */
+  readonly blockNumber: bigint;
+  /** That block's hash as observed; judged against the canonical hash before it counts. */
+  readonly blockHash: Hex;
+  /** The reference the event carries. Binds the event to exactly one operation. */
+  readonly ref: Bytes32;
+} & (
   | { readonly kind: 'Minted'; readonly to: Address; readonly amount: bigint }
   | { readonly kind: 'Burned'; readonly from: Address; readonly amount: bigint }
   | {
@@ -161,6 +168,11 @@ export type SettlingEventLike = { readonly blockNumber: bigint } & (
 
 /** The parts of an operation that its settling event must reproduce exactly. */
 export interface SettlementExpectation {
+  /**
+   * The operation's reference. Two operations can have the same type, parties and amount (two
+   * identical deposits); only the reference tells their events apart.
+   */
+  readonly ref: Bytes32;
   /** The operation type; decides which event kind settles it. */
   readonly type: OperationType;
   /** The amount in the token's smallest unit. */
@@ -176,6 +188,7 @@ export type SettlementDifference =
       readonly expected: SettlingEventKind;
       readonly observed: SettlingEventKind;
     }
+  | { readonly field: 'ref'; readonly expected: Bytes32; readonly observed: Bytes32 }
   | { readonly field: 'amount'; readonly expected: bigint; readonly observed: bigint }
   | { readonly field: 'from' | 'to'; readonly expected: Address; readonly observed: Address };
 
@@ -193,7 +206,8 @@ function assertConsistentExpectation(op: SettlementExpectation): void {
 }
 
 /**
- * Every way `event` fails to settle `op`: wrong kind, wrong amount, wrong sender or recipient.
+ * Every way `event` fails to settle `op`: wrong kind, wrong reference, wrong amount, wrong sender
+ * or recipient (in that order).
  * Empty means the event is exactly the settlement of this operation. A wrong kind is reported
  * alone: comparing the fields of a different kind of event would be meaningless.
  * Throws `InvalidInputError` when `op.type` and `op.parties.type` disagree.
@@ -208,6 +222,9 @@ export function settlementDifferences(
     return [{ field: 'kind', expected: expectedKind, observed: event.kind }];
   }
   const out: SettlementDifference[] = [];
+  if (event.ref !== op.ref) {
+    out.push({ field: 'ref', expected: op.ref, observed: event.ref });
+  }
   if (event.amount !== op.amount) {
     out.push({ field: 'amount', expected: op.amount, observed: event.amount });
   }
@@ -252,8 +269,9 @@ export type RevertResolution =
 export type SettlementJudgement = Exclude<RevertResolution, { verdict: 'failed' }>;
 
 /**
- * Judges an observed settling event against its operation: `wait` until it is final, then
- * `confirm` if `settlementDifferences` is empty, else `reference_conflict`. The one place that
+ * Judges an observed settling event against its operation: `wait` until it is final and its block
+ * is canonical (an event cached from an orphaned block never counts), then `confirm` if
+ * `settlementDifferences` is empty (reference included), else `reference_conflict`. The one place that
  * decides whether an event settles an operation, shared by `resolveRevert` and `lateConfirmation`.
  */
 function judgeSettlementEvent(
@@ -262,7 +280,7 @@ function judgeSettlementEvent(
   finality: Finality,
 ): SettlementJudgement {
   const differences = settlementDifferences(op, event);
-  if (!isFinal(event.blockNumber, finality)) {
+  if (!isFinalAndCanonical(event, finality)) {
     return { verdict: 'wait' };
   }
   if (differences.length === 0) {

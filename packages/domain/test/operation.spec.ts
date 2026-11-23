@@ -21,7 +21,7 @@ import {
   SETTLING_EVENT,
   transition,
 } from '../src';
-import { addr } from './support/fixtures';
+import { addr, bh, refOf } from './support/fixtures';
 
 const STATUSES: OperationStatus[] = [
   'requested',
@@ -118,25 +118,38 @@ describe('settling events', () => {
 
 // Finality used throughout: head 100, depth 3. Block 98 has exactly 3 confirmations (final);
 // block 99 has 2 (not final).
-const FIN: Finality = { head: 100n, depth: 3 };
+// Canonical hashes for blocks 90..110 are bh('b<n>'); `at(n)` stamps an event with that position.
+const FIN: Finality = {
+  head: 100n,
+  depth: 3,
+  canonicalBlockHashes: new Map(
+    Array.from({ length: 21 }, (_, i) => [BigInt(90 + i), bh(`b${90 + i}`)] as const),
+  ),
+};
 const FINAL_BLOCK = 98n;
 const SHALLOW_BLOCK = 99n;
+const at = (blockNumber: bigint) => ({ blockNumber, blockHash: bh(`b${blockNumber}`) });
+/** The reference every operation below carries (unless a test says otherwise). */
+const REF = refOf(7);
 
 describe('resolveRevert: the duplicate-submission rule', () => {
   const alice = addr(0xa);
   const bob = addr(0xb);
   const carol = addr(0xc);
   const deposit: SettlementExpectation = {
+    ref: REF,
     type: 'deposit',
     amount: 1000n,
     parties: { type: 'deposit', to: alice },
   };
   const withdrawal: SettlementExpectation = {
+    ref: REF,
     type: 'withdrawal',
     amount: 50n,
     parties: { type: 'withdrawal', from: alice },
   };
   const transfer: SettlementExpectation = {
+    ref: REF,
     type: 'transfer',
     amount: 7n,
     parties: { type: 'transfer', from: alice, to: bob },
@@ -145,7 +158,8 @@ describe('resolveRevert: the duplicate-submission rule', () => {
     kind: 'Minted',
     to,
     amount,
-    blockNumber,
+    ref: REF,
+    ...at(blockNumber),
   });
 
   describe('the first submission won (exact settling event on chain)', () => {
@@ -161,7 +175,7 @@ describe('resolveRevert: the duplicate-submission rule', () => {
         resolveRevert(
           withdrawal,
           REFERENCE_ALREADY_USED,
-          { kind: 'Burned', from: alice, amount: 50n, blockNumber: FINAL_BLOCK },
+          { kind: 'Burned', from: alice, amount: 50n, ref: REF, ...at(FINAL_BLOCK) },
           FIN,
         ).verdict,
       ).toBe('confirm');
@@ -169,7 +183,14 @@ describe('resolveRevert: the duplicate-submission rule', () => {
         resolveRevert(
           transfer,
           REFERENCE_ALREADY_USED,
-          { kind: 'SettledTransfer', from: alice, to: bob, amount: 7n, blockNumber: FINAL_BLOCK },
+          {
+            kind: 'SettledTransfer',
+            from: alice,
+            to: bob,
+            amount: 7n,
+            ref: REF,
+            ...at(FINAL_BLOCK),
+          },
           FIN,
         ).verdict,
       ).toBe('confirm');
@@ -209,7 +230,7 @@ describe('resolveRevert: the duplicate-submission rule', () => {
 
     it('rejects an invalid depth', () => {
       expect(() =>
-        resolveRevert(deposit, undefined, mint(alice, 1000n), { head: 100n, depth: 0 }),
+        resolveRevert(deposit, undefined, mint(alice, 1000n), { ...FIN, depth: 0 }),
       ).toThrow(InvalidInputError);
     });
   });
@@ -228,7 +249,7 @@ describe('resolveRevert: the duplicate-submission rule', () => {
         resolveRevert(
           deposit,
           REFERENCE_ALREADY_USED,
-          { kind: 'Burned', from: alice, amount: 1000n, blockNumber: FINAL_BLOCK },
+          { kind: 'Burned', from: alice, amount: 1000n, ref: REF, ...at(FINAL_BLOCK) },
           FIN,
         ),
       ).toEqual({
@@ -249,14 +270,21 @@ describe('resolveRevert: the duplicate-submission rule', () => {
         resolveRevert(
           withdrawal,
           REFERENCE_ALREADY_USED,
-          { kind: 'Burned', from: bob, amount: 50n, blockNumber: FINAL_BLOCK },
+          { kind: 'Burned', from: bob, amount: 50n, ref: REF, ...at(FINAL_BLOCK) },
           FIN,
         ).verdict,
       ).toBe('reference_conflict');
       const r = resolveRevert(
         transfer,
         REFERENCE_ALREADY_USED,
-        { kind: 'SettledTransfer', from: carol, to: carol, amount: 8n, blockNumber: FINAL_BLOCK },
+        {
+          kind: 'SettledTransfer',
+          from: carol,
+          to: carol,
+          amount: 8n,
+          ref: REF,
+          ...at(FINAL_BLOCK),
+        },
         FIN,
       );
       expect(r).toMatchObject({
@@ -321,6 +349,7 @@ describe('resolveRevert: the duplicate-submission rule', () => {
 describe('lateConfirmation: a failed operation settling late (review M-2)', () => {
   const alice = addr(0xa);
   const deposit: SettlementExpectation = {
+    ref: REF,
     type: 'deposit',
     amount: 1000n,
     parties: { type: 'deposit', to: alice },
@@ -329,7 +358,8 @@ describe('lateConfirmation: a failed operation settling late (review M-2)', () =
     kind: 'Minted',
     to: alice,
     amount,
-    blockNumber,
+    ref: REF,
+    ...at(blockNumber),
   });
 
   it('confirms on a final, exactly matching event, and the edge failed -> confirmed exists', () => {
@@ -369,16 +399,97 @@ describe('lateConfirmation: a failed operation settling late (review M-2)', () =
   });
 });
 
+describe('binding an event to its operation (review N-2)', () => {
+  const alice = addr(0xa);
+  const bob = addr(0xb);
+  const opA: SettlementExpectation = {
+    ref: refOf(0xa1),
+    type: 'deposit',
+    amount: 1000n,
+    parties: { type: 'deposit', to: alice },
+  };
+  // Operation B is identical to A except for its reference: same user, same amount.
+  const opB: SettlementExpectation = { ...opA, ref: refOf(0xb2) };
+  const mintFor = (op: SettlementExpectation, blockNumber = FINAL_BLOCK): SettlingEventLike => ({
+    kind: 'Minted',
+    to: alice,
+    amount: 1000n,
+    ref: op.ref,
+    ...at(blockNumber),
+  });
+
+  it("two identical deposits: B's event does NOT confirm A (late or after a revert)", () => {
+    const bEvent = mintFor(opB);
+    const expected = {
+      verdict: 'reference_conflict',
+      reason: 'reference_conflict',
+      differences: [{ field: 'ref', expected: opA.ref, observed: opB.ref }],
+    };
+    expect(lateConfirmation(opA, bEvent, FIN)).toEqual(expected);
+    expect(resolveRevert(opA, REFERENCE_ALREADY_USED, bEvent, FIN)).toEqual(expected);
+    // Each still confirms on its own event.
+    expect(lateConfirmation(opA, mintFor(opA), FIN).verdict).toBe('confirm');
+    expect(lateConfirmation(opB, bEvent, FIN).verdict).toBe('confirm');
+  });
+
+  it('an event cached from an orphaned block (deep number, other hash) gives wait', () => {
+    const orphan = { ...mintFor(opA), blockHash: bh('orphan98') };
+    expect(lateConfirmation(opA, orphan, FIN)).toEqual({ verdict: 'wait' });
+    expect(resolveRevert(opA, REFERENCE_ALREADY_USED, orphan, FIN)).toEqual({ verdict: 'wait' });
+  });
+
+  it('an event whose block has no canonical hash gives wait (fail closed)', () => {
+    const fin = { ...FIN, canonicalBlockHashes: new Map() };
+    expect(lateConfirmation(opA, mintFor(opA), fin)).toEqual({ verdict: 'wait' });
+  });
+
+  it('each compared field, changed alone, prevents a confirm', () => {
+    const good = mintFor(opA) as Extract<SettlingEventLike, { kind: 'Minted' }>;
+    const variants: Array<[string, SettlingEventLike]> = [
+      ['ref', { ...good, ref: refOf(0xc3) }],
+      ['amount', { ...good, amount: 999n }],
+      ['to', { ...good, to: bob }],
+      ['kind', { kind: 'Burned', from: alice, amount: 1000n, ref: opA.ref, ...at(FINAL_BLOCK) }],
+    ];
+    for (const [field, event] of variants) {
+      const r = lateConfirmation(opA, event, FIN);
+      expect(r).toMatchObject({ verdict: 'reference_conflict', differences: [{ field }] });
+    }
+    const transfer: SettlementExpectation = {
+      ref: refOf(0xd4),
+      type: 'transfer',
+      amount: 5n,
+      parties: { type: 'transfer', from: alice, to: bob },
+    };
+    const settled: Extract<SettlingEventLike, { kind: 'SettledTransfer' }> = {
+      kind: 'SettledTransfer',
+      from: alice,
+      to: bob,
+      amount: 5n,
+      ref: transfer.ref,
+      ...at(FINAL_BLOCK),
+    };
+    expect(lateConfirmation(transfer, settled, FIN).verdict).toBe('confirm');
+    expect(lateConfirmation(transfer, { ...settled, from: bob }, FIN)).toMatchObject({
+      differences: [{ field: 'from' }],
+    });
+    // Position fields, changed alone, prevent a confirm too.
+    expect(lateConfirmation(opA, { ...good, blockHash: bh('x') }, FIN).verdict).toBe('wait');
+    expect(lateConfirmation(opA, { ...good, ...at(SHALLOW_BLOCK) }, FIN).verdict).toBe('wait');
+  });
+});
+
 describe('an operation whose type disagrees with its parties', () => {
   const alice = addr(0xa);
   const bob = addr(0xb);
   // A deposit typed operation carrying transfer parties: the `from` check would silently vanish.
   const inconsistent: SettlementExpectation = {
+    ref: REF,
     type: 'deposit',
     amount: 5n,
     parties: { type: 'transfer', from: bob, to: alice },
   };
-  const mint: SettlingEventLike = { kind: 'Minted', to: alice, amount: 5n, blockNumber: 1n };
+  const mint: SettlingEventLike = { kind: 'Minted', to: alice, amount: 5n, ref: REF, ...at(1n) };
 
   it('settlementDifferences throws InvalidInputError instead of comparing', () => {
     expect(() => settlementDifferences(inconsistent, mint)).toThrow(InvalidInputError);
@@ -394,7 +505,7 @@ describe('an operation whose type disagrees with its parties', () => {
     );
     expect(() =>
       resolveRevert(
-        { type: 'withdrawal', amount: 5n, parties: { type: 'deposit', to: alice } },
+        { ref: REF, type: 'withdrawal', amount: 5n, parties: { type: 'deposit', to: alice } },
         undefined,
         null,
         FIN,
@@ -402,7 +513,7 @@ describe('an operation whose type disagrees with its parties', () => {
     ).toThrow(InvalidInputError);
     // Even when the event is not final yet: the bad input is reported, not deferred.
     expect(() =>
-      resolveRevert(inconsistent, undefined, { ...mint, blockNumber: SHALLOW_BLOCK }, FIN),
+      resolveRevert(inconsistent, undefined, { ...mint, ...at(SHALLOW_BLOCK) }, FIN),
     ).toThrow(InvalidInputError);
   });
 
