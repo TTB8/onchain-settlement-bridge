@@ -5,7 +5,8 @@ and an id source. No NestJS here; the API and worker apps wire these up.
 
 **Piece A**: the operation service, the single status-move helper, and the outbox dispatcher.
 **Piece B**: the settlement submitter, the transaction monitor, the indexer and the `BridgeEngine`
-composition root (below). The reconciler, compliance sending and audit extras are piece C.
+composition root (below). **Piece C**: compliance sending and monitoring, the signer router and
+the reconciler (section "Piece C" below).
 
 | Module                 | What it does                                                                                       |
 | ---------------------- | -------------------------------------------------------------------------------------------------- |
@@ -22,6 +23,12 @@ composition root (below). The reconciler, compliance sending and audit extras ar
 | `tx-monitor.ts`        | `TxMonitor`: submitted/failed operations decided on final evidence                                 |
 | `indexer.ts`           | `Indexer`: events + block hashes into the database, reorg-aware                                    |
 | `alarms.ts`            | `AlarmSink` / `AlarmLog`: conditions a person must look at                                         |
+| `compliance-service.ts` | `ComplianceService`: allow / disallow / freeze / unfreeze requests, each ONE transaction          |
+| `compliance-move.ts`   | `moveComplianceChange(tx, input)`: the only way a compliance change changes status                 |
+| `compliance-submitter.ts` | `ComplianceSubmitter`: the `OutboxHandler` for `compliance` rows                                |
+| `compliance-monitor.ts` | `ComplianceMonitor`: submitted/failed compliance changes decided on final registry events         |
+| `signer-router.ts`     | `SignerRouter`: one dispatcher, each row to its signer's handler                                   |
+| `reconciler.ts`        | `Reconciler`: ledger vs chain at the final block; every run (ok / mismatch / unknown) persisted    |
 | `bridge-engine.ts`     | `BridgeEngine`: wiring, `tick()`, a thin `start()`/`stop()` loop                                   |
 | `errors.ts`            | Typed `EngineError`s, and the translation from domain errors                                       |
 | `ports.ts`             | `Clock`, `IdSource` and their production implementations                                         |
@@ -321,6 +328,76 @@ queue behind the gap, and the operation cannot be reversed (its nonce is not fin
 needs a "cancel" transaction (a zero-value self-send with that nonce) that the gateway does not
 offer yet (open question).
 
+## Piece C: compliance and reconciliation
+
+### Compliance requests (`ComplianceService`)
+
+`request{Allow,Disallow,Freeze,Unfreeze}({ address, reason, idempotencyKey, requestedBy })` (allow
+and disallow set the registry's `verified` flag) runs ONE transaction: the active deployment
+`FOR SHARE` (the shared `lockActiveDeployment`), which must be the gateway's token AND registry;
+the user owning the address (`UnknownUserError`); a transaction-scoped advisory lock on (requester,
+key), then idempotency per requester (same content: the stored change, nothing written; other
+content: `ComplianceIdempotencyConflictError`); the change (`requested`, version 0,
+`ref = referenceFromUuid(id)`), ONE outbox row for the `compliance` signer with the registry call,
+and an audit row.
+
+### Sending and watching
+
+The dispatcher routes rows by signer (`SignerRouter`). `ComplianceSubmitter` has the settlement
+submitter's discipline and machinery: the call must be exactly the change's registry call; an
+existing attempt is rebroadcast (same bytes); otherwise `assertSignerBound(..., 'compliance')`,
+node reads first, `commitWithFreshNonce` (signed and verified outside any lock with the registry as
+`to`; lease fence, `signer_state` (compliance) lock, nonce, attempt, SUBMIT `first` in one commit),
+then `sendForOutbox` (shared with the settlement submitter): lease and abort re-checked, unknown =
+thrown (same bytes next time), rejected = recorded and still counted.
+
+`ComplianceMonitor` (a separate class: different subject, signer and terminal states; the same
+view and alarm code) confirms ONLY on a registry event carrying the change's reference, on the
+node's canonical block, final, and matching exactly (`judgeComplianceEvent`), with
+`confirmedBlock` = the event block; a failed change only through `confirmComplianceChangeLate`. A
+reference used to write something else (`conflict`) FAILs `reference_conflict` and escalates
+(`compliance_escalation` + audit). Without an event it follows the attempt verdicts exactly as the
+transaction monitor (bump, rebroadcast, same-nonce replacement, give-up only on a final nonce,
+`readReferenceUsed('registry', ref, finalBlock)` before a new nonce). There is no reversal (the
+domain table has no edge out of `confirmed`). A `requested` change whose outbox row died before
+anything was signed is FAILed `rejected` after `orphanAfterSeconds`.
+
+### The reconciler
+
+`Reconciler.runOnce()` / `reconcileNow()` (the admin entry point; returns the persisted run with
+its mismatches) and `latestRuns(limit)`:
+
+1. DB snapshot in one short read-only REPEATABLE READ transaction (operations, ledger balances
+   with `readBalances` (available + held per user), compliance changes, indexed events, the
+   indexer cursor). No node call inside.
+2. Head from the node, then `finalBlock = head - depth + 1` (checklist 15).
+3. All node reads at `finalBlock`: the canonical hash of every block that holds an indexed event
+   up to `finalBlock`; balances for exactly the ledger addresses plus both sides of every indexed
+   `Transfer`, and the supply; registry flags for that set plus every account a registry event or
+   a known change touched (checklist 16).
+4. Expected flags: `deriveExpectedCompliance` applies final canonical registry events in (block,
+   log index) order, only those matching a known change, then lets the latest CONFIRMED decision
+   per account and flag win where it disagrees (a late-landing old change becomes a
+   `compliance_mismatch`). Never the database's confirmation order (checklist 13).
+5. Domain `reconcile`, then one transaction: `reconciliation_run`, one `reconciliation_mismatch`
+   row per mismatch, an audit row; then one alarm per kind (`reconciliation_<kind>`).
+
+Unknown, never clean: a read error, an index behind `finalBlock`, a ledger behind the chain (an
+in-flight operation whose settling event is already final), a node missing a block, or input the
+domain refuses: an `unknown` run with the redacted reason and `reconciliation_unknown`.
+`BridgeEngine.tick()` runs it every `reconcileEveryTicks` ticks (default 10), after the monitors.
+
+**Deviation (documented):** canonical hashes are read for every block that holds an indexed event
+up to `finalBlock` (all the domain needs), not for every block since the deployment block.
+
+### Quick items from the piece B review
+
+- `BridgeEngine` refuses a `transactions.isolationLevel` other than `ReadCommitted` at
+  construction (`UnsafeIsolationError`). The reconciler's own read-only snapshot uses REPEATABLE
+  READ internally (it allocates nothing).
+- `SigningExpectation.gasLimit` was REMOVED (the smaller change): nobody set it, the gateway
+  chooses the limit, and a wrong limit can only make a transaction revert out of gas.
+
 ## Tests
 
 Real PostgreSQL 16 (the db package's migrations, so every SQL guard is live). Each test file
@@ -362,6 +439,18 @@ pnpm --filter @bridge/engine test:cov    # with thresholds (90% statements/lines
 | B / 10, 17: alarms, binding               | scenarios: "head_stalled", "another deployment's failed operation ...", "an outbox row bound to another deployment ...", "chain_mismatch" |
 | B / 14: indexer                           | indexer: scanning (5), reorgs (6)                                                                         |
 | B / end to end on a real chain            | engine.anvil: "deposit -> transfer -> withdrawal through tick() on Anvil ..."                             |
+| C / compliance happy paths, idempotency   | compliance: "each change is signed once ...", "a replay with the same key ...", "concurrent copies ...", "refuses a malformed request ..." |
+| C / frozen mid-operation, exact ledger    | compliance: "a withdrawal already signed when the freeze lands reverts ..."                               |
+| C / 1-4: unknown, rejected                | compliance: "unknown outcome, then mined ...", "unknown outcome and NOT taken ...", "rejected by our node but mined elsewhere ..." |
+| C / 8, 9, 12: event-only confirmation     | compliance: "a stale event from an orphaned block never confirms ...", "... under ANOTHER reference never confirms ...", "a front-run under OUR reference ..."; compliance-paths: "a final successful receipt without an indexed event is NOT a confirmation ..." |
+| C / attempt paths, orphans, refusals      | compliance-paths: 11 monitor tests, "ComplianceSubmitter refusals", "moveComplianceChange: ...", "SignerRouter" |
+| 13: expected flags from chain order       | reconciler: "deriveExpectedCompliance" (3), "the bridge's latest confirmed decision disagrees ..."         |
+| 15: final block, node hashes              | reconciler: "a reorg of NOT-final blocks leaves the run stable ...", "a stale index ...: stale_block from the NODE hashes ..." |
+| 16: exact address set                     | reconciler: "a rogue transfer to an OUTSIDER: its balance is read because it appears in a Transfer"         |
+| C / every mismatch kind, persisted, alarmed | reconciler: "a rogue holder transfer ...", "a rogue registry freeze ...", "a rogue mint ...", "a confirmation the chain never made ...", "... at another block ..." |
+| C / unknown runs                          | reconciler: "a node read error ...", "a read error AFTER the head ...", "an index behind the final block, a ledger behind the chain, a node missing a block ..." |
+| C / end to end on a real chain            | reconciler.anvil: "allow -> deposit -> transfer -> withdrawal on Anvil reconciles with ZERO mismatches; a direct holder transfer is caught" |
+| C / isolation refused at construction     | scenarios: "the engine refuses any isolation level but READ COMMITTED at construction ..."                 |
 
 ## Using the workspace packages
 
