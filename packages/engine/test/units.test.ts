@@ -16,8 +16,10 @@ import {
   IllegalTransitionError,
   InsufficientFundsError,
   InvalidRequestError,
+  describeError,
   isRetryableTransactionError,
   randomIds,
+  sanitizeText,
   SelfTransferRequestError,
   systemClock,
 } from '../src';
@@ -80,5 +82,43 @@ describe('production ports', () => {
     expect(ids.size).toBe(50);
     for (const id of ids)
       expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+});
+
+describe('sanitizeText / describeError', () => {
+  it.each([
+    ['https://mainnet.example.io/v3/KEY', '<redacted-url>'],
+    ['ws=wss://node.example:8546/KEY rest', 'ws=<redacted-url> rest'],
+    ['{"url":"https:\\/\\/node.example\\/KEY"}', '{"url":"<redacted-url>"}'],
+    ['GET https%3A%2F%2Fnode.example%2FKEY now', 'GET <redacted-url> now'],
+    ['line1\nline2\ttab\u0000nul', 'line1 line2 tab nul'],
+    ['   ', '(no message)'],
+  ])('%j -> %j', (input, expected) => {
+    expect(sanitizeText(input)).toBe(expected);
+  });
+
+  it('cuts to the limit, marking the cut', () => {
+    const out = sanitizeText('a'.repeat(5000));
+    expect(out).toHaveLength(1000);
+    expect(out.endsWith('...')).toBe(true);
+    expect(sanitizeText('abcdef', 5)).toBe('ab...');
+    expect(sanitizeText('abcde', 5)).toBe('abcde');
+  });
+
+  it('describes errors by class and non-errors by type', () => {
+    class RpcError extends Error {
+      override name = 'RpcError';
+    }
+    expect(describeError(new RpcError('at http://x.example/k'))).toBe(
+      'RpcError: at <redacted-url>',
+    );
+    expect(describeError('plain')).toBe('string: plain');
+    expect(describeError(42)).toBe('number: 42');
+    const evil = {
+      toString() {
+        throw new Error('no');
+      },
+    };
+    expect(describeError(evil)).toBe('object: (unprintable)');
   });
 });

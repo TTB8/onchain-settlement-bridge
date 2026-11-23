@@ -10,6 +10,7 @@ import {
   backoffDelayMs,
   type BackoffPolicy,
   DEFAULT_BACKOFF,
+  type HandlerContext,
   InvalidRequestError,
   OutboxDispatcher,
   type OutboxDispatcherOptions,
@@ -85,7 +86,9 @@ function dispatcher(
   });
 }
 
-const handlerOf = (fn: (row: OutboxMessage) => Promise<OutboxOutcome>): OutboxHandler => ({
+const handlerOf = (
+  fn: (row: OutboxMessage, ctx: HandlerContext) => Promise<OutboxOutcome>,
+): OutboxHandler => ({
   handle: fn,
 });
 
@@ -262,16 +265,21 @@ describe('outcomes', () => {
 
   it('a handler failure dead-letters at once, with an audit row', async () => {
     const [id] = await enqueue(1);
-    const d = dispatcher(handlerOf(async () => ({ failed: 'call is not encodable' })));
+    const d = dispatcher(handlerOf(async () => ({ failed: 'not_encodable' })));
     expect(await d.runOnce()).toMatchObject({ claimed: 1, dead: 1 });
-    expect(await rowOf(id as string)).toMatchObject({ status: 'dead', processedAt: clock.now() });
+    expect(await rowOf(id as string)).toMatchObject({
+      status: 'dead',
+      processedAt: clock.now(),
+      lastError: 'failed:not_encodable',
+      lastErrorAt: clock.now(),
+    });
     const audit = await db.prisma.auditLog.findFirstOrThrow({
       where: { toState: 'outbox:dead' },
       orderBy: { id: 'desc' },
     });
     expect(audit.detail).toMatchObject({
       outboxId: id,
-      note: 'handler failed: call is not encodable',
+      note: 'failed:not_encodable',
     });
   });
 });
@@ -279,14 +287,14 @@ describe('outcomes', () => {
 describe('crashes and stale locks', () => {
   it('a crashed worker’s row is reclaimed only once its lock is stale', async () => {
     const [id] = await enqueue(1);
-    // Simulate a crash: claim the row, then never finish (the handler never returns).
+    // Simulate a crash: claim the row, then do not finish while the rescue happens (the handler
+    // is held open; it is released at the end so nothing outlives the test).
+    let wake!: (o: OutboxOutcome) => void;
     const crashed = dispatcher(
-      handlerOf(() => new Promise<OutboxOutcome>(() => undefined)),
-      {
-        workerId: 'crashed',
-      },
+      handlerOf(() => new Promise<OutboxOutcome>((r) => (wake = r))),
+      { workerId: 'crashed' },
     );
-    void crashed.runOnce();
+    const crashedRun = crashed.runOnce();
     for (let i = 0; i < 100 && (await rowOf(id as string)).status !== 'processing'; i += 1) {
       await new Promise((r) => setTimeout(r, 20));
     }
@@ -303,6 +311,8 @@ describe('crashes and stale locks', () => {
     expect(await rescuer.runOnce()).toMatchObject({ claimed: 1, done: 1 });
     expect(seen).toEqual([id]);
     expect(await rowOf(id as string)).toMatchObject({ status: 'done', attemptsCount: 2 });
+    wake('done');
+    expect(await crashedRun).toMatchObject({ lostLease: 1, done: 0 });
   });
 
   it('a stale row with no attempts left is reaped to dead, not handed out again', async () => {
@@ -326,6 +336,8 @@ describe('crashes and stale locks', () => {
       orderBy: { id: 'desc' },
     });
     expect(audit.detail).toMatchObject({ outboxId: id });
+    expect(String((audit.detail as { note?: unknown }).note)).toContain('lease expired');
+    expect((await rowOf(id as string)).lastError).toContain('lease expired');
   });
 
   it('a slow worker whose lease was taken over cannot overwrite the new owner’s result', async () => {
@@ -390,6 +402,10 @@ describe('configuration', () => {
     [{ backoff: { baseMs: 0, maxMs: 1, maxAttempts: 1 } }],
     [{ backoff: { baseMs: 10, maxMs: 5, maxAttempts: 1 } }],
     [{ backoff: { baseMs: 1, maxMs: 5, maxAttempts: 0 } }],
+    [{ handlerTimeoutMs: 0 }],
+    [{ handlerTimeoutMs: LOCK_TIMEOUT }],
+    [{ lockTimeoutMs: 1_000, handlerTimeoutMs: 5_000 }],
+    [{ maxWaitAgeMs: 0 }],
   ] as [Partial<OutboxDispatcherOptions>][])('refuses %j', (extra) => {
     expect(() =>
       dispatcher(
@@ -409,5 +425,188 @@ describe('configuration', () => {
       handler: handlerOf(async () => 'done'),
     });
     expect((await d.runOnce()).done).toBe(1);
+  });
+});
+
+describe('leases are renewed per row and re-checkable (review M-2)', () => {
+  it('a slow batch: rows that went stale and were taken over are skipped, never handled twice', async () => {
+    const ids = await enqueue(3);
+    const calls = new Map<string, string[]>();
+    const record = (worker: string, row: OutboxMessage) =>
+      calls.set(row.id, [...(calls.get(row.id) ?? []), worker]);
+    const b = dispatcher(
+      handlerOf(async (row) => (record('b', row), 'done')),
+      { workerId: 'b' },
+    );
+    let bSummary: unknown;
+    let n = 0;
+    const a = dispatcher(
+      handlerOf(async (row) => {
+        record('a', row);
+        n += 1;
+        // Each row takes 60% of the lock timeout: the third row of the batch goes stale.
+        clock.advance(LOCK_TIMEOUT * 0.6);
+        if (n === 2) bSummary = await b.runOnce(); // another worker runs meanwhile
+        return 'done';
+      }),
+      { workerId: 'a', batchSize: 3 },
+    );
+    const aSummary = await a.runOnce();
+    expect(aSummary).toMatchObject({ claimed: 3, done: 2, lostLease: 1 });
+    expect(bSummary).toMatchObject({ claimed: 1, done: 1 });
+    expect([...calls.keys()].sort()).toEqual([...ids].sort());
+    for (const id of ids) expect(calls.get(id)).toHaveLength(1);
+    // The third row A claimed (claim order is available_at, id) was the one B took over.
+    const handlers = [...calls.values()].map((w) => w.join(',')).sort();
+    expect(handlers).toEqual(['a', 'a', 'b']);
+    const rows = await db.prisma.outboxMessage.findMany({ where: { id: { in: ids } } });
+    expect(rows.every((r) => r.status === 'done')).toBe(true);
+  });
+
+  it('stillHolds is true while the lease is ours and fresh, false once taken or stale', async () => {
+    const [id] = await enqueue(1);
+    const seen: boolean[] = [];
+    const d = dispatcher(
+      handlerOf(async (_row, ctx) => {
+        seen.push(await ctx.stillHolds());
+        clock.advance(LOCK_TIMEOUT); // our lease is now stale
+        seen.push(await ctx.stillHolds());
+        clock.advance(-LOCK_TIMEOUT);
+        await db.prisma.outboxMessage.update({ where: { id }, data: { lockedBy: 'thief/1' } });
+        seen.push(await ctx.stillHolds());
+        return 'done';
+      }),
+    );
+    expect(await d.runOnce()).toMatchObject({ lostLease: 1, done: 0 });
+    expect(seen).toEqual([true, false, false]);
+  });
+
+  it('a handler that never answers times out: unknown outcome, retried, signal aborted', async () => {
+    const [id] = await enqueue(1);
+    let signal: AbortSignal | undefined;
+    const d = dispatcher(
+      handlerOf((_row, ctx) => {
+        signal = ctx.signal;
+        return new Promise<OutboxOutcome>(() => undefined);
+      }),
+      { handlerTimeoutMs: 50 },
+    );
+    expect(await d.runOnce()).toMatchObject({ claimed: 1, retried: 1, dead: 0 });
+    expect(signal?.aborted).toBe(true);
+    const row = await rowOf(id as string);
+    expect(row).toMatchObject({ status: 'pending', attemptsCount: 1, lockedBy: null });
+    expect(row.lastError).toMatch(/^HandlerTimeoutError: handler did not answer within 50 ms$/);
+    expect(row.availableAt.getTime() - clock.now().getTime()).toBe(POLICY.baseMs);
+  });
+
+  it('a handler that rejects after its timeout does not crash the dispatcher', async () => {
+    await enqueue(1);
+    let rejectLate!: (e: Error) => void;
+    const d = dispatcher(
+      handlerOf(() => new Promise<OutboxOutcome>((_, reject) => (rejectLate = reject))),
+      { handlerTimeoutMs: 20 },
+    );
+    expect(await d.runOnce()).toMatchObject({ retried: 1 });
+    rejectLate(new Error('too late'));
+    await new Promise((r) => setTimeout(r, 20));
+  });
+});
+
+describe('error text is recorded redacted and bounded (review L-1, L-2)', () => {
+  it('a thrown error: class name, URL redacted, written to last_error', async () => {
+    const [id] = await enqueue(1);
+    class RpcError extends Error {
+      override name = 'RpcError';
+    }
+    const d = dispatcher(
+      handlerOf(async () => {
+        throw new RpcError('POST https://eth.example.org/v2/SECRETKEY failed\nretry later');
+      }),
+    );
+    await d.runOnce();
+    const row = await rowOf(id as string);
+    expect(row.lastError).toBe('RpcError: POST <redacted-url> failed retry later');
+    expect(row.lastError).not.toContain('SECRETKEY');
+    expect(row.lastErrorAt).toEqual(clock.now());
+  });
+
+  it('a failure code and detail are sanitized into last_error and the audit note', async () => {
+    const [id] = await enqueue(1);
+    const d = dispatcher(
+      handlerOf(async () => ({
+        failed: 'node_refused',
+        detail: `from wss://rpc.example/KEY: ${'x'.repeat(2000)}`,
+      })),
+    );
+    expect(await d.runOnce()).toMatchObject({ dead: 1 });
+    const row = await rowOf(id as string);
+    expect(row.lastError?.startsWith('failed:node_refused: from <redacted-url> ')).toBe(true);
+    expect(row.lastError).toHaveLength(1000);
+    expect(row.lastError).not.toContain('KEY');
+    const audit = await db.prisma.auditLog.findFirstOrThrow({
+      where: { toState: 'outbox:dead' },
+      orderBy: { id: 'desc' },
+    });
+    expect((audit.detail as { note?: string }).note).toBe(row.lastError);
+  });
+
+  it('the dead letter at the attempt cap keeps the last error', async () => {
+    const [id] = await enqueue(1);
+    const d = dispatcher(
+      handlerOf(async () => {
+        throw new Error('boom');
+      }),
+      { backoff: { ...POLICY, maxAttempts: 1 } },
+    );
+    expect(await d.runOnce()).toMatchObject({ dead: 1 });
+    expect((await rowOf(id as string)).lastError).toBe('attempts exhausted (1); last: Error: boom');
+  });
+});
+
+describe('deliberate waits are bounded (review L-3)', () => {
+  it('a retryAt in the past is clamped to now + baseMs', async () => {
+    const [id] = await enqueue(1);
+    const d = dispatcher(handlerOf(async () => ({ retryAt: new Date(0) })));
+    await d.runOnce();
+    const row = await rowOf(id as string);
+    expect(row.availableAt.getTime()).toBe(clock.now().getTime() + POLICY.baseMs);
+    expect(row.attemptsCount).toBe(0);
+  });
+
+  it.each([
+    ['an Invalid Date', { retryAt: new Date(Number.NaN) }],
+    ['a non-Date retryAt', { retryAt: '2030-01-01' }],
+    ['an unknown outcome', 'maybe'],
+  ])('%s is an unknown outcome: backoff, attempt kept', async (_name, outcome) => {
+    const [id] = await enqueue(1);
+    const d = dispatcher(handlerOf(async () => outcome as unknown as OutboxOutcome));
+    expect(await d.runOnce()).toMatchObject({ retried: 1 });
+    const row = await rowOf(id as string);
+    expect(row).toMatchObject({ status: 'pending', attemptsCount: 1 });
+    expect(row.lastError).toMatch(/^InvalidOutcome: /);
+    expect(row.availableAt.getTime()).toBe(clock.now().getTime() + POLICY.baseMs);
+  });
+
+  it('a row that keeps waiting past maxWaitAgeMs is dead-lettered with an audit row', async () => {
+    const [id] = await enqueue(1);
+    const d = dispatcher(
+      handlerOf(async () => ({ retryAt: new Date(clock.now().getTime() + 10_000) })),
+      { maxWaitAgeMs: 25_000 },
+    );
+    expect(await d.runOnce()).toMatchObject({ retried: 1 });
+    clock.advance(10_000);
+    expect(await d.runOnce()).toMatchObject({ retried: 1 });
+    clock.advance(10_000);
+    expect(await d.runOnce()).toMatchObject({ retried: 1 }); // age 20 s
+    clock.advance(10_000);
+    expect(await d.runOnce()).toMatchObject({ dead: 1 }); // age 30 s
+    const row = await rowOf(id as string);
+    expect(row).toMatchObject({ status: 'dead', attemptsCount: 1 });
+    expect(row.lastError).toBe('still waiting after 25000 ms since it was created');
+    const audit = await db.prisma.auditLog.findFirstOrThrow({
+      where: { toState: 'outbox:dead' },
+      orderBy: { id: 'desc' },
+    });
+    expect(audit.detail).toMatchObject({ outboxId: id });
   });
 });

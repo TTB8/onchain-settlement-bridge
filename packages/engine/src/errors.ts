@@ -27,6 +27,7 @@ export type EngineErrorCode =
   | 'VERSION_CONFLICT'
   | 'ILLEGAL_TRANSITION'
   | 'EVIDENCE_REFUSED'
+  | 'HANDLER_TIMEOUT'
   | 'RETRIES_EXHAUSTED'
   | 'LEDGER_SETUP';
 
@@ -146,6 +147,14 @@ export class IllegalTransitionError extends EngineError {
  */
 export class EvidenceRefusedError extends EngineError {
   readonly code = 'EVIDENCE_REFUSED' as const;
+}
+
+/**
+ * An outbox handler did not answer within its time limit. Its outcome is UNKNOWN (it may still be
+ * running, or have sent a transaction): the row is retried, never failed (ADR 0009).
+ */
+export class HandlerTimeoutError extends EngineError {
+  readonly code = 'HANDLER_TIMEOUT' as const;
 }
 
 /** A transaction kept failing with a serialization failure or deadlock after every retry. */
