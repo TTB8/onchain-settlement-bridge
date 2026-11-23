@@ -990,6 +990,20 @@ describe('FakeChainGateway: reorgs', () => {
     expect(await chain.getReceipt(rogue)).toMatchObject({ status: 'success' });
   });
 
+  it('replacement blocks get new hashes even when the removed blocks were empty', async () => {
+    const { chain } = setup();
+    chain.mine(2);
+    const old1 = await chain.getBlock(1n);
+    const old2 = await chain.getBlock(2n);
+    chain.reorg({ depth: 2 });
+    const new1 = await chain.getBlock(1n);
+    const new2 = await chain.getBlock(2n);
+    expect(new1?.hash).not.toBe(old1?.hash);
+    expect(new2?.hash).not.toBe(old2?.hash);
+    expect(new2?.parentHash).toBe(new1?.hash);
+    expect(new1?.parentHash).toBe((await chain.getBlock(0n))?.hash);
+  });
+
   it('rejects an impossible depth', () => {
     const { chain } = setup();
     chain.mine(2);
