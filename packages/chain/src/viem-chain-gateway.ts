@@ -11,7 +11,7 @@
  * - The RPC URL (whose path or query often holds an API key) never reaches an error either: every
  *   cause is a scrubbed copy (`safeCause`), and the client lives in a `#private` field that
  *   `util.inspect` and `JSON.stringify` do not show.
- * - Submission errors fail safe: only definite rejections are `SubmissionRejectedError`; any
+ * - Submission errors fail safe: only this node's definite refusals are `SubmissionRejectedError`; any
  *   error it does not recognise means "outcome unknown" (`ChainUnavailableError`).
  * - A call sent with the wrong signer is refused before anything touches the network.
  * - Transactions are sent with a fixed gas limit instead of an estimate, so a call that would
@@ -285,9 +285,10 @@ const REPLACEMENT_UNDERPRICED = /replacement[^|]*underpriced|underpriced replace
 const INSUFFICIENT_FUNDS = /insufficient funds/;
 
 /**
- * Node answers that mean the transaction was DEFINITELY not accepted, so retrying the same bytes
- * cannot help and nothing can be mined from it. Anything not on this list (and not one of the
- * specific cases above) is treated as an unknown outcome.
+ * Node answers that mean THIS node refused THIS submission, so resending the same bytes to it
+ * cannot help. They do not prove the transaction can never be mined (another node may already
+ * hold the same signed bytes), so the attempt must still be kept until its nonce is final.
+ * Anything not on this list (and not one of the specific cases above) is an unknown outcome.
  */
 const DEFINITE_REJECTIONS: readonly RegExp[] = [
   /invalid (transaction )?signature|invalid sender|signature (is )?invalid/,
@@ -303,7 +304,7 @@ const DEFINITE_REJECTIONS: readonly RegExp[] = [
  * Maps a failure of `eth_sendRawTransaction` to the typed errors. `hash` is the hash the signed
  * transaction would have, reported with `AlreadyKnownError`.
  *
- * Fail-safe: only the allowlisted DEFINITE rejections become `SubmissionRejectedError`. Every
+ * Fail-safe: only the allowlisted refusals by this node become `SubmissionRejectedError`. Every
  * error it does not recognise (a proxy that forwarded the transaction and then failed, a
  * `-32603`, "header not found", a provider's own wording) is `ChainUnavailableError`: the
  * outcome is unknown and the caller must check by hash and by reference before re-sending.

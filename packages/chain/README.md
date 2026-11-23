@@ -43,23 +43,36 @@ incomplete: the operation (and the money) already moved.
 
 ## When a submit fails
 
-The gateway fails safe. `SubmissionRejectedError` means the node DEFINITELY did not take the
-transaction, and it is used only for an allowlist of answers: invalid signature or sender,
-intrinsic gas too low, a fee cap below the base fee, more gas than the block allows, a wrong
-chain id, a nonce gap, and a tip above the fee cap. Every other answer the gateway does not
+The gateway fails safe. `SubmissionRejectedError` means only that THIS node refused THIS
+submission. It is used for an allowlist of answers: invalid signature or sender, intrinsic gas
+too low, a fee cap below the base fee, more gas than the block allows, a wrong chain id, a nonce
+gap, and a tip above the fee cap. It does not prove the transaction can never be mined: another
+node, for example one behind the same load balancer, may already hold the same signed bytes. So
+an attempt that got `SubmissionRejectedError` STILL counts in the engine's `attemptCanStillMine`
+check and is kept until its nonce is final. Every other answer the gateway does not
 recognise is a `ChainUnavailableError`: the outcome is unknown. That includes a proxy that
 forwarded the transaction and then failed, a `-32603`, "header not found", and a provider's own
 wording. The transaction may still be mined.
 
-So the engine must keep a record of every transaction it signs (hash, nonce, fees, reference)
-until that nonce is final. After an unknown outcome or a `NonceTooLowError`, it looks up its
+So the engine must keep a record of every transaction it signs (hash, nonce, fees, reference),
+whatever error came back, until that nonce is final. After an unknown outcome or a `NonceTooLowError`, it looks up its
 earlier attempts by hash and checks the reference with `readReferenceUsed` before signing
 anything new for that operation.
 
-Errors never carry secrets. Each cause is a scrubbed copy that keeps the error names, codes and
-node messages, with every URL replaced by `<redacted-url>`, because an RPC URL's path or query
-often holds an API key. The viem client is a `#private` field, so `util.inspect` and
-`JSON.stringify` of the gateway do not show the URL either.
+Errors never carry secrets, because an RPC URL's path or query often holds an API key. Before
+the gateway throws anything, it redacts the configured URL from the message and the stack of
+every error in the cause chain. It removes the full URL, host, credentials, path, each path
+segment and each query value, as written, JSON-escaped, percent-encoded and without the scheme.
+Any other URL-shaped text becomes `<redacted-url>`. Each cause is a scrubbed copy that keeps only
+error names, codes and node messages. The viem client is a `#private` field, so `util.inspect`
+and `JSON.stringify` of the gateway do not show the URL either. URL pieces shorter than four
+characters (such as `v2`) are left in place.
+
+**Deployment binding (promote or redeploy risk).** A reference flag lives in ONE contract. If
+the engine starts following a replaced or redeployed token, the new contract has never seen the
+old references, so the duplicate-reference guard is gone for every operation still in flight.
+Operations must therefore stay bound to the `(chainId, token address)` they were created for.
+The deployment the engine follows must never change while any operation is not terminal.
 
 **Known limit of revert reasons on a real node:** the viem gateway finds a revert's reason by
 replaying the call with `eth_call` on the state AFTER the transaction's block. If a later
