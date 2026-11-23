@@ -122,13 +122,22 @@ export interface LedgerOperationView {
   readonly confirmedBlock: bigint | null;
 }
 
-/** Everything reconciliation compares, all as of `atBlock`. */
+/** Everything reconciliation compares: state as of `atBlock`, events up to `finalBlock`. */
 export interface ReconciliationInput {
-  /** The block the comparison is made at. Events after it are ignored. */
+  /** The block balances, supply and flags are compared at. At most `finalBlock`. */
   readonly atBlock: bigint;
+  /**
+   * The newest FINAL block when the engine runs (`head - depth + 1`). Every confirmed operation's
+   * `confirmedBlock` must be at or below it; events are considered up to it, so an operation
+   * confirmed after `atBlock` still has to show its settling event.
+   */
+  readonly finalBlock: bigint;
   /** Every operation the ledger knows. */
   readonly operations: readonly LedgerOperationView[];
-  /** Every event from both contracts up to `atBlock` (later ones are ignored). */
+  /**
+   * Every event from both contracts up to `finalBlock` (later ones are ignored). Engine obligation:
+   * `canonicalBlockHashes` must hold the canonical hash of every block these events come from.
+   */
   readonly events: readonly ObservedEvent[];
   /** Token balances read from the chain at `atBlock`. Should cover every expected address. */
   readonly observedBalances: ReadonlyMap<Address, bigint>;
@@ -165,7 +174,19 @@ export type Mismatch =
       readonly operationId: string;
       readonly ref: Bytes32;
       readonly expectedEvent: SettlementEvent['kind'];
-      readonly confirmedBlock: bigint | null;
+      readonly confirmedBlock: bigint;
+    }
+  | {
+      /** The settling event exists but is in a different block than the ledger recorded. */
+      readonly kind: 'confirmed_block_mismatch';
+      readonly operationId: string;
+      readonly ref: Bytes32;
+      /** The operation's recorded `confirmedBlock`. */
+      readonly expected: bigint;
+      /** The block the settling event is actually in. */
+      readonly observed: bigint;
+      readonly txHash: TxHash;
+      readonly logIndex: number;
     }
   | {
       readonly kind: 'amount_mismatch';
@@ -267,6 +288,7 @@ const KIND_ORDER: readonly Mismatch['kind'][] = [
   'missing_onchain',
   'amount_mismatch',
   'address_mismatch',
+  'confirmed_block_mismatch',
   'unexpected_onchain_event',
   'unexplained_transfer',
   'balance_mismatch',
@@ -307,6 +329,8 @@ function sortKey(m: Mismatch): [number, string, bigint, number, string] {
       return [rank, m.operationId, 0n, 0, ''];
     case 'amount_mismatch':
       return [rank, m.operationId, m.blockNumber, m.logIndex, ''];
+    case 'confirmed_block_mismatch':
+      return [rank, m.operationId, m.observed, m.logIndex, ''];
     case 'address_mismatch':
       return [rank, m.operationId, m.blockNumber, m.logIndex, m.field];
     case 'unexpected_onchain_event':
@@ -406,8 +430,23 @@ function impliedTransfer(e: SettlementEvent): { from: Address; to: Address; amou
 }
 
 function validateInput(input: ReconciliationInput): Map<Bytes32, LedgerOperationView> {
+  if (input.atBlock > input.finalBlock) {
+    throw new InvalidInputError(
+      `atBlock ${input.atBlock} is after finalBlock ${input.finalBlock}: compare only final state`,
+    );
+  }
   const byRef = new Map<Bytes32, LedgerOperationView>();
   for (const op of input.operations) {
+    if (op.status === 'confirmed') {
+      // A settlement must be in a block that is final now. A missing or future block would let a
+      // confirmation the chain never made skip every check (review N-1).
+      if (op.confirmedBlock === null || op.confirmedBlock > input.finalBlock) {
+        throw new InvalidInputError(
+          `confirmed operation ${op.id} has confirmedBlock ${String(op.confirmedBlock)}, ` +
+            `not a final block (<= ${input.finalBlock})`,
+        );
+      }
+    }
     if (op.type !== op.parties.type) {
       throw new InvalidInputError(
         `operation ${op.id} has type ${op.type} but ${op.parties.type} parties`,
@@ -454,24 +493,27 @@ function validateInput(input: ReconciliationInput): Map<Bytes32, LedgerOperation
  * change exactly. Compliance flags are checked for every address that is expected, appears in a
  * (canonical) compliance event, or holds a non-zero observed balance.
  *
- * Operations still in flight (`ledger_reserved`, `submitted`) and confirmed after `atBlock` are
- * never reported missing: the chain is not expected to show them yet. A confirmed operation with no
- * recorded block is treated as due (fail closed: the ledger claims it settled). An expected address
- * whose chain balance was not read, or whose registry flags were not read, is reported with
- * `observed: null` rather than assumed correct.
+ * Two blocks matter. Balances, supply and flags are compared at `atBlock`. Events are considered up
+ * to `finalBlock`: every confirmed operation must have a final `confirmedBlock` (else
+ * `InvalidInputError`), and must show its canonical settling event IN that block, whether it is
+ * before or after `atBlock` (else `missing_onchain` or `confirmed_block_mismatch`). Operations
+ * confirmed in (`atBlock`, `finalBlock`] are left out of the expected balances at `atBlock`
+ * (see `expectedChainState`) but never out of the event check, so a forged future block cannot
+ * hide a settlement the chain never made. Operations still in flight (`ledger_reserved`,
+ * `submitted`) are never reported missing. An expected address whose chain balance or registry
+ * flags were not read is reported with `observed: null` rather than assumed correct.
  *
- * What it does NOT check: that a settling event's block equals the operation's `confirmedBlock`,
- * and that every settlement event has its matching ERC-20 `Transfer` (only the reverse direction,
- * every Transfer explained by a settlement event, is checked). The balance and supply comparisons
- * catch the money effect of either gap, but not its cause.
+ * What it does NOT check: that every settlement event has its matching ERC-20 `Transfer` (only the
+ * reverse direction, every Transfer explained by a settlement event, is checked). The balance and
+ * supply comparisons catch the money effect of that gap, but not its cause.
  */
 export function reconcile(input: ReconciliationInput): ReconciliationReport {
   const byRef = validateInput(input);
   const mismatches: Mismatch[] = [];
-  // 0. Only events at or before atBlock, and only from canonical blocks.
+  // 0. Only events at or before finalBlock, and only from canonical blocks.
   const events: ObservedEvent[] = [];
   for (const e of input.events) {
-    if (e.blockNumber > input.atBlock) continue;
+    if (e.blockNumber > input.finalBlock) continue;
     if (input.canonicalBlockHashes.get(e.blockNumber) !== e.blockHash) {
       mismatches.push(unexpected(e, 'stale_block', 'ref' in e ? byRef.get(e.ref) : undefined));
       continue;
@@ -526,17 +568,28 @@ export function reconcile(input: ReconciliationInput): ReconciliationReport {
     mismatches.push(...differenceMismatches(op, e, differences));
   }
 
-  // 2. Settled operations that the chain should show by now.
+  // 2. Every confirmed operation must show its settling event, in its recorded block.
   for (const op of input.operations) {
     if (op.status !== 'confirmed') continue;
-    if (op.confirmedBlock !== null && op.confirmedBlock > input.atBlock) continue;
-    if (!settledByRef.has(op.ref)) {
+    const confirmedBlock = op.confirmedBlock as bigint; // validated above
+    const event = settledByRef.get(op.ref);
+    if (event === undefined) {
       mismatches.push({
         kind: 'missing_onchain',
         operationId: op.id,
         ref: op.ref,
         expectedEvent: SETTLING_EVENT[op.type],
-        confirmedBlock: op.confirmedBlock,
+        confirmedBlock,
+      });
+    } else if (event.blockNumber !== confirmedBlock) {
+      mismatches.push({
+        kind: 'confirmed_block_mismatch',
+        operationId: op.id,
+        ref: op.ref,
+        expected: confirmedBlock,
+        observed: event.blockNumber,
+        txHash: event.txHash,
+        logIndex: event.logIndex,
       });
     }
   }

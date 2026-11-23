@@ -72,6 +72,7 @@ function cleanWorld(): ReconciliationInput {
   ]);
   return {
     atBlock: 20n,
+    finalBlock: 20n,
     operations,
     events,
     observedBalances: balances,
@@ -103,7 +104,7 @@ describe('reconcile', () => {
     });
   });
 
-  it('ignores events after atBlock', () => {
+  it('ignores events after finalBlock', () => {
     const w = cleanWorld();
     const r = reconcile({
       ...w,
@@ -138,7 +139,7 @@ describe('reconcile', () => {
       expect(r.ok).toBe(false);
     });
 
-    it('does not report in-flight operations or ones confirmed after atBlock', () => {
+    it('does not report in-flight, failed, reversed or requested operations', () => {
       const w = cleanWorld();
       const extra: LedgerOperationView[] = [
         {
@@ -158,15 +159,6 @@ describe('reconcile', () => {
           amount: 5n,
           parties: { type: 'deposit', to: alice },
           confirmedBlock: null,
-        },
-        {
-          id: 'op-late',
-          ref: refOf(12),
-          type: 'deposit',
-          status: 'confirmed',
-          amount: 5n,
-          parties: { type: 'deposit', to: alice },
-          confirmedBlock: 21n,
         },
         {
           id: 'op-f',
@@ -190,7 +182,7 @@ describe('reconcile', () => {
       expect(reconcile({ ...w, operations: [...w.operations, ...extra] }).ok).toBe(true);
     });
 
-    it('treats a confirmed operation without a recorded block as due (fail closed)', () => {
+    it('rejects a confirmed operation without a recorded block (fail closed)', () => {
       const w = cleanWorld();
       const op: LedgerOperationView = {
         id: 'op-nb',
@@ -201,7 +193,125 @@ describe('reconcile', () => {
         parties: { type: 'deposit', to: alice },
         confirmedBlock: null,
       };
-      expect(kinds({ ...w, operations: [...w.operations, op] })).toEqual(['missing_onchain']);
+      expect(() => reconcile({ ...w, operations: [...w.operations, op] })).toThrow(
+        InvalidInputError,
+      );
+    });
+  });
+
+  describe('phantom settlements and the final window (review N-1)', () => {
+    const late = (confirmedBlock: bigint): LedgerOperationView => ({
+      id: 'op-late',
+      ref: refOf(12),
+      type: 'deposit',
+      status: 'confirmed',
+      amount: 1_000n,
+      parties: { type: 'deposit', to: alice },
+      confirmedBlock,
+    });
+    const lateMint = (block: number): ObservedEvent[] => [
+      { ...pos(block, 30, 0), kind: 'Transfer', from: ZERO_ADDRESS, to: alice, amount: 1_000n },
+      { ...pos(block, 30, 1), kind: 'Minted', to: alice, amount: 1_000n, ref: refOf(12) },
+    ];
+
+    it('PoC: a 1,000 deposit "confirmed" at block 10^18 with no Minted is NOT ok (it throws)', () => {
+      const w = cleanWorld();
+      expect(() =>
+        reconcile({ ...w, finalBlock: 25n, operations: [...w.operations, late(10n ** 18n)] }),
+      ).toThrow(InvalidInputError);
+      expect(() =>
+        reconcile({ ...w, finalBlock: 25n, operations: [...w.operations, late(26n)] }),
+      ).toThrow(/not a final block/);
+    });
+
+    it('rejects atBlock after finalBlock', () => {
+      const w = cleanWorld();
+      expect(() => reconcile({ ...w, atBlock: 21n })).toThrow(/after finalBlock/);
+    });
+
+    it('an operation confirmed in (atBlock, finalBlock] still needs its settling event', () => {
+      const w = cleanWorld();
+      const base = { ...w, finalBlock: 25n, operations: [...w.operations, late(23n)] };
+      // Without the Minted: missing_onchain, even though it is after atBlock.
+      expect(reconcile(base).mismatches).toEqual([
+        {
+          kind: 'missing_onchain',
+          operationId: 'op-late',
+          ref: refOf(12),
+          expectedEvent: 'Minted',
+          confirmedBlock: 23n,
+        },
+      ]);
+      // With it: clean, and not counted in the balances at atBlock (alice still expected 70).
+      expect(reconcile({ ...base, events: [...w.events, ...lateMint(23)] }).ok).toBe(true);
+    });
+
+    it('the window edges: exactly at finalBlock is allowed, and events after finalBlock do not count', () => {
+      const w = cleanWorld();
+      const base = { ...w, finalBlock: 25n, operations: [...w.operations, late(25n)] };
+      expect(reconcile({ ...base, events: [...w.events, ...lateMint(25)] }).ok).toBe(true);
+      expect(kinds({ ...base, events: [...w.events, ...lateMint(26)] })).toEqual([
+        'missing_onchain',
+      ]);
+    });
+
+    it('reports confirmed_block_mismatch when the event is in another block than recorded', () => {
+      const w = cleanWorld();
+      const r = reconcile({
+        ...w,
+        finalBlock: 25n,
+        operations: [...w.operations, late(23n)],
+        events: [...w.events, ...lateMint(22)],
+      });
+      expect(r.mismatches).toEqual([
+        {
+          kind: 'confirmed_block_mismatch',
+          operationId: 'op-late',
+          ref: refOf(12),
+          expected: 23n,
+          observed: 22n,
+          txHash: txh(30),
+          logIndex: 1,
+        },
+      ]);
+      // Also before atBlock: the deposit recorded at 10 but minted at 9.
+      const moved = w.events.map((e) =>
+        e.txHash === txh(1) ? { ...e, ...pos(9, 1, e.logIndex) } : e,
+      );
+      expect(kinds({ ...w, events: moved })).toEqual(['confirmed_block_mismatch']);
+    });
+
+    it('orders several confirmed_block_mismatch findings by operation, whatever the input order', () => {
+      const w = cleanWorld();
+      const moved = w.events.map((e) =>
+        e.txHash === txh(1) ? { ...e, ...pos(9, 1, e.logIndex) } : e,
+      );
+      const input = {
+        ...w,
+        finalBlock: 25n,
+        operations: [late(23n), ...w.operations],
+        events: [...lateMint(22), ...moved],
+      };
+      const ids = (i: ReconciliationInput) =>
+        reconcile(i).mismatches.map((m) => ('operationId' in m ? m.operationId : m.kind));
+      expect(ids(input)).toEqual(['op-dep', 'op-late']);
+      expect(ids({ ...input, operations: [...input.operations].reverse() })).toEqual([
+        'op-dep',
+        'op-late',
+      ]);
+    });
+
+    it('checks transfers in (atBlock, finalBlock] too', () => {
+      const w = cleanWorld();
+      const r = reconcile({
+        ...w,
+        finalBlock: 25n,
+        events: [
+          ...w.events,
+          { ...pos(24, 31, 0), kind: 'Transfer', from: alice, to: mallory, amount: 1n },
+        ],
+      });
+      expect(r.mismatches.map((m) => m.kind)).toEqual(['unexplained_transfer']);
     });
   });
 

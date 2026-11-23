@@ -109,8 +109,14 @@ export interface ChainStateInput {
   readonly operations: readonly ChainStateOperation[];
   /** Each user's on-chain address. One address per user, one user per address. */
   readonly userAddresses: ReadonlyMap<string, Address>;
-  /** The block the chain state is wanted at. */
+  /** The block the chain state is wanted at. At most `finalBlock`. */
   readonly atBlock: bigint;
+  /**
+   * The newest FINAL block when the engine runs (`head - depth + 1`). Every settled operation's
+   * `confirmedBlock` must be at or below it: a settlement "confirmed" in a block that is not final
+   * (or does not exist yet) would otherwise be silently taken back out of the expected state.
+   */
+  readonly finalBlock: bigint;
 }
 
 /** The balances and supply the chain should show. */
@@ -150,11 +156,18 @@ function sameParties(a: OperationParties, b: OperationParties): boolean {
  * settled in the ledger with `confirmedBlock > atBlock`.
  *
  * Throws `InvalidInputError` (or `JournalIntegrityError` from the journal check) when the inputs
- * cannot describe one consistent state: duplicate operation ids or user addresses, a user with
- * funds and no address, parties that are not the users' addresses, a settled operation without a
- * `confirmedBlock`, or an unsettled one with one.
+ * cannot describe one consistent state: `atBlock` after `finalBlock`, duplicate operation ids or
+ * user addresses, a user with funds and no address, parties that are not the users' addresses, a
+ * settled operation without a `confirmedBlock` or with one after `finalBlock`, or an unsettled one
+ * with one.
+ *
+ * Only settlements in (`atBlock`, `finalBlock`] are taken back. `reconcile` still requires their
+ * settling events, so this never hides a settlement the chain did not make.
  */
 export function expectedChainState(input: ChainStateInput): ExpectedChainState {
+  if (input.atBlock > input.finalBlock) {
+    throw new InvalidInputError(`atBlock ${input.atBlock} is after finalBlock ${input.finalBlock}`);
+  }
   const byId = new Map<string, ChainStateOperation>();
   for (const o of input.operations) {
     if (byId.has(o.op.operationId)) {
@@ -187,6 +200,11 @@ export function expectedChainState(input: ChainStateInput): ExpectedChainState {
     if (!sameParties(o.parties, expectedParties(o.op, addressOf))) {
       throw new InvalidInputError(
         `operation ${o.op.operationId} parties are not its users' addresses`,
+      );
+    }
+    if (o.confirmedBlock !== null && o.confirmedBlock > input.finalBlock) {
+      throw new InvalidInputError(
+        `operation ${o.op.operationId} confirmedBlock ${o.confirmedBlock} is after finalBlock ${input.finalBlock}`,
       );
     }
     const isSettled = settled.has(o.op.operationId);

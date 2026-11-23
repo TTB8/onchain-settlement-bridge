@@ -132,7 +132,7 @@ describe('expectedChainState', () => {
     { op: wd, parties: partiesOf(wd), confirmedBlock: null },
   ];
   const at = (atBlock: bigint) =>
-    expectedChainState({ entries, operations, userAddresses: ADDRESS, atBlock });
+    expectedChainState({ entries, operations, userAddresses: ADDRESS, atBlock, finalBlock: 30n });
 
   it('counts held funds (in-flight withdrawal) as still on chain', () => {
     expect(at(20n)).toEqual({
@@ -193,12 +193,56 @@ describe('expectedChainState', () => {
           { op: wd, parties: partiesOf(wd), confirmedBlock: null },
         ],
         atBlock: 25n,
+        finalBlock: 30n,
       },
     ],
   ])('rejects %s', (_label, patch) => {
     expect(() =>
-      expectedChainState({ entries, operations, userAddresses: ADDRESS, atBlock: 20n, ...patch }),
+      expectedChainState({
+        entries,
+        operations,
+        userAddresses: ADDRESS,
+        atBlock: 20n,
+        finalBlock: 20n,
+        ...patch,
+      }),
     ).toThrow(InvalidInputError);
+  });
+
+  it('rejects a settlement confirmed after finalBlock, and atBlock after finalBlock (review N-1)', () => {
+    // The review's PoC shape: a settled deposit "confirmed" at block 10^18.
+    const forged = [
+      { op: dep, parties: partiesOf(dep), confirmedBlock: 10n ** 18n },
+      ...operations.slice(1),
+    ];
+    expect(() =>
+      expectedChainState({
+        entries,
+        operations: forged,
+        userAddresses: ADDRESS,
+        atBlock: 20n,
+        finalBlock: 30n,
+      }),
+    ).toThrow(/after finalBlock/);
+    expect(() =>
+      expectedChainState({
+        entries,
+        operations,
+        userAddresses: ADDRESS,
+        atBlock: 31n,
+        finalBlock: 30n,
+      }),
+    ).toThrow(InvalidInputError);
+    // Exactly at finalBlock is fine.
+    expect(
+      expectedChainState({
+        entries,
+        operations,
+        userAddresses: ADDRESS,
+        atBlock: 20n,
+        finalBlock: 20n,
+      }).supply,
+    ).toBe(100n);
   });
 
   it('runs the journal check first', () => {
@@ -208,6 +252,7 @@ describe('expectedChainState', () => {
         operations,
         userAddresses: ADDRESS,
         atBlock: 20n,
+        finalBlock: 20n,
       }),
     ).toThrow(JournalIntegrityError);
   });
@@ -279,6 +324,7 @@ describe('expectedChainState (seeded property test)', () => {
         operations: h.operations,
         userAddresses: ADDRESS,
         atBlock,
+        finalBlock: h.maxBlock,
       });
       const want = new Map<Address, bigint>();
       for (const o of h.operations) {
