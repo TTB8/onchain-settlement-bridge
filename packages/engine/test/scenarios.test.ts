@@ -1326,6 +1326,35 @@ describe('review round 2, N-1: drop patience survives a flaky node', () => {
     expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(1);
     expect(new Set(rig.signer.broadcasts)).toEqual(new Set([hash]));
     expect(rig.chain.balanceOf(alice.wallet as `0x${string}`)).toBe(9n);
+    expect((await opRow(db.prisma, dep.id)).resubmitsSoFar).toBe(3); // the extra one was uncounted
+  });
+
+  it('rebroadcasts do not use up the NEW-NONCE budget: a nonce taken after a counted rebroadcast still gets a new nonce', async () => {
+    const rig = await makeRig(db.prisma, { maxResubmits: 1 }, { automine: false });
+    const alice = await verifiedUser(rig);
+    rig.chain.mine();
+    const dep = await deposit(rig, alice, 4n);
+    await rig.engine.tick();
+    const [attempt] = await attemptsOf(db.prisma, dep.id);
+    rig.chain.dropTransaction(attempt?.hash as `0x${string}`);
+    rig.clock.advance(31_000);
+    await rig.engine.tick(); // counted rebroadcast: resubmitsSoFar 1 = maxResubmits
+    expect((await opRow(db.prisma, dep.id)).resubmitsSoFar).toBe(1);
+    rig.chain.dropTransaction(attempt?.hash as `0x${string}`);
+    await rig.chain.submit({
+      signer: 'settlement',
+      call: { kind: 'mint', to: alice.wallet as `0x${string}`, amount: 1n, ref: ref32() },
+      nonce: attempt?.nonce ?? 0,
+      fees: { maxFeePerGas: 10n ** 10n, maxPriorityFeePerGas: 10n ** 9n },
+    });
+    rig.chain.mine();
+    await rig.engine.tick();
+    const attempts = await attemptsOf(db.prisma, dep.id);
+    expect(await statusOf(dep.id)).toBe('submitted');
+    expect(attempts.map((a) => a.nonce)).toEqual([attempt?.nonce, (attempt?.nonce ?? 0) + 1]);
+    rig.chain.mine();
+    await rig.engine.tick();
+    expect(await statusOf(dep.id)).toBe('confirmed');
   });
 });
 
