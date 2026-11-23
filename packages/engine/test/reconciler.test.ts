@@ -374,8 +374,17 @@ describe('final block, reorgs and unknown runs (never a clean pass on bad reads)
     const rig = await rigFor({ confirmationDepth: 3 });
     const alice = await funded(rig, 10n);
     const dep = (await rig.engine.operations.requestDeposit(alice.id, 4n, randomUUID())).operation;
-    await rig.engine.tick(); // mined in the head block, 1 of 3 confirmations: submitted
+    const freeze = await rig.engine.compliance.requestFreeze({
+      address: alice.wallet,
+      reason: 'review',
+      idempotencyKey: randomUUID(),
+      requestedBy: 'ops',
+    });
+    await rig.engine.tick(); // both mined in the newest blocks, not final: submitted
     expect((await opRow(db.prisma, dep.id)).status).toBe('submitted');
+    expect((await changeRow(freeze.change.id)).status).toBe('submitted');
+    // At the head alice is frozen and holds 14; at the final block she is neither.
+    expect(rig.chain.complianceOf(wallet(alice)).frozen).toBe(true);
     const before = await reconcile(rig);
     expect(before.status).toBe('ok');
     rig.chain.reorg({ depth: 1 });
@@ -518,6 +527,16 @@ describe('deriveExpectedCompliance (checklist 13, pure)', () => {
     const pending: KnownComplianceChange = { ...unfreeze, status: 'submitted' };
     const out = deriveExpectedCompliance({ addresses: [], events, changes: [freeze, pending] });
     expect(out.get(A)).toEqual({ verified: false, frozen: true });
+  });
+
+  it('events are applied in chain order whatever order they arrive in (latest decision still in flight)', () => {
+    const events = [
+      { ...pos(12n, 0), kind: 'FrozenSet' as const, account: A, frozen: false, ref: unfreezeRef },
+      { ...pos(10n, 5), kind: 'FrozenSet' as const, account: A, frozen: true, ref: freezeRef },
+    ];
+    const inFlight: KnownComplianceChange = { ...unfreeze, status: 'submitted' };
+    const out = deriveExpectedCompliance({ addresses: [A], events, changes: [freeze, inFlight] });
+    expect(out.get(A)).toEqual({ verified: false, frozen: false });
   });
 
   it('observedEventOf refuses an indexed row missing a field', () => {

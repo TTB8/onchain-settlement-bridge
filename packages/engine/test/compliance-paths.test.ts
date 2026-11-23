@@ -15,6 +15,7 @@ import {
   ComplianceVersionConflictError,
   EvidenceRefusedError,
   IllegalTransitionError,
+  LeaseLostError,
   moveComplianceChange,
   type OutboxHandler,
   SignerRouter,
@@ -386,6 +387,60 @@ describe('ComplianceSubmitter refusals', () => {
     });
     expect(await capped.handle(row, context)).toHaveProperty('retryAt');
     expect(await attemptsOfChange(change.id)).toHaveLength(0);
+  });
+});
+
+describe('ComplianceSubmitter: lease fence and FAIL racing the attempt commit (review L-B)', () => {
+  it('a lease taken over while signing rolls the attempt back and sends nothing', async () => {
+    const rig = await makeRig(db.prisma);
+    const change = await freeze(rig, await insertUser(db.prisma));
+    await db.prisma.outboxMessage.updateMany({
+      where: { complianceChangeId: change.id },
+      data: { status: 'processing', lockedBy: 'me/1', lockedAt: rig.clock.now() },
+    });
+    const row = await db.prisma.outboxMessage.findFirstOrThrow({
+      where: { complianceChangeId: change.id },
+    });
+    await db.prisma.outboxMessage.updateMany({
+      where: { id: row.id },
+      data: { lockedBy: 'other/2' },
+    });
+    await expect(rig.engine.complianceSubmitter.handle(row, context)).rejects.toBeInstanceOf(
+      LeaseLostError,
+    );
+    expect(await attemptsOfChange(change.id)).toHaveLength(0);
+    expect((await changeRow(change.id)).status).toBe('requested');
+    expect(rig.signer.broadcasts).toHaveLength(0);
+  });
+
+  it('a FAIL committed while the bytes were being signed: the fence sees the cancelled row, nothing stored or sent', async () => {
+    const rig = await makeRig(db.prisma);
+    const change = await freeze(rig, await insertUser(db.prisma));
+    await db.prisma.outboxMessage.updateMany({
+      where: { complianceChangeId: change.id },
+      data: { status: 'processing', lockedBy: 'me/1', lockedAt: rig.clock.now() },
+    });
+    const row = await db.prisma.outboxMessage.findFirstOrThrow({
+      where: { complianceChangeId: change.id },
+    });
+    rig.signer.onSign = async () => {
+      await db.prisma.$transaction((tx) =>
+        moveComplianceChange(tx, {
+          changeId: change.id,
+          from: 'requested',
+          version: 0,
+          move: { event: 'FAIL', reason: 'rejected' },
+          at: rig.clock.now(),
+          note: 'operator cancelled',
+        }),
+      );
+    };
+    await expect(rig.engine.complianceSubmitter.handle(row, context)).rejects.toBeInstanceOf(
+      LeaseLostError,
+    );
+    expect(await attemptsOfChange(change.id)).toHaveLength(0);
+    expect((await changeRow(change.id)).status).toBe('failed');
+    expect(rig.signer.broadcasts).toHaveLength(0);
   });
 });
 
