@@ -1,0 +1,30 @@
+{
+  "name": "@bridge/worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The bridge worker (NestJS standalone application context, no HTTP server): builds the viem gateway and the BridgeEngine from validated environment variables and runs the engine loop until SIGTERM / SIGINT.",
+  "scripts": {
+    "start": "ts-node --transpile-only -r tsconfig-paths/register src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "jest --runInBand",
+    "test:cov": "jest --runInBand --coverage"
+  },
+  "dependencies": {
+    "@bridge/chain": "workspace:*",
+    "@bridge/db": "workspace:*",
+    "@bridge/engine": "workspace:*",
+    "@nestjs/common": "11.2.8",
+    "@nestjs/core": "11.2.8",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "ts-node": "10.9.2",
+    "tsconfig-paths": "4.2.0"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.2.8",
+    "@types/jest": "^29.5.14",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.15",
+    "viem": "2.57.16"
+  }
+}
