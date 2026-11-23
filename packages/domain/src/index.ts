@@ -13,3 +13,4 @@ export * from './accounts';
 export * from './ledger';
 export * from './operation';
 export * from './reference';
+export * from './compliance';
