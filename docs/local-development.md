@@ -157,6 +157,7 @@ are observations; the operation's `confirmed` status and block are what count.
 | ----------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `pnpm test`                               | Every package's suite, the end-to-end suite included                                      |
 | `pnpm test:e2e`                           | The end-to-end suite only (`e2e/`, about one minute)                                      |
+| `pnpm test:e2e:hermetic`                  | The e2e suite twice, next to planted stale deployment files and a held port 3000          |
 | `pnpm --filter @bridge/api test`          | One package                                                                               |
 | `pnpm lint && pnpm format:check && pnpm typecheck` | Static checks                                                                    |
 | `python3 scripts/harness/verify.py fast`  | The repo's harness checks for what you changed                                            |
@@ -179,9 +180,15 @@ engine the way the worker builds it.
   restarted chain.
 - `setup-local.unit` and `demo.unit`: the pure parts of both scripts.
 
-The files run in band (one at a time), because each one deploys with `forge script`, which
-writes one fixed pending record in `contracts/deployments`. Do not run `pnpm setup:local` while
-the e2e suite is running.
+The suite is **hermetic**: it never reads or writes your `contracts/deployments`, `.env`, dev
+database, compose Anvil, or ports 3000 / 8545. Forge writes its pending record to one fixed path
+inside the project root, so each test run deploys from its own temp forge root: `foundry.toml`
+copied, `src`, `script` and `lib` linked, and its own `deployments`, `out`, `cache` and
+`broadcast`. You can run it next to your own `pnpm setup:local` state and a running `pnpm dev`.
+`pnpm test:e2e:hermetic [--runs N]` proves this. It plants a stale `31337.json` and a
+`31337.pending.json` in the real `contracts/deployments` (only where you have none), holds port
+3000, runs the suite N times (default 2), requires every file under `contracts/deployments` and
+`contracts/broadcast` to be unchanged, then removes only what it planted.
 
 ### In CI
 
@@ -234,6 +241,11 @@ the old supply on the chain does not count against the new, empty ledger.
 
 **Wipe everything, the database volume included:** run `docker compose down -v`, then
 `docker compose up -d`, then `pnpm setup:local`.
+
+**`contracts/deployments/31337.pending.json exists: an unverified record ...`.** A deploy was
+aborted (or one is running right now in another terminal). Forge writes that pending record
+before the transactions are confirmed, so setup never overwrites or promotes it. Make sure no
+deploy is running, move the file away (for example to `/tmp`), and re-run `pnpm setup:local`.
 
 **`.env exists and points at another deployment`** (exit code 2). Run `pnpm setup:local --force`.
 Your old file is kept as `.env.bak`. Copy any edits you need (such as `API_PORT`) back into the

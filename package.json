@@ -41,6 +41,7 @@
     "test": "pnpm -r test",
     "test:cov": "pnpm -r test:cov",
     "test:e2e": "pnpm --filter @bridge/e2e test",
+    "test:e2e:hermetic": "node scripts/check-e2e-hermetic.mjs",
     "db:generate": "pnpm --filter @bridge/db db:generate",
     "db:seed": "pnpm --filter @bridge/db db:seed",
     "contracts:build": "cd contracts && forge build",

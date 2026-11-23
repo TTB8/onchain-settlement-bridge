@@ -18,7 +18,16 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -76,7 +85,36 @@ export function reserveDatabase(): { name: string; url: string; drop: () => Prom
   return { name, url: u.toString(), drop };
 }
 
-/** A temp directory holding the stack's `.env`, template and deployment record. */
+/** The repository's forge project (sources, scripts, libraries). Only ever READ by the suite. */
+export const REAL_CONTRACTS_DIR = join(REPO_ROOT, 'contracts');
+
+/**
+ * An isolated forge project root under `dir`: `foundry.toml` copied, `src`, `script` and `lib`
+ * linked to the repository's (read only: forge reads sources, the deploy script writes only under
+ * the root's own `deployments/`), and its OWN `deployments/`, `out/`, `cache/` and `broadcast/`.
+ * WHY: forge writes the pending record to one fixed path (`<root>/deployments/31337.pending.json`)
+ * and promotion reads `<root>/out`. Sharing the repository's would collide with a developer's own
+ * `setup:local` record, an aborted deploy, `test-promote.sh`, or another test run. Removing `dir`
+ * unlinks the links and never follows them.
+ *
+ * @param dir The workdir.
+ */
+export function isolatedContracts(dir: string): string {
+  const root = join(dir, 'contracts');
+  mkdirSync(join(root, 'deployments'), { recursive: true });
+  copyFileSync(join(REAL_CONTRACTS_DIR, 'foundry.toml'), join(root, 'foundry.toml'));
+  for (const linked of ['src', 'script', 'lib']) {
+    symlinkSync(join(REAL_CONTRACTS_DIR, linked), join(root, linked), 'dir');
+  }
+  // Fail closed: the isolation is only real if the writable parts are this root's own.
+  for (const own of ['deployments']) {
+    const st = lstatSync(join(root, own));
+    if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`${own} is not isolated`);
+  }
+  return root;
+}
+
+/** A temp directory holding the stack's `.env`, template and its own forge project root. */
 export interface Workdir {
   /** The directory. */
   readonly dir: string;
@@ -84,7 +122,9 @@ export interface Workdir {
   readonly envPath: string;
   /** `<dir>/.env.example`: the repository template pointed at this file's database and node. */
   readonly templatePath: string;
-  /** `<dir>/deployments`. */
+  /** `<dir>/contracts`: the isolated forge root (`isolatedContracts`). */
+  readonly contractsDir: string;
+  /** `<dir>/contracts/deployments`: where this run's pending and promoted records live. */
   readonly deploymentsDir: string;
   /** Removes the directory. */
   remove(): void;
@@ -102,11 +142,13 @@ export function makeWorkdir(databaseUrl: string, rpcUrl: string): Workdir {
   const templatePath = join(dir, '.env.example');
   const template = readFileSync(join(REPO_ROOT, '.env.example'), 'utf8');
   writeFileSync(templatePath, renderEnv(template, { DATABASE_URL: databaseUrl, RPC_URL: rpcUrl }));
+  const contractsDir = isolatedContracts(dir);
   return {
     dir,
     envPath: join(dir, '.env'),
     templatePath,
-    deploymentsDir: join(dir, 'deployments'),
+    contractsDir,
+    deploymentsDir: join(contractsDir, 'deployments'),
     remove: () => rmSync(dir, { recursive: true, force: true }),
   };
 }
@@ -127,7 +169,7 @@ export function setupLocal(
     repoRoot: REPO_ROOT,
     envPath: w.envPath,
     templatePath: w.templatePath,
-    deploymentsDir: w.deploymentsDir,
+    contractsDir: w.contractsDir,
     flags: { force: flags.force ?? false, resetDb: flags.resetDb ?? false, help: false },
     checkGitIgnore: false,
     log,

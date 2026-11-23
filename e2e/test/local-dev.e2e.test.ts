@@ -12,7 +12,7 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createPrismaClient } from '@bridge/db';
@@ -25,7 +25,14 @@ import { type AnvilNode, freePort, startAnvil } from '../../packages/chain/test/
 import { runDemo } from '../../scripts/lib/demo';
 import { parseEnvFile, SetupRefusal } from '../../scripts/lib/local-env';
 import { Rpc } from '../../scripts/lib/rpc';
-import { envFrom, makeWorkdir, reserveDatabase, setupLocal, type Workdir } from './support/stack';
+import {
+  envFrom,
+  makeWorkdir,
+  REPO_ROOT,
+  reserveDatabase,
+  setupLocal,
+  type Workdir,
+} from './support/stack';
 
 const db = reserveDatabase();
 let node: AnvilNode;
@@ -301,5 +308,31 @@ describe('pnpm setup:local', () => {
     }
     // Same deployer nonces on a fresh chain: the same addresses as before, so .env still fits.
     expect(fresh.env).toBe('unchanged');
+  });
+});
+
+describe('pnpm setup:local and a pending record left in the deployments directory', () => {
+  it('refuses it (never overwritten, never promoted), deploys nothing, and leaves the file byte for byte', async () => {
+    const own = reserveDatabase();
+    const chain = await startAnvil();
+    const w = makeWorkdir(own.url, chain.url);
+    try {
+      // What an aborted deploy leaves behind: a pending claim nobody verified.
+      const pending = join(w.deploymentsDir, '31337.pending.json');
+      const planted = '{"chainId":31337,"note":"an aborted deploy left this"}\n';
+      writeFileSync(pending, planted);
+      const r = await refusal(setupLocal(w, {}, log));
+      expect(r.message).toContain('31337.pending.json exists: an unverified record');
+      expect(r.message).toContain('move the file away');
+      expect(readFileSync(pending, 'utf8')).toBe(planted);
+      expect(existsSync(join(w.deploymentsDir, '31337.json'))).toBe(false);
+      expect(await chain.client.getBlockNumber()).toBe(0n); // nothing was sent
+      // The repository's own deployments directory was never involved.
+      expect(w.contractsDir.startsWith(REPO_ROOT)).toBe(false);
+    } finally {
+      w.remove();
+      await chain.stop();
+      await own.drop();
+    }
   });
 });

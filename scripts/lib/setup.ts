@@ -17,6 +17,11 @@
  *    unlocked on Anvil), mine `CONFIRMATION_DEPTH + 1` blocks (`anvil_mine`) so the record is deep
  *    enough, then `contracts/script/promote-deployment.sh` checks the record against the chain and
  *    writes `deployments/31337.json` (`PROMOTE_REPLACE=1` when an older local record exists).
+ *    A `deployments/31337.pending.json` already there is REFUSED, never overwritten: it is an
+ *    unverified claim from an aborted or a concurrent deploy (forge writes that one fixed path).
+ *    Everything forge and the promotion touch lives in ONE forge project root, `contractsDir`
+ *    (default `<root>/contracts`); the test suite passes its own isolated root, so it never
+ *    reads, writes or races a developer's `contracts/deployments`.
  * 7. One transaction: the ACTIVE `deployment` row (chain id from the node, addresses and
  *    deployment block from the VERIFIED record) and its two `signer_state` rows.
  * 8. `.env` from `.env.example` with TOKEN_ADDRESS / REGISTRY_ADDRESS filled, only if git ignores
@@ -38,7 +43,7 @@ import {
 } from 'node:fs';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
-import { delimiter, join, relative, resolve } from 'node:path';
+import { delimiter, join, relative } from 'node:path';
 
 import { createPrismaClient, ensureFiatClearingAccount, type PrismaClient } from '@bridge/db';
 
@@ -68,8 +73,13 @@ export interface SetupOptions {
   readonly envPath?: string;
   /** The template (default `<root>/.env.example`). */
   readonly templatePath?: string;
-  /** Where the promoted record lives (default `<root>/contracts/deployments`). */
-  readonly deploymentsDir?: string;
+  /**
+   * The forge project root that is built, deployed from and promoted in (default
+   * `<root>/contracts`). Its `deployments/` holds the pending and the promoted record, and its
+   * `out/` is what promotion compares the code against. Tests pass an isolated copy (sources
+   * linked, its own deployments, out, cache and broadcast), never the developer's.
+   */
+  readonly contractsDir?: string;
   /** The command-line flags. */
   readonly flags: SetupFlags;
   /** Check with git that `.env` is ignored (the CLI always does; a temp path is not in a repo). */
@@ -230,8 +240,8 @@ export async function runSetupLocal(o: SetupOptions): Promise<SetupResult> {
   const root = o.repoRoot;
   const envPath = o.envPath ?? join(root, '.env');
   const templatePath = o.templatePath ?? join(root, '.env.example');
-  const contractsDir = join(root, 'contracts');
-  const deploymentsDir = o.deploymentsDir ?? join(contractsDir, 'deployments');
+  const contractsDir = o.contractsDir ?? join(root, 'contracts');
+  const deploymentsDir = join(contractsDir, 'deployments');
   const dbPackageDir = join(root, 'packages', 'db');
   const shown = (p: string) => relative(root, p) || p;
 
@@ -339,11 +349,13 @@ export async function runSetupLocal(o: SetupOptions): Promise<SetupResult> {
       // 6. Deploy, confirm, promote.
       log('[6/8] deploying with contracts/script/Deploy.s.sol, then promoting');
       mkdirSync(deploymentsDir, { recursive: true });
-      const forgePending = join(contractsDir, 'deployments', `${LOCAL_CHAIN_ID}.pending.json`);
+      // Forge writes the pending record to this one fixed path. One already there is somebody's
+      // unverified claim (an aborted deploy, or one running now): never overwrite or promote it.
       const pending = join(deploymentsDir, `${LOCAL_CHAIN_ID}.pending.json`);
-      if (resolve(forgePending) !== resolve(pending) && existsSync(forgePending)) {
+      if (existsSync(pending)) {
         throw new SetupRefusal(
-          `${shown(forgePending)} exists (another deploy in progress?); move it away and re-run`,
+          `${shown(pending)} exists: an unverified record from an aborted or concurrent deploy. ` +
+            'Check that no deploy is running, move the file away, and re-run.',
         );
       }
       const env: Record<string, string | undefined> = { ...deployEnv(), ADMIN_ADDRESS: undefined };
@@ -363,10 +375,9 @@ export async function runSetupLocal(o: SetupOptions): Promise<SetupResult> {
         ],
         { cwd: contractsDir, env },
       );
-      if (!existsSync(forgePending)) {
+      if (!existsSync(pending)) {
         throw new SetupRefusal('the deploy script wrote no pending deployment record');
       }
-      if (resolve(forgePending) !== resolve(pending)) renameSync(forgePending, pending);
       // The record must be CONFIRMATION_DEPTH blocks deep, with no role change after the
       // confirmed block: an empty block more than the depth satisfies both on Anvil.
       await rpc.mine(depth + 1);
