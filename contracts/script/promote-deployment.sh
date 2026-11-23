@@ -337,8 +337,8 @@ py write "$tmp" "$block" "$confirmations" "chainId=${rec[chainId]}" \
   "${checksummed[@]}" || fail "could not write the verified record"
 chmod 644 "$tmp"
 
-if [[ -e "$final" ]]; then
-  # Only reachable with PROMOTE_REPLACE=1 on 31337 (checked above); rename is atomic.
+if [[ "$replace" == "1" && "$chain_id" == "31337" ]]; then
+  # The only case that may overwrite: an explicit replace on the local chain. Rename is atomic.
   mv -f "$tmp" "$final"
   echo "promote-deployment: replaced the existing record (PROMOTE_REPLACE=1, chain 31337)"
 else

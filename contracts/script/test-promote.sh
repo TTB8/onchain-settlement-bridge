@@ -209,5 +209,29 @@ PROMOTE_REPLACE=1 expect_refusal "PROMOTE_REPLACE=1 is ignored off chain 31337" 
   "only honoured on the local chain 31337" 84532 "$rpc"
 rm -f "$D/84532.json" "$D/84532.pending.json"
 
+# A record that appears WHILE the checks run (another operator promoted meanwhile) is never
+# overwritten: a cast shim creates it during the log read.
+shim="$T/shim"
+mkdir -p "$shim"
+real_cast="$(command -v cast)"
+cat >"$shim/cast" <<SHIM
+#!/usr/bin/env bash
+if [[ "\$*" == *eth_getLogs* && ! -e "$F" ]]; then echo '{"other":"operator"}' >"$F"; fi
+exec "$real_cast" "\$@"
+SHIM
+chmod +x "$shim/cast"
+rm -f "$F"
+cp "$T/pristine.json" "$P"
+before_pending="$(sha "$P")"
+if PATH="$shim:$PATH" run_promote 31337 "$rpc"; then
+  bad "a record appearing mid-run was overwritten (promotion succeeded)"
+elif ! grep -qF "appeared during the checks" "$T/out"; then
+  bad "mid-run record (wrong reason: $(tr '\n' ' ' <"$T/out"))"
+elif [[ "$(cat "$F")" == '{"other":"operator"}' && "$(sha "$P")" == "$before_pending" ]]; then
+  ok "a record appearing mid-run is not overwritten"
+else
+  bad "mid-run record (files changed)"
+fi
+
 echo "test-promote: $passed passed, $failed failed"
 [[ "$failed" -eq 0 ]]
