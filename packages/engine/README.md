@@ -241,7 +241,43 @@ eviction or a load balancer flap; a transaction every node keeps dropping after 
 person, and a resubmission can never pay twice (single-use reference), so the limit only bounds
 noise and gas. `start()`/`stop()` loop around `tick()` without overlap.
 
-### Known limit: a dead nonce blocks the signer
+### Review fixes (Patrick, round 1)
+
+- **H-1, drops and give-ups.** A dropped attempt is retried at most every `dropRetrySeconds`
+  (time, never pass count). If its `maxFeePerGas` is below the node's current estimate, the same
+  bytes would be dropped again, so a REPLACEMENT is signed: same nonce, same call, fees =
+  max(current estimate + margin, previous bumped), as a `bump` committed with its SUBMIT move.
+  A `give_up` verdict is acted on only `giveUpAfterSeconds` after the first attempt, and never
+  FAILs while the attempt's nonce is not final: the operation stays `submitted` (it could not be
+  reversed anyway) and `nonce_stuck` names the signer and the lowest non-final nonce, for this
+  and every operation queued behind it. A failed operation still not reversible after
+  `failedAlarmAfterSeconds` raises `failed_not_reversible`.
+- **M-1, signer binding.** Before any nonce read or signature, the gateway's settlement address
+  must equal `signer_state.address` of the operation's deployment (`assertSignerBound`). A
+  mismatch raises `signer_mismatch`; the submitter waits (`retryAt`) and the monitor decides
+  nothing (no confirmation, no reversal).
+- **M-4, unsent reservations.** A `ledger_reserved` operation older than `orphanAfterSeconds`
+  with no attempt and no live outbox row (its row died before anything was signed) is failed
+  (`rejected`) and reversed in ONE transaction that locks the operation row and re-checks every
+  condition. Safe because an attempt is only ever inserted together with SUBMIT `first`. If the
+  reference is consumed on chain, it is failed but not reversed (and escalated).
+- **L-1** `node_unreachable` after `headStallTicks` failed chain views; `indexer_stalled` after
+  `stallPasses` passes without progress. **L-2** the indexer's writes take
+  `pg_advisory_xact_lock(hashtext(deployment_id))` and compare-and-set the cursor; block inserts
+  use `skipDuplicates`; `tick()` isolates each component (`component_failed`, the others still
+  run). **L-3** a failed operation whose reference is consumed with no indexed event raises
+  `escalation`.
+- **Rollback audit.** The indexer's rollback audit row lists every deleted event (`deletedEvents`:
+  block, block hash, tx hash, log index, kind, ref, amount).
+
+### Info (documented, not enforced)
+
+- One outbox row per (deployment, signer, nonce) is lock discipline only (`signer_state FOR
+  UPDATE` + `nextNonce` over every attempt nonce); there is no database constraint.
+- The default `AlarmLog` is in memory. The application must wire a real `AlarmSink` (monitoring),
+  or alarms are lost on restart.
+
+### Known limit: a dead nonce blocks the signer (accepted, documented)
 
 An attempt that was dropped everywhere and given up keeps its nonce reserved (attempts are never
 deleted, and it can still mine). Until something uses that nonce, later transactions of the signer
