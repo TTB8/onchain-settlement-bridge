@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 
 import { ChainUnavailableError, SubmissionRejectedError } from '@bridge/chain';
 
-import { LeaseLostError, DeploymentMismatchError } from '../src';
+import { DeploymentMismatchError, LeaseLostError, moveOperation } from '../src';
 import { createTestDatabase, type TestDatabase } from './support/database';
 import { balanceOf, insertUser, type TestUser } from './support/fixtures';
 import {
@@ -45,6 +45,21 @@ async function deposit(rig: Rig, u: TestUser, amount: bigint) {
 
 async function statusOf(id: string): Promise<string> {
   return (await opRow(db.prisma, id)).status;
+}
+
+/** A person FAILs a submitted operation (any attempt it has stays recorded). */
+async function operatorFail(id: string): Promise<void> {
+  const op = await opRow(db.prisma, id);
+  await db.prisma.$transaction((tx) =>
+    moveOperation(tx, {
+      operationId: id,
+      from: 'submitted',
+      version: op.version,
+      move: { event: 'FAIL', reason: 'retries_exhausted' },
+      at: new Date(),
+      note: 'operator gave up',
+    }),
+  );
 }
 
 /** A deposit taken to `confirmed` through tick(). */
@@ -327,8 +342,8 @@ describe('unknown and rejected submissions (ADR 0009, obligations 3-4)', () => {
     expect(await balanceOf(db.prisma, alice.available)).toBe(20n);
   });
 
-  it('another node accepted what ours rejected: the rejected attempt still counts, the operation is not reversed, then settles late', async () => {
-    const rig = await makeRig(db.prisma, { maxBumps: 0 }, { automine: false });
+  it('another node accepted what ours rejected: the rejected attempt still counts, the failed operation is not reversed, then settles late', async () => {
+    const rig = await makeRig(db.prisma, {}, { automine: false });
     const alice = await verifiedUser(rig);
     rig.chain.mine();
     const dep = await deposit(rig, alice, 15n);
@@ -339,11 +354,8 @@ describe('unknown and rejected submissions (ADR 0009, obligations 3-4)', () => {
     expect(attempt?.status).toBe('dropped');
     expect(rig.chain.mempoolSize()).toBe(1); // ...but the pool holds it
 
-    rig.clock.advance(120_000);
-    await rig.engine.tick(); // stuck, no bumps allowed: give up
-    expect((await opRow(db.prisma, dep.id)).failureReason).toBe('retries_exhausted');
-    await rig.engine.tick();
-    await rig.engine.tick();
+    await operatorFail(dep.id); // e.g. a person gives up on it
+    for (let i = 0; i < 3; i += 1) await rig.engine.tick();
     expect(await statusOf(dep.id)).toBe('failed'); // NOT reversed: the attempt can still mine
 
     rig.chain.mine();
@@ -352,6 +364,28 @@ describe('unknown and rejected submissions (ADR 0009, obligations 3-4)', () => {
     expect(await statusOf(dep.id)).toBe('confirmed');
     expect(await balanceOf(db.prisma, alice.available)).toBe(15n);
     expect(rig.chain.balanceOf(alice.wallet as `0x${string}`)).toBe(15n);
+  });
+
+  it('review H-1c: giving up on the lowest non-final nonce keeps the operation submitted and raises nonce_stuck; queued operations behind it are not failed one by one', async () => {
+    const rig = await makeRig(db.prisma, { maxBumps: 0 }, { automine: false });
+    const alice = await verifiedUser(rig);
+    rig.chain.mine();
+    const ops = [];
+    for (const amount of [1n, 2n, 3n]) ops.push(await deposit(rig, alice, amount));
+    await rig.engine.tick(); // three attempts, nonces n, n+1, n+2, all pooled
+    rig.chain.setBaseFee(10n ** 11n); // above every fee cap they were signed with: all stuck
+    rig.clock.advance(120_000); // stuck and no bumps allowed: the domain gives up...
+    await rig.engine.tick();
+    for (const op of ops) expect(await statusOf(op.id)).toBe('submitted'); // ...but not yet (time)
+    expect(rig.alarms.ofKind('nonce_stuck')).toHaveLength(0);
+    rig.clock.advance(300_000); // past giveUpAfterSeconds
+    await rig.engine.tick();
+    for (const op of ops) expect(await statusOf(op.id)).toBe('submitted');
+    const stuck = rig.alarms.ofKind('nonce_stuck');
+    expect(new Set(stuck.map((a) => a.operationId))).toEqual(new Set(ops.map((o) => o.id)));
+    const [first] = await attemptsOf(db.prisma, ops[0]?.id ?? '');
+    expect(stuck[0]?.detail).toContain(`nonce ${first?.nonce} is the lowest non-final nonce`);
+    expect(stuck[0]?.detail).toContain(rig.chain.signerAddress('settlement'));
   });
 
   it('obligation 3: any read error means nothing is decided or written', async () => {
@@ -431,7 +465,7 @@ describe('reverts, drops, bumps and give-ups (ADR 0006, 0007)', () => {
     expect(await balanceOf(db.prisma, alice.available)).toBe(100n);
   });
 
-  it('dropped transaction: rebroadcast of the same bytes (SUBMIT resubmit), then confirmed', async () => {
+  it('dropped transaction: rebroadcast of the same bytes (SUBMIT resubmit) once dropRetrySeconds passed, then confirmed', async () => {
     const rig = await makeRig(db.prisma, {}, { automine: false });
     const alice = await verifiedUser(rig);
     rig.chain.mine();
@@ -439,6 +473,9 @@ describe('reverts, drops, bumps and give-ups (ADR 0006, 0007)', () => {
     await rig.engine.tick();
     const [attempt] = await attemptsOf(db.prisma, dep.id);
     expect(rig.chain.dropTransaction(attempt?.hash as `0x${string}`)).toBe(true);
+    for (let i = 0; i < 5; i += 1) await rig.engine.tick(); // fast passes: patience is time
+    expect((await opRow(db.prisma, dep.id)).resubmitsSoFar).toBe(0);
+    rig.clock.advance(31_000);
     const t = await rig.engine.tick();
     expect(t.monitor.resubmitted).toBe(1);
     expect(rig.chain.mempoolHashes()).toEqual([attempt?.hash]);
@@ -448,6 +485,30 @@ describe('reverts, drops, bumps and give-ups (ADR 0006, 0007)', () => {
     expect(row.status).toBe('confirmed');
     expect(row.resubmitsSoFar).toBe(1);
     expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(1);
+  });
+
+  it('review H-1a: dropped because its fees fell below the base fee: a same-nonce replacement at current fees confirms', async () => {
+    const rig = await makeRig(db.prisma, {}, { automine: false });
+    const alice = await verifiedUser(rig);
+    rig.chain.mine();
+    const dep = await deposit(rig, alice, 18n);
+    await rig.engine.tick();
+    const [first] = await attemptsOf(db.prisma, dep.id);
+    rig.chain.setBaseFee((first?.maxFeePerGas ?? 0n) * 2n); // the old bytes can never be included
+    rig.chain.dropTransaction(first?.hash as `0x${string}`); // ...and the pool evicted them
+    rig.clock.advance(31_000);
+    const t = await rig.engine.tick();
+    expect(t.monitor.bumped).toBe(1);
+    expect(t.monitor.resubmitted).toBe(0);
+    const attempts = await attemptsOf(db.prisma, dep.id);
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]?.nonce).toBe(first?.nonce);
+    expect(attempts[1]?.bumpsSoFar).toBe(1);
+    expect((attempts[1]?.maxFeePerGas ?? 0n) > rig.chain.baseFee).toBe(true);
+    rig.chain.mine();
+    await rig.engine.tick();
+    expect(await statusOf(dep.id)).toBe('confirmed');
+    expect(rig.chain.balanceOf(alice.wallet as `0x${string}`)).toBe(18n);
   });
 
   it('stuck transaction: fee bump with the SAME nonce, then confirmed', async () => {
@@ -475,7 +536,7 @@ describe('reverts, drops, bumps and give-ups (ADR 0006, 0007)', () => {
     expect(rig.chain.balanceOf(alice.wallet as `0x${string}`)).toBe(13n);
   });
 
-  it('dropped and never mined: give up, and reverse ONLY once the nonce use is final (obligations 2, 4, 7)', async () => {
+  it('dropped and never mined: no FAIL while the nonce is not final (nonce_stuck); reverse ONLY once the nonce use is final (obligations 2, 4, 7)', async () => {
     const rig = await makeRig(
       db.prisma,
       { maxResubmits: 1, confirmationDepth: 3 },
@@ -488,14 +549,15 @@ describe('reverts, drops, bumps and give-ups (ADR 0006, 0007)', () => {
     const [attempt] = await attemptsOf(db.prisma, dep.id);
     const hash = attempt?.hash as `0x${string}`;
     rig.chain.dropTransaction(hash);
+    rig.clock.advance(31_000);
     await rig.engine.tick(); // dropped: resubmit (1 of 1)
     rig.chain.dropTransaction(hash);
-    await rig.engine.tick(); // dropped again: give up
-    const failed = await opRow(db.prisma, dep.id);
-    expect(failed.status).toBe('failed');
-    expect(failed.failureReason).toBe('dropped');
+    rig.clock.advance(31_000);
+    await rig.engine.tick(); // dropped again: the domain gives up, too early to act
+    rig.clock.advance(300_000);
     await rig.engine.tick();
-    expect(await statusOf(dep.id)).toBe('failed'); // nonce never used: it can still mine
+    expect(await statusOf(dep.id)).toBe('submitted'); // nonce never used: it can still mine
+    expect(rig.alarms.ofKind('nonce_stuck').length).toBeGreaterThan(0);
 
     // Something else takes the nonce (an operator's transaction from the same key).
     await rig.chain.submit({
@@ -506,11 +568,15 @@ describe('reverts, drops, bumps and give-ups (ADR 0006, 0007)', () => {
     });
     rig.chain.mine();
     await rig.engine.tick();
-    expect(await statusOf(dep.id)).toBe('failed'); // used at the head, not final yet
+    expect(await statusOf(dep.id)).toBe('submitted'); // used at the head, not final yet
     rig.chain.mine(1);
     await rig.engine.tick();
-    expect(await statusOf(dep.id)).toBe('failed'); // 2 of 3
+    expect(await statusOf(dep.id)).toBe('submitted'); // 2 of 3
     rig.chain.mine(1);
+    await rig.engine.tick(); // final: replaced for good, resubmissions used up
+    const failed = await opRow(db.prisma, dep.id);
+    expect(failed.status).toBe('failed');
+    expect(failed.failureReason).toBe('retries_exhausted');
     const t = await rig.engine.tick();
     expect(t.monitor.reversed).toBe(1);
     expect(await statusOf(dep.id)).toBe('reversed');
@@ -657,6 +723,7 @@ describe('reorgs and canonical evidence (obligations 9, 12, 15)', () => {
       10,
       () => {
         rig.chain.mine(1);
+        rig.clock.advance(31_000);
       },
     );
     const row = await opRow(db.prisma, dep.id);
@@ -684,14 +751,13 @@ describe('reorgs and canonical evidence (obligations 9, 12, 15)', () => {
 
 describe('deployment binding and alarms (obligations 10, 17)', () => {
   it("another deployment's failed operation is never touched (its evidence lives on another contract)", async () => {
-    const rigA = await makeRig(db.prisma, { maxBumps: 0 }, { automine: false });
+    const rigA = await makeRig(db.prisma, {}, { automine: false });
     const rigB = await makeRig(db.prisma);
     const alice = await verifiedUser(rigA);
     rigA.chain.mine();
     const dep = await deposit(rigA, alice, 8n);
     await rigA.engine.tick();
-    rigA.clock.advance(120_000);
-    await rigA.engine.tick(); // gave up; the attempt is still in A's pool
+    await operatorFail(dep.id); // the attempt is still in A's pool
     const failed = await opRow(db.prisma, dep.id);
     expect(failed.status).toBe('failed');
     const m = await rigB.engine.monitor.runOnce();
@@ -819,12 +885,19 @@ describe('each piece of reversal evidence blocks on its own (obligations 5, 6)',
     expect(await balanceOf(db.prisma, alice.available)).toBe(21n);
   });
 
-  it('referenceConsumedOnChain: a final consumed reference the index missed blocks the reversal', async () => {
+  it('referenceConsumedOnChain: a final consumed reference the index missed blocks the reversal, escalates (L-3) and alarms once it has waited (H-1d)', async () => {
     const rig = await makeRig(db.prisma, { confirmationDepth: 2 });
     const { dep } = await failedThenSettledOutside(rig);
     rig.chain.mine(3);
     for (let i = 0; i < 3; i += 1) await rig.engine.monitor.runOnce(); // no indexer pass
     expect(await statusOf(dep.id)).toBe('failed');
+    expect(rig.alarms.ofKind('escalation').some((a) => a.operationId === dep.id)).toBe(true);
+    expect(rig.alarms.ofKind('failed_not_reversible')).toHaveLength(0);
+    rig.clock.advance(3_600_000);
+    await rig.engine.monitor.runOnce();
+    expect(rig.alarms.ofKind('failed_not_reversible').some((a) => a.operationId === dep.id)).toBe(
+      true,
+    );
   });
 
   it('chainHasEventForRef: a stale indexed event (block since reorged away, index not yet rolled back) still blocks the reversal', async () => {

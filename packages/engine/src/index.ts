@@ -15,6 +15,7 @@ export * from './outbox-dispatcher';
 export * from './redact';
 export * from './signing';
 export * from './attempts';
+export * from './signer-binding';
 export * from './alarms';
 export * from './settlement-submitter';
 export * from './tx-monitor';

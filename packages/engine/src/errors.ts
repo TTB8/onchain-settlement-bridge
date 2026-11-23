@@ -31,7 +31,8 @@ export type EngineErrorCode =
   | 'RETRIES_EXHAUSTED'
   | 'LEDGER_SETUP'
   | 'LEASE_LOST'
-  | 'SIGNED_HASH_MISMATCH';
+  | 'SIGNED_HASH_MISMATCH'
+  | 'SIGNER_MISMATCH';
 
 /** Base class of every error the engine throws on purpose. */
 export abstract class EngineError extends Error {
@@ -196,6 +197,15 @@ export class LeaseLostError extends EngineError {
  */
 export class SignedHashMismatchError extends EngineError {
   readonly code = 'SIGNED_HASH_MISMATCH' as const;
+}
+
+/**
+ * The gateway signs with another address than the one recorded for the deployment in
+ * `signer_state` (a rotated or misconfigured key). Nonces and evidence belong to an address, so
+ * nothing is read, signed or decided until a person fixes the configuration (review M-1).
+ */
+export class SignerMismatchError extends EngineError {
+  readonly code = 'SIGNER_MISMATCH' as const;
 }
 
 /**

@@ -35,11 +35,18 @@ import {
   insertAttempt,
   recordBroadcast,
 } from './attempts';
-import { DeploymentMismatchError, InvalidRequestError, LeaseLostError } from './errors';
+import type { AlarmSink } from './alarms';
+import {
+  DeploymentMismatchError,
+  InvalidRequestError,
+  LeaseLostError,
+  SignerMismatchError,
+} from './errors';
 import { moveOperation } from './move-operation';
 import type { HandlerContext, OutboxHandler, OutboxOutcome } from './outbox-dispatcher';
 import type { Clock } from './ports';
 import { describeError, type SanitizeOptions } from './redact';
+import { assertSignerBound } from './signer-binding';
 import type { TransactionSigner } from './signing';
 import { runTransaction, type TransactionOptions } from './transaction';
 
@@ -79,6 +86,8 @@ export interface SettlementSubmitterOptions {
   readonly transactions?: TransactionOptions;
   /** Literal secrets (RPC URL, API key, host) removed from every error text written. */
   readonly secrets?: readonly string[];
+  /** Where alarms go (a signer mismatch). Default: nowhere but the row's wait. */
+  readonly alarms?: AlarmSink;
 }
 
 /** Throws `DeploymentMismatchError` unless `d` is the bound deployment. */
@@ -101,6 +110,7 @@ export class SettlementSubmitter implements OutboxHandler {
   private readonly fees: InitialFeePolicy;
   private readonly transactions: TransactionOptions;
   private readonly redaction: SanitizeOptions;
+  private readonly alarms: AlarmSink | undefined;
 
   /** @param options Database, gateway, signer, clock, binding and fee policy. */
   constructor(options: SettlementSubmitterOptions) {
@@ -112,6 +122,7 @@ export class SettlementSubmitter implements OutboxHandler {
     this.fees = options.fees;
     this.transactions = options.transactions ?? {};
     this.redaction = { secrets: [...(options.secrets ?? [])] };
+    this.alarms = options.alarms;
   }
 
   /** @inheritdoc */
@@ -148,6 +159,23 @@ export class SettlementSubmitter implements OutboxHandler {
     // Failed (or reversed) before anything was signed: nothing may ever be sent.
     if (op.status !== 'ledger_reserved') return 'done';
 
+    // The gateway's key must be the deployment's recorded signer before any nonce is read or
+    // anything signed (review M-1). A mismatch waits (and alarms); it never signs.
+    try {
+      await assertSignerBound(this.prisma, this.gateway, op.deploymentId, (detail) =>
+        this.alarms?.raise({
+          kind: 'signer_mismatch',
+          detail,
+          operationId: op.id,
+          at: this.clock.now(),
+        }),
+      );
+    } catch (err) {
+      if (err instanceof SignerMismatchError) {
+        return { retryAt: new Date(this.clock.now().getTime() + this.fees.feeWaitMs) };
+      }
+      throw err;
+    }
     // Network reads first, outside the transaction: no lock is held across a node call.
     const signerAddress = this.gateway.signerAddress('settlement');
     const { pending } = await this.gateway.getNonce('settlement');

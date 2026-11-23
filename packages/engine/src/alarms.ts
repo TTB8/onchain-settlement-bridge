@@ -24,7 +24,24 @@ export type AlarmKind =
   /** A `submitted` operation has no recorded attempt (should be impossible). */
   | 'missing_attempts'
   /** Examining one operation failed for a reason that is not a chain read. */
-  | 'examine_error';
+  | 'examine_error'
+  /**
+   * The signer's lowest non-final nonce belongs to an attempt the engine gave up on: every later
+   * transaction of that signer queues behind it. Needs a person (a cancel transaction).
+   */
+  | 'nonce_stuck'
+  /** A failed operation still cannot be reversed after the configured time. */
+  | 'failed_not_reversible'
+  /** The gateway signs with another address than the deployment's `signer_state` row. */
+  | 'signer_mismatch'
+  /** Chain reads kept failing for the configured number of passes (unreachable node). */
+  | 'node_unreachable'
+  /** The indexer could not finish a pass for the configured number of passes. */
+  | 'indexer_stalled'
+  /** A reserved operation that never signed anything was failed and released. */
+  | 'orphan_released'
+  /** One component of `tick()` threw; the others still ran. */
+  | 'component_failed';
 
 /** One raised alarm. */
 export interface EngineAlarm {

@@ -38,7 +38,14 @@
  */
 
 import type { ChainGateway, ContractCall, Fees, Receipt } from '@bridge/chain';
-import type { ChainAttempt, ChainEvent, Deployment, Operation, PrismaClient } from '@bridge/db';
+import {
+  type ChainAttempt,
+  type ChainEvent,
+  type Deployment,
+  lockRows,
+  type Operation,
+  type PrismaClient,
+} from '@bridge/db';
 import {
   type AttemptObservation,
   type AttemptPolicy,
@@ -46,7 +53,9 @@ import {
   assessAttempt,
   attemptCanStillMine,
   auditEntryFor,
+  bumpFees,
   ESCALATION_REASONS,
+  FeeCapExceededError,
   type FailureReason,
   type Finality,
   initialFees,
@@ -64,6 +73,7 @@ import {
   attemptRecordOf,
   broadcastAttempt,
   contractCallFromJson,
+  feesOf,
   insertAttempt,
   recordBroadcast,
 } from './attempts';
@@ -73,6 +83,7 @@ import { moveOperation, type OperationMove } from './move-operation';
 import type { Clock } from './ports';
 import { describeError, type SanitizeOptions } from './redact';
 import type { DeploymentBinding } from './settlement-submitter';
+import { assertSignerBound } from './signer-binding';
 import type { TransactionSigner } from './signing';
 import { runTransaction, type TransactionOptions } from './transaction';
 
@@ -92,8 +103,28 @@ export interface MonitorPolicy {
   readonly feeCap: bigint;
   /** Headroom on the max fee of a new-nonce resubmission, in basis points. */
   readonly initialFeeMarginBps: number;
-  /** Passes with an unchanged head before `head_stalled` is raised (>= 1). */
+  /**
+   * Passes with an unchanged head before `head_stalled` is raised, and failed chain-view reads
+   * before `node_unreachable` is raised (>= 1).
+   */
   readonly headStallTicks: number;
+  /**
+   * Seconds between two rebroadcasts of a dropped attempt. Patience is measured in time, not in
+   * passes: a fast poll interval must not burn through `maxResubmits` in seconds.
+   */
+  readonly dropRetrySeconds: number;
+  /**
+   * Seconds since an operation's first attempt before a `give_up` verdict is acted on. Before
+   * that, the engine keeps waiting (and rebroadcasting at `dropRetrySeconds`).
+   */
+  readonly giveUpAfterSeconds: number;
+  /** Seconds a failed operation may stay unreversible before `failed_not_reversible`. */
+  readonly failedAlarmAfterSeconds: number;
+  /**
+   * Seconds after which a `ledger_reserved` operation with no attempt and no live outbox row is
+   * failed and released (nothing was ever signed for it).
+   */
+  readonly orphanAfterSeconds: number;
 }
 
 /** Construction options for `TxMonitor`. */
@@ -140,9 +171,12 @@ export interface MonitorSummary {
   readonly bumped: number;
   /** Resubmissions (same bytes after a drop, or a new nonce). */
   readonly resubmitted: number;
+  /** Reserved operations that never signed anything, failed and released this pass. */
+  readonly released: number;
 }
 
-type Outcome = 'confirmed' | 'lateConfirmed' | 'failed' | 'reversed' | 'bumped' | 'resubmitted';
+type Outcome =
+  'confirmed' | 'lateConfirmed' | 'failed' | 'reversed' | 'bumped' | 'resubmitted' | 'released';
 
 /** The chain position of one pass. */
 interface ChainView {
@@ -210,6 +244,7 @@ export class TxMonitor {
   private readonly redaction: SanitizeOptions;
   private lastHead: bigint | null = null;
   private stalledPasses = 0;
+  private failedReads = 0;
 
   /** @param options Database, gateway, signer, clock, binding, policy and alarm sink. */
   constructor(options: TxMonitorOptions) {
@@ -240,6 +275,7 @@ export class TxMonitor {
       reversed: 0,
       bumped: 0,
       resubmitted: 0,
+      released: 0,
     };
     const idle = { ran: false, head: null, examined: 0, skipped: 0, ...counts };
     const deployment = await this.prisma.deployment.findUnique({
@@ -254,11 +290,20 @@ export class TxMonitor {
 
     let view: ChainView;
     try {
-      view = await this.readChainView();
+      view = await this.readChainView(deployment);
     } catch {
-      // Unknown (obligation 3): nothing is decided on a failed read.
+      // Unknown (obligation 3): nothing is decided on a failed read. An unreachable node is a
+      // stalled node too: count it (review L-1).
+      this.failedReads += 1;
+      if (this.failedReads >= this.policy.headStallTicks) {
+        this.alarm(
+          'node_unreachable',
+          `the chain view failed ${this.failedReads} pass(es) in a row`,
+        );
+      }
       return idle;
     }
+    this.failedReads = 0;
     this.trackHead(view.head);
 
     const foreign = await this.prisma.operation.count({
@@ -296,11 +341,26 @@ export class TxMonitor {
         this.alarm('examine_error', describeError(err, this.redaction), op.id);
       }
     }
+    try {
+      counts.released += await this.sweepOrphans(deployment, view);
+    } catch (err) {
+      if (!(err instanceof VersionConflictError)) {
+        this.alarm('examine_error', describeError(err, this.redaction));
+      }
+    }
     return { ran: true, head: view.head, examined: ops.length, skipped, ...counts };
   }
 
-  /** Head first, then the two nonce counts at explicit blocks (obligation 2). */
-  private async readChainView(): Promise<ChainView> {
+  /**
+   * The signer the gateway uses must be the deployment's recorded one before any nonce is read or
+   * anything is signed (review M-1): nonces belong to an address, and evidence read for another
+   * key would say "nonce free" for every attempt of ours. Then head first, then the two nonce
+   * counts at explicit blocks (obligation 2).
+   */
+  private async readChainView(d: Deployment): Promise<ChainView> {
+    await assertSignerBound(this.prisma, this.gateway, d.id, (detail) =>
+      this.alarm('signer_mismatch', detail),
+    );
     const chainId = await this.gateway.getChainId();
     if (BigInt(chainId) !== this.binding.chainId) {
       this.alarm(
@@ -506,16 +566,94 @@ export class TxMonitor {
         await this.bump(op, d, latest, verdict.fees);
         return 'bumped';
       case 'dropped':
-        await this.resubmitSame(op, latest);
-        return 'resubmitted';
+        return this.dropped(op, d, latest, now);
       case 'give_up':
-        await this.fail(op, giveUpReason(verdict.why), `gave up: ${verdict.why}`);
-        return 'failed';
+        return this.givenUp(op, ev, view, verdict.why, now);
       case 'replaced_or_lost':
         return this.replacedOrLost(op, d, view, ev, verdicts);
       default:
         return null;
     }
+  }
+
+  /**
+   * The node forgot the newest attempt (review H-1a). Not more often than every
+   * `dropRetrySeconds`. If its fees are below what the node asks now, the same bytes would be
+   * dropped again: sign a REPLACEMENT with the same nonce and call at current fees (a `bump`, in
+   * one commit with its SUBMIT move). Otherwise rebroadcast the same bytes (`resubmit`).
+   */
+  private async dropped(
+    op: Operation,
+    d: Deployment,
+    latest: AttemptWithCall,
+    now: Date,
+  ): Promise<Outcome | null> {
+    const lastSent = latest.lastCheckedAt ?? latest.submittedAt;
+    if (now.getTime() - lastSent.getTime() < this.policy.dropRetrySeconds * 1000) return null;
+    const estimate = await this.gateway.estimateFees();
+    if (latest.maxFeePerGas >= estimate.maxFeePerGas) {
+      await this.resubmitSame(op, latest);
+      return 'resubmitted';
+    }
+    let fees: Fees;
+    try {
+      const fresh = initialFees(estimate, {
+        marginBps: this.policy.initialFeeMarginBps,
+        cap: this.policy.feeCap,
+      });
+      const bumped = bumpFees(feesOf(latest), {
+        bumpBps: this.policy.bumpFeeBps,
+        cap: this.policy.feeCap,
+      });
+      fees = {
+        maxFeePerGas: max(fresh.maxFeePerGas, bumped.maxFeePerGas),
+        maxPriorityFeePerGas: max(fresh.maxPriorityFeePerGas, bumped.maxPriorityFeePerGas),
+      };
+    } catch (err) {
+      if (!(err instanceof FeeCapExceededError)) throw err;
+      this.alarm(
+        'nonce_stuck',
+        `settlement nonce ${latest.nonce}: the fees the node asks exceed the fee cap`,
+        op.id,
+      );
+      return null;
+    }
+    await this.bump(op, d, latest, fees);
+    return 'bumped';
+  }
+
+  /**
+   * The domain gave up (review H-1b, H-1c). Nothing happens before `giveUpAfterSeconds` since
+   * the first attempt. After that, while the attempt's nonce is not final (it is the signer's
+   * lowest non-final nonce, or queued behind it), FAILing would release nothing (the operation
+   * cannot be reversed while its nonce can still be used) and would only hide the real problem:
+   * every later transaction of the signer is stuck behind that nonce. So the operation stays
+   * `submitted` and `nonce_stuck` names the signer and the blocking nonce; a person cancels it.
+   */
+  private async givenUp(
+    op: Operation,
+    ev: Evidence,
+    view: ChainView,
+    why: 'max_bumps' | 'fee_cap' | 'max_resubmits',
+    now: Date,
+  ): Promise<Outcome | null> {
+    const first = ev.attempts[0];
+    const latest = ev.attempts[ev.attempts.length - 1];
+    if (first === undefined || latest === undefined) return null;
+    if (now.getTime() - first.submittedAt.getTime() < this.policy.giveUpAfterSeconds * 1000) {
+      return null;
+    }
+    if (latest.nonce >= view.finalNonce) {
+      this.alarm(
+        'nonce_stuck',
+        `settlement signer ${this.gateway.signerAddress('settlement')}: nonce ${view.finalNonce} ` +
+          `is the lowest non-final nonce; this operation's nonce ${latest.nonce} gave up (${why})`,
+        op.id,
+      );
+      return null;
+    }
+    await this.fail(op, giveUpReason(why), `gave up: ${why}`);
+    return 'failed';
   }
 
   /**
@@ -558,7 +696,10 @@ export class TxMonitor {
     ev: Evidence,
   ): Promise<Outcome | null> {
     const reason = op.failureReason;
-    if (reason === null || ESCALATION_REASONS.has(reason)) return null;
+    if (reason === null || ESCALATION_REASONS.has(reason)) {
+      this.alarmIfLong(op);
+      return null;
+    }
     const anAttemptCanStillMine = ev.attempts.some((a, i) =>
       attemptCanStillMine(a, this.observation(ev, i), this.policy.confirmationDepth),
     );
@@ -573,9 +714,114 @@ export class TxMonitor {
       chainHasEventForRef: ev.events.length > 0,
       referenceConsumedOnChain,
     };
-    if (!mayReverse(evidence)) return null;
+    if (!mayReverse(evidence)) {
+      if (referenceConsumedOnChain && ev.events.length === 0) {
+        // Only a settlement consumes a reference: the money most likely moved (review L-3).
+        this.alarm(
+          'escalation',
+          'the reference is consumed on chain but the index has no event for it',
+          op.id,
+        );
+      }
+      this.alarmIfLong(op);
+      return null;
+    }
     await this.move(op, { event: 'REVERSE', evidence }, `reversed: ${reason}, final evidence`);
     return 'reversed';
+  }
+
+  /** `failed_not_reversible` once a failed operation has waited `failedAlarmAfterSeconds`. */
+  private alarmIfLong(op: Operation): void {
+    const waited = this.clock.now().getTime() - op.updatedAt.getTime();
+    if (waited >= this.policy.failedAlarmAfterSeconds * 1000) {
+      this.alarm(
+        'failed_not_reversible',
+        `failed (${String(op.failureReason)}) and not reversible for ${Math.floor(waited / 1000)} s`,
+        op.id,
+      );
+    }
+  }
+
+  /**
+   * Review M-4: a `ledger_reserved` operation older than `orphanAfterSeconds` with NO attempt and
+   * NO live outbox row (its row was dead-lettered before anything was signed) holds funds forever.
+   * It is provably unsent: an attempt is only ever inserted in the transaction of SUBMIT `first`,
+   * so "still ledger_reserved" means no attempt was committed. Inside ONE transaction, with the
+   * operation row locked and every condition re-checked there (a row claimed meanwhile, or an
+   * attempt committed meanwhile, stops it), FAIL (`rejected`) then REVERSE with evidence read
+   * this pass: no attempt, no indexed event, the reference unused at the final block.
+   */
+  private async sweepOrphans(d: Deployment, view: ChainView): Promise<number> {
+    const before = new Date(this.clock.now().getTime() - this.policy.orphanAfterSeconds * 1000);
+    const candidates = await this.prisma.operation.findMany({
+      where: { deploymentId: d.id, status: 'ledger_reserved', createdAt: { lte: before } },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: 50,
+    });
+    let released = 0;
+    for (const op of candidates) {
+      let used: boolean;
+      try {
+        used = await this.gateway.readReferenceUsed(
+          'token',
+          op.ref as `0x${string}`,
+          view.finalBlock,
+        );
+      } catch {
+        continue;
+      }
+      const at = this.clock.now();
+      const { value: done } = await runTransaction(
+        this.prisma,
+        async (tx) => {
+          await lockRows(tx, 'operation', [op.id]);
+          const fresh = await tx.operation.findUniqueOrThrow({ where: { id: op.id } });
+          if (fresh.status !== 'ledger_reserved' || fresh.version !== op.version) return false;
+          const live = await tx.outboxMessage.count({
+            where: { operationId: op.id, status: { in: ['pending', 'processing'] } },
+          });
+          const attempts = await tx.chainAttempt.count({
+            where: { outbox: { operationId: op.id } },
+          });
+          const events = await tx.chainEvent.count({ where: { deploymentId: d.id, ref: op.ref } });
+          if (live > 0 || attempts > 0) return false;
+          const failed = await moveOperation(tx, {
+            operationId: op.id,
+            from: 'ledger_reserved',
+            version: op.version,
+            move: { event: 'FAIL', reason: 'rejected' },
+            at,
+            note: 'reserved but never signed: its outbox row is gone',
+          });
+          const evidence = {
+            failureReason: 'rejected' as const,
+            anAttemptCanStillMine: false,
+            chainHasEventForRef: events > 0,
+            referenceConsumedOnChain: used,
+          };
+          if (!mayReverse(evidence)) return false;
+          await moveOperation(tx, {
+            operationId: op.id,
+            from: 'failed',
+            version: failed.version,
+            move: { event: 'REVERSE', evidence },
+            at,
+            note: 'released: nothing was ever signed for this operation',
+          });
+          return true;
+        },
+        this.transactions,
+      );
+      if (done) {
+        released += 1;
+        this.alarm(
+          'orphan_released',
+          'reserved operation never signed: failed and released',
+          op.id,
+        );
+      }
+    }
+    return released;
   }
 
   private observation(ev: Evidence, i: number): AttemptObservation {
@@ -759,4 +1005,8 @@ export class TxMonitor {
       at: this.clock.now(),
     });
   }
+}
+
+function max(a: bigint, b: bigint): bigint {
+  return a > b ? a : b;
 }

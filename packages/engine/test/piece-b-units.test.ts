@@ -178,6 +178,10 @@ describe('BridgeEngine construction and loop', () => {
       feeCap: 1n,
       initialFeeMarginBps: 0,
       headStallTicks: 1,
+      dropRetrySeconds: 1,
+      giveUpAfterSeconds: 1,
+      failedAlarmAfterSeconds: 1,
+      orphanAfterSeconds: 1,
     };
     expect(() => new TxMonitor({ ...base, policy: { ...policy, confirmationDepth: 0 } })).toThrow(
       RangeError,

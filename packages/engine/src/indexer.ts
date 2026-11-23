@@ -49,7 +49,7 @@ import type { AlarmSink } from './alarms';
 import { writeAudit } from './ledger-writes';
 import type { Clock } from './ports';
 import type { DeploymentBinding } from './settlement-submitter';
-import { runTransaction, type TransactionOptions } from './transaction';
+import { runTransaction, type TransactionOptions, type Tx } from './transaction';
 
 /** Indexer limits. */
 export interface IndexerPolicy {
@@ -59,6 +59,8 @@ export interface IndexerPolicy {
   readonly maxBatch: number;
   /** Stored blocks compared with the node each pass (>= depth). */
   readonly reorgWindow: number;
+  /** Passes in a row without progress (unknown / node behind) before `indexer_stalled`. Default 10. */
+  readonly stallPasses?: number;
 }
 
 /** Construction options for `Indexer`. */
@@ -157,6 +159,7 @@ export class Indexer {
   private readonly policy: IndexerPolicy;
   private readonly alarms: AlarmSink;
   private readonly transactions: TransactionOptions;
+  private stuckPasses = 0;
 
   /** @param options Database, gateway, clock, binding, limits and alarm sink. */
   constructor(options: IndexerOptions) {
@@ -181,6 +184,26 @@ export class Indexer {
 
   /** One pass. Never throws for a chain read: a failed read is `unknown` with nothing written. */
   async runOnce(): Promise<IndexerResult> {
+    const result = await this.pass();
+    // An indexer that cannot make progress is as bad as a stalled head (review L-1).
+    if (result.status === 'unknown' || result.status === 'node_behind') {
+      this.stuckPasses += 1;
+      const limit = this.policy.stallPasses ?? 10;
+      if (this.stuckPasses >= limit) {
+        this.alarms.raise({
+          kind: 'indexer_stalled',
+          detail: `no indexer progress for ${this.stuckPasses} pass(es) (last: ${result.status})`,
+          at: this.clock.now(),
+        });
+      }
+    } else {
+      this.stuckPasses = 0;
+    }
+    return result;
+  }
+
+  /** One pass, without the stall bookkeeping. */
+  private async pass(): Promise<IndexerResult> {
     const d = await this.prisma.deployment.findUnique({
       where: {
         chainId_tokenAddress: {
@@ -224,7 +247,7 @@ export class Indexer {
         return { status: 'halted' };
       }
       if (report.reorged && report.forkPoint !== null) {
-        return this.rollback(d.id, report.forkPoint, lastIndexed);
+        return this.rollback(d.id, report.forkPoint, lastIndexed, d.deploymentBlock);
       }
       if (report.nodeBehind) return { status: 'node_behind' };
 
@@ -258,6 +281,7 @@ export class Indexer {
       await runTransaction(
         this.prisma,
         async (tx) => {
+          await lockIndexer(tx, d.id, lastIndexed, d.deploymentBlock);
           const existing = await tx.indexedBlock.findMany({
             where: { deploymentId: d.id, number: { gte: range.fromBlock, lte: range.toBlock } },
           });
@@ -276,6 +300,7 @@ export class Indexer {
                 parentHash: b.parentHash.toLowerCase(),
                 timestamp: new Date(Number(b.timestamp) * 1000),
               })),
+            skipDuplicates: true,
           });
           await tx.chainEvent.createMany({
             data: events.map((e) => eventRow(d.id, e)),
@@ -309,34 +334,79 @@ export class Indexer {
     deploymentId: string,
     forkPoint: bigint,
     lastIndexed: bigint,
+    deploymentBlock: bigint,
   ): Promise<IndexerResult> {
     const at = this.clock.now();
-    const removed = await runTransaction(
-      this.prisma,
-      async (tx) => {
-        const del = await tx.indexedBlock.deleteMany({
-          where: { deploymentId, number: { gt: forkPoint } },
-        });
-        await tx.indexerState.update({
-          where: { deploymentId },
-          data: { lastIndexedBlock: forkPoint },
-        });
-        await writeAudit(
-          tx,
-          auditEntryFor({
-            entity: 'indexer',
-            entityId: deploymentId,
-            fromState: `last_indexed:${lastIndexed}`,
-            toState: `last_indexed:${forkPoint}`,
-            detail: `reorg: ${del.count} orphaned block(s) above ${forkPoint} removed with their events`,
-            at,
-          }),
-          { removedBlocks: del.count },
-        );
-        return del.count;
-      },
-      this.transactions,
-    );
+    let removed;
+    try {
+      removed = await runTransaction(
+        this.prisma,
+        async (tx) => {
+          await lockIndexer(tx, deploymentId, lastIndexed, deploymentBlock);
+          // Every event about to go, listed in the audit row (what the index believed, and why it
+          // no longer does).
+          const orphaned = await tx.chainEvent.findMany({
+            where: { deploymentId, blockNumber: { gt: forkPoint } },
+            orderBy: [{ blockNumber: 'asc' }, { logIndex: 'asc' }],
+          });
+          const del = await tx.indexedBlock.deleteMany({
+            where: { deploymentId, number: { gt: forkPoint } },
+          });
+          await tx.indexerState.update({
+            where: { deploymentId },
+            data: { lastIndexedBlock: forkPoint },
+          });
+          await writeAudit(
+            tx,
+            auditEntryFor({
+              entity: 'indexer',
+              entityId: deploymentId,
+              fromState: `last_indexed:${lastIndexed}`,
+              toState: `last_indexed:${forkPoint}`,
+              detail: `reorg: ${del.count} orphaned block(s) above ${forkPoint} removed with their events`,
+              at,
+            }),
+            {
+              removedBlocks: del.count,
+              removedEvents: orphaned.length,
+              deletedEvents: JSON.stringify(
+                orphaned.map((e) => ({
+                  blockNumber: e.blockNumber.toString(),
+                  blockHash: e.blockHash,
+                  txHash: e.txHash,
+                  logIndex: e.logIndex,
+                  kind: e.kind,
+                  ref: e.ref,
+                  amount: e.amount === null ? null : e.amount.toFixed(),
+                })),
+              ),
+            },
+          );
+          return del.count;
+        },
+        this.transactions,
+      );
+    } catch (err) {
+      if (err instanceof ChainMovedError) return { status: 'unknown' };
+      throw err;
+    }
     return { status: 'rolled_back', forkPoint, removed: removed.value };
   }
+}
+
+/**
+ * Serialises indexers of one deployment (review L-2): a transaction-scoped advisory lock on the
+ * deployment, then a compare-and-set on the cursor. A second indexer that read the same cursor
+ * waits for the lock, then sees the cursor moved and writes nothing (`ChainMovedError`).
+ */
+async function lockIndexer(
+  tx: Tx,
+  deploymentId: string,
+  expectedLast: bigint,
+  deploymentBlock: bigint,
+): Promise<void> {
+  await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtext(${deploymentId}))) AS l`;
+  const state = await tx.indexerState.findUnique({ where: { deploymentId } });
+  const current = state?.lastIndexedBlock ?? deploymentBlock - 1n;
+  if (current !== expectedLast) throw new ChainMovedError();
 }
