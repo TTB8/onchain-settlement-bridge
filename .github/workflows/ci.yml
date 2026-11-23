@@ -68,6 +68,15 @@ jobs:
         working-directory: contracts
         run: forge build --sizes
 
-      - name: Test
+      - name: Test (unit, fuzz and invariant)
         working-directory: contracts
         run: forge test -vvv
+
+      # Fuzz and invariant gas varies run to run, so the snapshot covers the deterministic tests.
+      - name: Gas snapshot has not regressed
+        working-directory: contracts
+        run: forge snapshot --check --no-match-test "testFuzz|invariant"
+
+      - name: Coverage
+        working-directory: contracts
+        run: forge coverage --report summary --no-match-coverage "(test|script)"

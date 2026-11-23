@@ -36,7 +36,10 @@
     "test": "pnpm -r test",
     "test:cov": "pnpm -r test:cov",
     "contracts:build": "cd contracts && forge build",
-    "contracts:test": "cd contracts && forge test"
+    "contracts:test": "cd contracts && forge test",
+    "contracts:snapshot": "cd contracts && forge snapshot --no-match-test \"testFuzz|invariant\"",
+    "contracts:snapshot:check": "cd contracts && forge snapshot --check --no-match-test \"testFuzz|invariant\"",
+    "contracts:coverage": "cd contracts && forge coverage --report summary --no-match-coverage \"(test|script)\""
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

@@ -13,3 +13,4 @@ contracts/cache/
 contracts/broadcast/
 # Deployments to a local Anvil are throwaway; testnet deployments are committed deliberately.
 contracts/deployments/31337.json
+contracts/deployments/test-output.json
