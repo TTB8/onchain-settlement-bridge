@@ -8,6 +8,7 @@
  * treated as "not allowed": a check that cannot see its input must fail closed.
  */
 
+import { type Finality, isFinal } from './confirmation';
 import {
   type ComplianceParty,
   ComplianceRejectedError,
@@ -168,16 +169,31 @@ export type ComplianceChangeStatus = 'requested' | 'submitted' | 'confirmed' | '
 /** The events that move a compliance change. */
 export type ComplianceChangeEvent = 'SUBMIT' | 'CONFIRM' | 'FAIL';
 
-/** The only legal edges of a compliance change, keyed `status:event`. */
+/**
+ * The only legal edges of a compliance change, keyed `status:event`.
+ *
+ *   requested --SUBMIT--> submitted --CONFIRM--> confirmed (terminal)
+ *       |                  |  ^                      ^
+ *       |                  +--+ SUBMIT (re-attempt)  | CONFIRM (late, gated)
+ *       +------FAIL------> failed -------------------+
+ *                  submitted --FAIL--^
+ *
+ * `requested:FAIL` covers a change refused before it is ever sent. `failed:CONFIRM` covers an
+ * attempt that landed after the engine gave up; it is GATED: apply it only when
+ * `judgeComplianceEvent` returns `confirm` (a final event whose content matches the change).
+ */
 export const COMPLIANCE_CHANGE_TRANSITIONS: ReadonlyMap<string, ComplianceChangeStatus> = new Map<
   string,
   ComplianceChangeStatus
 >([
   ['requested:SUBMIT', 'submitted'],
+  ['requested:FAIL', 'failed'],
   // Another attempt: a fee-bump replacement or a resubmission after a drop.
   ['submitted:SUBMIT', 'submitted'],
   ['submitted:CONFIRM', 'confirmed'],
   ['submitted:FAIL', 'failed'],
+  // Late confirmation of a failed change. Gated: only on judgeComplianceEvent(...) === confirm.
+  ['failed:CONFIRM', 'confirmed'],
 ]);
 
 /** The status after applying `event`. Throws `InvalidTransitionError` for an edge not in the table. */
@@ -190,4 +206,68 @@ export function transitionComplianceChange(
     throw new InvalidTransitionError(status, event, 'compliance_change');
   }
   return next;
+}
+
+/**
+ * What a compliance change writes on chain: which account, which flag, which value. This is also
+ * what the bridge remembers per reference, so reconciliation can check every registry event.
+ */
+export interface ComplianceChangeContent {
+  /** The account whose flag changes. */
+  readonly account: Address;
+  /** Which registry flag. */
+  readonly flag: ComplianceFlagChange['flag'];
+  /** The value written. */
+  readonly value: boolean;
+}
+
+/** The fields of a registry event that are compared with a change. Matches the chain's events. */
+export type ComplianceEventLike = { readonly blockNumber: bigint } & (
+  | { readonly kind: 'VerificationSet'; readonly account: Address; readonly verified: boolean }
+  | { readonly kind: 'FrozenSet'; readonly account: Address; readonly frozen: boolean }
+);
+
+/** The change a registry event records: `VerificationSet` sets `verified`, `FrozenSet` sets `frozen`. */
+export function complianceEventContent(event: ComplianceEventLike): ComplianceChangeContent {
+  return event.kind === 'VerificationSet'
+    ? { account: event.account, flag: 'verified', value: event.verified }
+    : { account: event.account, flag: 'frozen', value: event.frozen };
+}
+
+/**
+ * Whether a registry event is exactly the given change: the event kind's flag, the account and the
+ * value all match. A known reference used for another account (a front-run) does not match.
+ */
+export function complianceEventMatches(
+  change: ComplianceChangeContent,
+  event: ComplianceEventLike,
+): boolean {
+  const observed = complianceEventContent(event);
+  return (
+    observed.flag === change.flag &&
+    observed.account === change.account &&
+    observed.value === change.value
+  );
+}
+
+/** The verdict on a registry event for a compliance change. */
+export type ComplianceEventJudgement =
+  | { readonly verdict: 'confirm'; readonly event: 'CONFIRM' }
+  | { readonly verdict: 'wait' }
+  | { readonly verdict: 'conflict' };
+
+/**
+ * Judges a registry event carrying a change's reference: `wait` until it is final, then `confirm`
+ * if it matches the change exactly, else `conflict` (a person decides). The only evidence on which
+ * the engine may apply `submitted:CONFIRM` or the gated `failed:CONFIRM`.
+ */
+export function judgeComplianceEvent(
+  change: ComplianceChangeContent,
+  event: ComplianceEventLike,
+  finality: Finality,
+): ComplianceEventJudgement {
+  if (!isFinal(event.blockNumber, finality)) return { verdict: 'wait' };
+  return complianceEventMatches(change, event)
+    ? { verdict: 'confirm', event: 'CONFIRM' }
+    : { verdict: 'conflict' };
 }

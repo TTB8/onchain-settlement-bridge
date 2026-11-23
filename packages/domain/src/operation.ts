@@ -7,9 +7,18 @@
  * is easy to review line by line, and everything not listed is refused with a typed error.
  *
  *   requested --RESERVE--> ledger_reserved --SUBMIT--> submitted --CONFIRM--> confirmed (terminal)
- *                               |                        |  ^
- *                               |                        +--+ SUBMIT (gas bump / resubmission)
- *                               +--------FAIL------------+--FAIL--> failed --REVERSE--> reversed (terminal)
+ *                               |                        |  ^                     ^
+ *                               |                        +--+ SUBMIT              | CONFIRM (late,
+ *                               |                          (gas bump / resubmit)  |  gated)
+ *                               +--------FAIL------------+--FAIL--> failed -------+
+ *                                                                     |
+ *                                                                     +--REVERSE--> reversed (terminal)
+ *
+ * `failed` is not terminal: an attempt the engine gave up on can still land, and then the
+ * operation must settle late (`failed:CONFIRM`). That edge is GATED: the engine may apply it only
+ * on a `confirm` verdict from `lateConfirmation` (a final event that matches exactly). Funds stay
+ * held while an operation is failed and not reversed, so the ordinary settle entry is still valid.
+ * Nothing leaves `confirmed` or `reversed`.
  */
 
 import { type Finality, isFinal } from './confirmation';
@@ -76,6 +85,8 @@ export const OPERATION_TRANSITIONS: ReadonlyMap<string, OperationStatus> = new M
   ['ledger_reserved:FAIL', 'failed'],
   ['submitted:FAIL', 'failed'],
   ['failed:REVERSE', 'reversed'],
+  // Late settlement of a failed operation. Gated: apply only on lateConfirmation(...) === confirm.
+  ['failed:CONFIRM', 'confirmed'],
 ]);
 
 /** Whether `event` is legal from `status`. */
@@ -249,6 +260,26 @@ function judgeSettlementEvent(
     return { verdict: 'confirm', event: 'CONFIRM' };
   }
   return { verdict: 'reference_conflict', reason: 'reference_conflict', differences };
+}
+
+/**
+ * Whether a FAILED (not reversed) operation may settle late on the strength of `event`: `confirm`
+ * only when the event is final and matches the operation exactly, `wait` while it is not final,
+ * `reference_conflict` when it is final but differs. This is the only evidence on which the engine
+ * may apply the gated `failed:CONFIRM` edge, so a failed operation is never confirmed on weaker
+ * evidence than a submitted one.
+ *
+ * @param op The failed operation.
+ * @param event The settling-kind event on chain carrying the operation's reference.
+ * @param finality The current head and the confirmations required.
+ */
+export function lateConfirmation(
+  op: SettlementExpectation,
+  event: SettlingEventLike,
+  finality: Finality,
+): SettlementJudgement {
+  assertConsistentExpectation(op);
+  return judgeSettlementEvent(op, event, finality);
 }
 
 /** The contract error the token raises when a reference was already consumed. */

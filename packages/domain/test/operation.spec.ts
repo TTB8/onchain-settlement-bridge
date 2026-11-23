@@ -6,6 +6,7 @@ import {
   InvalidTransitionError,
   isTerminal,
   journalKindFor,
+  lateConfirmation,
   ESCALATION_REASONS,
   mayReverse,
   NOT_ALLOWED,
@@ -41,6 +42,8 @@ const LEGAL: Record<string, OperationStatus> = {
   'ledger_reserved:FAIL': 'failed',
   'submitted:FAIL': 'failed',
   'failed:REVERSE': 'reversed',
+  // Late, gated settlement of a failed operation (review M-2 decision).
+  'failed:CONFIRM': 'confirmed',
 };
 
 describe('operation state machine', () => {
@@ -57,10 +60,10 @@ describe('operation state machine', () => {
     });
   });
 
-  it('has exactly seven legal edges', () => {
+  it('has exactly eight legal edges', () => {
     let legal = 0;
     for (const s of STATUSES) for (const e of EVENTS) if (canTransition(s, e)) legal += 1;
-    expect(legal).toBe(7);
+    expect(legal).toBe(8);
   });
 
   it('reports the refused edge in the error', () => {
@@ -312,6 +315,57 @@ describe('resolveRevert: the duplicate-submission rule', () => {
   it('settlementDifferences is empty exactly for the matching event', () => {
     expect(settlementDifferences(deposit, mint(alice, 1000n))).toEqual([]);
     expect(settlementDifferences(deposit, mint(alice, 999n))).toHaveLength(1);
+  });
+});
+
+describe('lateConfirmation: a failed operation settling late (review M-2)', () => {
+  const alice = addr(0xa);
+  const deposit: SettlementExpectation = {
+    type: 'deposit',
+    amount: 1000n,
+    parties: { type: 'deposit', to: alice },
+  };
+  const mint = (amount: bigint, blockNumber: bigint): SettlingEventLike => ({
+    kind: 'Minted',
+    to: alice,
+    amount,
+    blockNumber,
+  });
+
+  it('confirms on a final, exactly matching event, and the edge failed -> confirmed exists', () => {
+    expect(lateConfirmation(deposit, mint(1000n, FINAL_BLOCK), FIN)).toEqual({
+      verdict: 'confirm',
+      event: 'CONFIRM',
+    });
+    expect(transition('failed', 'CONFIRM')).toBe('confirmed');
+  });
+
+  it('waits on a matching event that is not final', () => {
+    expect(lateConfirmation(deposit, mint(1000n, SHALLOW_BLOCK), FIN)).toEqual({ verdict: 'wait' });
+  });
+
+  it('reports a conflict, never a confirm, for a final event that differs', () => {
+    expect(lateConfirmation(deposit, mint(999n, FINAL_BLOCK), FIN)).toMatchObject({
+      verdict: 'reference_conflict',
+      differences: [{ field: 'amount', expected: 1000n, observed: 999n }],
+    });
+  });
+
+  it('rejects an operation whose type disagrees with its parties', () => {
+    expect(() =>
+      lateConfirmation(
+        { ...deposit, parties: { type: 'withdrawal', from: alice } },
+        mint(1000n, FINAL_BLOCK),
+        FIN,
+      ),
+    ).toThrow(InvalidInputError);
+  });
+
+  it('still leaves no edge out of reversed or confirmed', () => {
+    for (const e of EVENTS) {
+      expect(canTransition('reversed', e)).toBe(false);
+      expect(canTransition('confirmed', e)).toBe(false);
+    }
   });
 });
 
