@@ -65,6 +65,16 @@ export interface SubmitRequest {
   fees: Fees;
 }
 
+/**
+ * A transaction signed but not sent: the exact bytes to broadcast, and their hash
+ * (`hash === keccak256(raw)`). The engine persists both BEFORE broadcasting, so after a crash it
+ * can rebroadcast exactly the same bytes, and look the transaction up by hash.
+ */
+export interface SignedTransaction {
+  hash: TxHash;
+  raw: Hex;
+}
+
 /** The identifying fields of a block, enough to detect a reorganisation. */
 export interface BlockRef {
   number: bigint;
@@ -188,6 +198,30 @@ export interface ChainGateway {
    * sent.
    */
   submit(request: SubmitRequest): Promise<TxHash>;
+
+  /**
+   * Signs a transaction with the named signer's key and returns its bytes and hash, WITHOUT
+   * sending it and without consuming anything: the nonce and fees are used exactly as given (no
+   * nonce is allocated or reserved), and the node is not contacted, so it works during an outage.
+   * The same request always yields the same bytes and hash. Validates like `submit`: throws
+   * `SubmissionRejectedError` for a call sent with the wrong signer or for arguments that cannot be
+   * encoded, before signing.
+   *
+   * This is the first half of "persist every signed transaction before broadcasting": sign,
+   * store `{ hash, raw }` with the operation, then `sendRaw(raw)`.
+   */
+  signTransaction(request: SubmitRequest): Promise<SignedTransaction>;
+
+  /**
+   * Broadcasts exactly these signed bytes and returns their hash. Idempotent: bytes the node
+   * already knows (waiting in its pool, or already mined) return the hash successfully, so a
+   * rebroadcast after a crash or a timeout is always safe. Every other failure follows the same
+   * fail-safe discipline as `submit`: `NonceTooLowError` (the nonce was used by OTHER bytes),
+   * `ReplacementUnderpricedError`, `InsufficientFundsError`, `SubmissionRejectedError` (THIS node
+   * refused; the attempt still counts until its nonce is final) or `ChainUnavailableError`
+   * (outcome unknown). It never throws `AlreadyKnownError`.
+   */
+  sendRaw(raw: Hex): Promise<TxHash>;
 
   /** The receipt, or `null` if the transaction has not been mined. */
   getReceipt(hash: TxHash): Promise<Receipt | null>;

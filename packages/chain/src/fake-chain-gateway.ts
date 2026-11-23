@@ -22,6 +22,7 @@ import {
   parseEther,
   parseGwei,
   size,
+  hexToString,
   stringToHex,
   zeroAddress,
   zeroHash,
@@ -50,6 +51,7 @@ import {
   type Hex,
   type Receipt,
   type SignerName,
+  type SignedTransaction,
   type SubmitRequest,
   type TransactionInfo,
   type TxHash,
@@ -214,7 +216,43 @@ function labelAddress(label: string): Address {
 
 /** JSON with bigints, for hashing. */
 function stableJson(value: unknown): string {
-  return JSON.stringify(value, (_key, v: unknown) => (typeof v === 'bigint' ? `${v}n` : v));
+  return JSON.stringify(value, (_key, v: unknown) => {
+    if (typeof v === 'bigint') return `${v}n`;
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      // Sorted keys: identical requests encode identically whatever order their keys were in.
+      return Object.fromEntries(
+        Object.entries(v as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : 1)),
+      );
+    }
+    return v;
+  });
+}
+
+/** The prefix of the fake's signed-transaction encoding. */
+const RAW_PREFIX = 'fake-eip1559-tx:';
+
+/** What the fake's raw bytes carry: everything a real signed EIP-1559 transaction pins down. */
+interface DecodedRaw {
+  chainId: number;
+  from: Address;
+  signer: SignerName;
+  nonce: number;
+  call: ContractCall;
+  fees: Fees;
+}
+
+/** Decodes the fake's raw encoding, or returns undefined for bytes it did not produce. */
+function decodeRaw(raw: unknown): DecodedRaw | undefined {
+  if (typeof raw !== 'string' || !isHex(raw, { strict: true }) || raw.length <= 2) return undefined;
+  try {
+    const text = hexToString(raw as Hex);
+    if (!text.startsWith(RAW_PREFIX)) return undefined;
+    return JSON.parse(text.slice(RAW_PREFIX.length), (_key, v: unknown) =>
+      typeof v === 'string' && /^\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v,
+    ) as DecodedRaw;
+  } catch {
+    return undefined;
+  }
 }
 
 function isUint256(value: unknown): value is bigint {
@@ -387,13 +425,30 @@ export class FakeChainGateway implements ChainGateway {
 
   async submit(request: SubmitRequest): Promise<TxHash> {
     this.ensureAvailable();
-    const failure = this.pendingFailure;
-    if (failure) {
-      this.pendingFailure = undefined;
-      if (failure.accept) this.accept(request);
-      throw failure.error;
-    }
-    return this.accept(request);
+    return this.withInjectedFailure(() => this.admit(this.sign(request), false));
+  }
+
+  /**
+   * Signs without sending or consuming anything. Local, like a real key: it works while the fake
+   * is unavailable. The fake has no keys, so its `raw` is a deterministic encoding of
+   * `{ chainId, from, signer, nonce, call, fees }`, not a real Ethereum transaction; `hash` is
+   * `keccak256(raw)`, and it is the same hash `submit` returns for the same request.
+   */
+  async signTransaction(request: SubmitRequest): Promise<SignedTransaction> {
+    const { hash, raw } = this.sign(request);
+    return { hash, raw };
+  }
+
+  /**
+   * Broadcasts bytes from `signTransaction` (of a fake with the same signer addresses).
+   * Idempotent: bytes already in the pool or already mined return their hash. Bytes it cannot
+   * decode, bytes for another chain id, and bytes from a sender it does not know are refused
+   * with `SubmissionRejectedError`, worded like a node. Every other rule, and `failNextSubmit`,
+   * apply exactly as for `submit`.
+   */
+  async sendRaw(raw: Hex): Promise<TxHash> {
+    this.ensureAvailable();
+    return this.withInjectedFailure(() => this.admit(this.verifyRaw(raw), true));
   }
 
   async getReceipt(hash: TxHash): Promise<Receipt | null> {
@@ -536,8 +591,9 @@ export class FakeChainGateway implements ChainGateway {
   }
 
   /**
-   * The next `submit` throws `error`. By default nothing else happens; with `accept: true` the
-   * transaction is accepted first (the outcome-unknown case a real timeout produces).
+   * The next `submit` or `sendRaw` throws `error`. By default nothing else happens; with
+   * `accept: true` the transaction is accepted first (the outcome-unknown case a real timeout
+   * produces).
    */
   failNextSubmit(error: Error, options: FailNextSubmitOptions = {}): void {
     this.pendingFailure = { error, accept: options.accept ?? false };
@@ -726,8 +782,19 @@ export class FakeChainGateway implements ChainGateway {
     );
   }
 
-  /** Validates a submission against the node's rules, then pools it (and automines). */
-  private accept(request: SubmitRequest): TxHash {
+  /** Runs a submission, unless a failure was injected for it (see `failNextSubmit`). */
+  private withInjectedFailure(run: () => TxHash): TxHash {
+    const failure = this.pendingFailure;
+    if (failure) {
+      this.pendingFailure = undefined;
+      if (failure.accept) run();
+      throw failure.error;
+    }
+    return run();
+  }
+
+  /** Validates a request the way `submit` does and returns its canonical signed form. */
+  private sign(request: SubmitRequest): SignedTransaction & DecodedRaw {
     const { signer, nonce, fees } = request;
     const expected = SIGNER_FOR_CALL[request.call?.kind];
     if (!expected) throw new SubmissionRejectedError('unknown call kind');
@@ -748,12 +815,53 @@ export class FakeChainGateway implements ChainGateway {
         'fees must satisfy 0 <= maxPriorityFeePerGas <= maxFeePerGas',
       );
     }
-    const call = validateCall(request.call);
-    const cleanFees: Fees = {
-      maxFeePerGas: fees.maxFeePerGas,
-      maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+    const decoded: DecodedRaw = {
+      chainId: this.chainId,
+      from: this.signerAddress(signer),
+      signer,
+      nonce,
+      call: validateCall(request.call),
+      fees: { maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas },
     };
-    const hash = this.txHash({ signer, nonce, call, fees: cleanFees });
+    const raw = stringToHex(`${RAW_PREFIX}${stableJson(decoded)}`);
+    return { ...decoded, raw, hash: keccak256(raw) };
+  }
+
+  /** Checks raw bytes the way a node does before it looks at the pool. */
+  private verifyRaw(raw: Hex): SignedTransaction & DecodedRaw {
+    const decoded = decodeRaw(raw);
+    if (!decoded) {
+      throw new SubmissionRejectedError(
+        'submit: this node refused the submission: failed to decode transaction',
+      );
+    }
+    if (decoded.chainId !== this.chainId) {
+      throw new SubmissionRejectedError(
+        'submit: this node refused the submission: invalid chain id for signer',
+      );
+    }
+    if (this.signerAddresses[decoded.signer] !== decoded.from) {
+      // A real node would accept any validly signed sender; the fake only knows its two signers.
+      throw new SubmissionRejectedError('submit: this node refused the submission: invalid sender');
+    }
+    const canonical = this.sign(decoded);
+    if (canonical.raw !== raw.toLowerCase()) {
+      throw new SubmissionRejectedError(
+        'submit: this node refused the submission: failed to decode transaction',
+      );
+    }
+    return canonical;
+  }
+
+  /**
+   * Admits a signed transaction to the pool under the node's rules (and automines). With
+   * `idempotent`, bytes the node already knows (pooled or mined) return their hash instead of
+   * `AlreadyKnownError` or `NonceTooLowError`.
+   */
+  private admit(tx: SignedTransaction & DecodedRaw, idempotent: boolean): TxHash {
+    const { hash, signer, nonce, call } = tx;
+    const cleanFees = tx.fees;
+    if (idempotent && (this.pool.has(hash) || this.minedIn.has(hash))) return hash;
 
     const confirmed = this.head.state.nonces[signer];
     if (nonce < confirmed) {

@@ -32,6 +32,7 @@ import {
   encodeFunctionData,
   http,
   isAddress,
+  isHex,
   keccak256,
   type Abi,
   type LocalAccount,
@@ -64,6 +65,7 @@ import {
   type Hex,
   type Receipt,
   type SignerName,
+  type SignedTransaction,
   type SubmitRequest,
   type TransactionInfo,
   type TxHash,
@@ -298,6 +300,7 @@ const DEFINITE_REJECTIONS: readonly RegExp[] = [
   /invalid chain ?id|chain ?id mismatch|incompatible chain ?id|wrong chain ?id/,
   /nonce (is )?too high|nonce gap/,
   /priority fee per gas higher than max fee per gas|tip (above|higher than) fee cap/,
+  /failed to decode transaction|rlp: |empty transaction data|transaction type not supported|invalid transaction encoding/,
 ];
 
 /**
@@ -487,25 +490,61 @@ export class ViemChainGateway implements ChainGateway {
 
   async submit(request: SubmitRequest): Promise<TxHash> {
     try {
-      return await this.#submit(request);
+      const signed = await this.#sign(request, 'submit');
+      return await this.#broadcast(signed.raw, signed.hash, false);
     } catch (error) {
       throw sanitizeError(error, this.#redact);
     }
   }
 
-  /** `submit` without the final redaction pass. */
-  async #submit(request: SubmitRequest): Promise<TxHash> {
+  /**
+   * Signs locally with the named signer's account (EIP-1559, the configured chain id, the fixed
+   * gas limit, value 0), exactly as `submit` would, and returns the bytes and their hash. The node
+   * is not contacted: this works during an outage and does not run the chain-id check (`sendRaw`
+   * does). Signing is deterministic (RFC 6979), so the same request gives the same bytes.
+   */
+  async signTransaction(request: SubmitRequest): Promise<SignedTransaction> {
+    try {
+      return await this.#sign(request, 'signTransaction');
+    } catch (error) {
+      throw sanitizeError(error, this.#redact);
+    }
+  }
+
+  /**
+   * Broadcasts exactly these bytes, after the chain-id check. Idempotent: "already known" returns
+   * the hash; "nonce too low" returns the hash only if the node knows a transaction with exactly
+   * this hash (pooled or mined), and otherwise stays `NonceTooLowError` (other bytes used the
+   * nonce). Every other failure is mapped by `mapSubmitError`, so an unrecognised answer is an
+   * unknown outcome, and every error is redacted.
+   */
+  async sendRaw(raw: Hex): Promise<TxHash> {
+    try {
+      if (typeof raw !== 'string' || !isHex(raw, { strict: true }) || raw.length <= 2) {
+        throw new SubmissionRejectedError(
+          'sendRaw: not signed transaction bytes (empty or not hex)',
+        );
+      }
+      const bytes = raw.toLowerCase() as Hex;
+      return await this.#broadcast(bytes, keccak256(bytes), true);
+    } catch (error) {
+      throw sanitizeError(error, this.#redact);
+    }
+  }
+
+  /** Validates, encodes and signs a request. Nothing is sent. */
+  async #sign(request: SubmitRequest, op: string): Promise<SignedTransaction> {
     const kind = request.call?.kind;
     const expected = SIGNER_FOR_CALL[kind];
-    if (!expected) throw new SubmissionRejectedError('submit: unknown call kind');
+    if (!expected) throw new SubmissionRejectedError(`${op}: unknown call kind`);
     if (request.signer !== expected) {
       throw new SubmissionRejectedError(
-        `submit: ${kind} must be sent by the ${expected} signer, not ${String(request.signer)}`,
+        `${op}: ${kind} must be sent by the ${expected} signer, not ${String(request.signer)}`,
       );
     }
     const { nonce, fees } = request;
     if (!Number.isSafeInteger(nonce) || nonce < 0) {
-      throw new SubmissionRejectedError('submit: nonce must be a non-negative integer');
+      throw new SubmissionRejectedError(`${op}: nonce must be a non-negative integer`);
     }
     if (
       typeof fees?.maxFeePerGas !== 'bigint' ||
@@ -514,7 +553,7 @@ export class ViemChainGateway implements ChainGateway {
       fees.maxPriorityFeePerGas > fees.maxFeePerGas
     ) {
       throw new SubmissionRejectedError(
-        'submit: fees must satisfy 0 <= maxPriorityFeePerGas <= maxFeePerGas',
+        `${op}: fees must satisfy 0 <= maxPriorityFeePerGas <= maxFeePerGas`,
       );
     }
 
@@ -524,12 +563,11 @@ export class ViemChainGateway implements ChainGateway {
       ({ to, data } = this.encode(request.call));
     } catch (error) {
       throw new SubmissionRejectedError(
-        `submit: invalid arguments for ${kind}`,
+        `${op}: invalid arguments for ${kind}`,
         safeCause(error, this.#redact),
       );
     }
 
-    await this.ensureChain();
     const account = this.#accounts[expected];
     let raw: Hex;
     try {
@@ -546,14 +584,42 @@ export class ViemChainGateway implements ChainGateway {
       });
     } catch {
       // Deliberately no cause: signing errors come from the key holder.
-      throw new SubmissionRejectedError('submit: the transaction could not be signed');
+      throw new SubmissionRejectedError(`${op}: the transaction could not be signed`);
     }
-    const hash = keccak256(raw);
+    const bytes = raw.toLowerCase() as Hex;
+    return { hash: keccak256(bytes), raw: bytes };
+  }
+
+  /**
+   * Sends signed bytes after the chain-id check. `idempotent` turns "the node already has these
+   * exact bytes" into success (`sendRaw`); without it the typed errors are thrown (`submit`).
+   */
+  async #broadcast(raw: Hex, hash: TxHash, idempotent: boolean): Promise<TxHash> {
+    await this.ensureChain();
     try {
       const sent = await this.#client.sendRawTransaction({ serializedTransaction: raw });
       return sent.toLowerCase() as TxHash;
     } catch (error) {
-      throw mapSubmitError(error, hash, this.#redact);
+      const mapped = mapSubmitError(error, hash, this.#redact);
+      if (!idempotent) throw mapped;
+      if (mapped instanceof AlreadyKnownError) return hash;
+      if (mapped instanceof NonceTooLowError && (await this.#nodeKnows(hash))) return hash;
+      throw mapped;
+    }
+  }
+
+  /** Whether the node knows a transaction with this hash (pooled or mined), from any sender. */
+  async #nodeKnows(hash: TxHash): Promise<boolean> {
+    try {
+      await this.#client.getTransaction({ hash });
+      return true;
+    } catch (error) {
+      if (error instanceof TransactionNotFoundError) return false;
+      // The nonce is used and we cannot tell by whom: the outcome is unknown.
+      throw new ChainUnavailableError(
+        'sendRaw: nonce too low and the lookup by hash failed; the outcome is unknown',
+        safeCause(error, this.#redact),
+      );
     }
   }
 

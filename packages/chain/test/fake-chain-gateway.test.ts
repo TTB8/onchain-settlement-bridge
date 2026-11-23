@@ -3,7 +3,7 @@
  * control. The fake is what every other package's tests trust, so it is tested exhaustively.
  */
 
-import { parseGwei } from 'viem';
+import { hexToString, keccak256, parseGwei, stringToHex } from 'viem';
 
 import {
   AlreadyKnownError,
@@ -1399,5 +1399,150 @@ describe('FakeChainGateway: failure controls', () => {
     const { chain } = setup();
     expect(await chain.getReceipt(`0x${'2'.repeat(64)}`)).toBeNull();
     expect(await chain.getTransaction(`0x${'2'.repeat(64)}`)).toBeNull();
+  });
+});
+
+describe('FakeChainGateway: signTransaction and sendRaw', () => {
+  it('signing consumes nothing, sends nothing, is deterministic and hash = keccak256(raw)', async () => {
+    const { chain } = setup({ automine: false });
+    const a = await chain.signTransaction(mintRequest(0));
+    const b = await chain.signTransaction(mintRequest(0));
+    expect(b).toEqual(a);
+    expect(a.hash).toBe(keccak256(a.raw));
+    // Key order in the request does not matter.
+    const reordered = await chain.signTransaction({
+      fees: { maxPriorityFeePerGas: FEES.maxPriorityFeePerGas, maxFeePerGas: FEES.maxFeePerGas },
+      nonce: 0,
+      call: { ref: ref(1), amount: ONE, to: alice, kind: 'mint' },
+      signer: 'settlement',
+    });
+    expect(reordered).toEqual(a);
+    expect(await chain.getNonce('settlement')).toEqual({ confirmed: 0, pending: 0 });
+    expect(chain.mempoolSize()).toBe(0);
+    expect(await chain.getHeadBlock()).toBe(0n);
+    expect(await chain.getTransaction(a.hash)).toBeNull();
+    // Different nonce or fees: different bytes.
+    expect((await chain.signTransaction(mintRequest(1))).hash).not.toBe(a.hash);
+    expect((await chain.signTransaction(mintRequest(0, scale(FEES, 2n, 1n)))).hash).not.toBe(
+      a.hash,
+    );
+  });
+
+  it('the signed hash is the hash submit returns for the same request', async () => {
+    const { chain } = setup();
+    const signed = await chain.signTransaction(mintRequest(0));
+    expect(await new FakeChainGateway().submit(mintRequest(0))).toBe(signed.hash);
+  });
+
+  it('signing validates like submit and works while the node is unavailable', async () => {
+    const { chain } = setup();
+    await expect(
+      chain.signTransaction({ ...mintRequest(0), signer: 'compliance' }),
+    ).rejects.toBeInstanceOf(SubmissionRejectedError);
+    await expect(chain.signTransaction(mintRequest(-1))).rejects.toBeInstanceOf(
+      SubmissionRejectedError,
+    );
+    await expect(
+      chain.signTransaction(mintRequest(0, FEES, '0x12' as never)),
+    ).rejects.toBeInstanceOf(SubmissionRejectedError);
+    chain.setUnavailable(true);
+    await expect(chain.signTransaction(mintRequest(0))).resolves.toMatchObject({
+      hash: expect.any(String),
+    });
+    await expect(
+      chain.sendRaw((await chain.signTransaction(mintRequest(0))).raw),
+    ).rejects.toBeInstanceOf(ChainUnavailableError);
+  });
+
+  it('sendRaw mines the signed transaction, and rebroadcasting known bytes returns the hash', async () => {
+    const { chain, d } = setup();
+    await d.verify(alice);
+    const { hash, raw } = await chain.signTransaction(mintRequest(0));
+    expect(await chain.sendRaw(raw)).toBe(hash);
+    expect(await chain.getReceipt(hash)).toMatchObject({ status: 'success' });
+    expect(chain.balanceOf(alice)).toBe(ONE);
+    // Already mined: the same bytes again succeed, change nothing, and mine nothing new.
+    const head = await chain.getHeadBlock();
+    expect(await chain.sendRaw(raw)).toBe(hash);
+    expect(await chain.sendRaw(raw.toUpperCase().replace('0X', '0x') as typeof raw)).toBe(hash);
+    expect(await chain.getHeadBlock()).toBe(head);
+    expect(chain.balanceOf(alice)).toBe(ONE);
+    // submit keeps its strict behaviour for the same request.
+    await expect(chain.submit(mintRequest(0))).rejects.toBeInstanceOf(NonceTooLowError);
+  });
+
+  it('rebroadcasting pooled bytes returns the hash (no AlreadyKnownError)', async () => {
+    const { chain } = setup({ automine: false });
+    const { hash, raw } = await chain.signTransaction(mintRequest(0));
+    expect(await chain.sendRaw(raw)).toBe(hash);
+    expect(await chain.sendRaw(raw)).toBe(hash);
+    expect(chain.mempoolSize()).toBe(1);
+    await expect(chain.submit(mintRequest(0))).rejects.toBeInstanceOf(AlreadyKnownError);
+  });
+
+  it('dropped or reorged-out bytes can be rebroadcast exactly', async () => {
+    const { chain } = setup({ automine: false });
+    const { hash, raw } = await chain.signTransaction(mintRequest(0));
+    await chain.sendRaw(raw);
+    chain.dropTransaction(hash);
+    expect(await chain.getTransaction(hash)).toBeNull();
+    expect(await chain.sendRaw(raw)).toBe(hash);
+    chain.mine();
+    chain.reorg({ depth: 1, dropTransactions: true });
+    expect(await chain.getTransaction(hash)).toBeNull();
+    expect(await chain.sendRaw(raw)).toBe(hash);
+    chain.mine();
+    expect(await chain.getReceipt(hash)).not.toBeNull();
+  });
+
+  it('other bytes for a used nonce, an underpriced replacement and an unaffordable fee are errors', async () => {
+    const { chain } = setup({ automine: false });
+    const first = await chain.signTransaction(mintRequest(0));
+    await chain.sendRaw(first.raw);
+    const sameFees = await chain.signTransaction(mintRequest(0, FEES, ref(2)));
+    await expect(chain.sendRaw(sameFees.raw)).rejects.toBeInstanceOf(ReplacementUnderpricedError);
+    const rich = await chain.signTransaction(
+      mintRequest(1, { maxFeePerGas: 10n ** 30n, maxPriorityFeePerGas: 1n }),
+    );
+    await expect(chain.sendRaw(rich.raw)).rejects.toBeInstanceOf(InsufficientFundsError);
+    chain.mine();
+    const other = await chain.signTransaction(mintRequest(0, scale(FEES, 2n, 1n), ref(3)));
+    await expect(chain.sendRaw(other.raw)).rejects.toBeInstanceOf(NonceTooLowError);
+  });
+
+  it('refuses bytes it cannot decode, bytes for another chain, and an unknown sender', async () => {
+    const { chain } = setup();
+    const refused = (raw: string) =>
+      expect(chain.sendRaw(raw as `0x${string}`)).rejects.toBeInstanceOf(SubmissionRejectedError);
+    await refused('0x');
+    await refused('0x1234');
+    await refused('not hex');
+    await refused(stringToHex('fake-eip1559-tx:{not json'));
+    const { raw } = await chain.signTransaction(mintRequest(0));
+    // Tampered: decodes, but is not the canonical encoding (an extra space).
+    await refused(stringToHex(`${hexToString(raw)} `));
+    await expect(
+      chain.sendRaw(
+        (await new FakeChainGateway({ chainId: 5 }).signTransaction(mintRequest(0))).raw,
+      ),
+    ).rejects.toThrow(/invalid chain id for signer/);
+    const stranger = new FakeChainGateway({ signers: { settlement: bob } });
+    await expect(
+      chain.sendRaw((await stranger.signTransaction(mintRequest(0))).raw),
+    ).rejects.toThrow(/invalid sender/);
+    expect(await chain.getHeadBlock()).toBe(0n);
+  });
+
+  it('failNextSubmit applies to sendRaw too, with and without accept', async () => {
+    const { chain } = setup({ automine: false });
+    const { hash, raw } = await chain.signTransaction(mintRequest(0));
+    chain.failNextSubmit(new ChainUnavailableError('timeout'));
+    await expect(chain.sendRaw(raw)).rejects.toThrow('timeout');
+    expect(chain.mempoolSize()).toBe(0);
+    chain.failNextSubmit(new ChainUnavailableError('lost the answer'), { accept: true });
+    await expect(chain.sendRaw(raw)).rejects.toBeInstanceOf(ChainUnavailableError);
+    expect(chain.mempoolSize()).toBe(1);
+    // The outcome was unknown; rebroadcasting the same bytes settles it safely.
+    expect(await chain.sendRaw(raw)).toBe(hash);
   });
 });
