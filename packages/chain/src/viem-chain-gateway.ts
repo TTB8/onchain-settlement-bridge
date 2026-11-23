@@ -8,6 +8,11 @@
  *   the node's chain id is the configured one.
  * - Key material never leaves the account objects: no error message, cause or log line carries a
  *   key. A configured key that cannot be parsed fails with a message that does not echo it.
+ * - The RPC URL (whose path or query often holds an API key) never reaches an error either: every
+ *   cause is a scrubbed copy (`safeCause`), and the client lives in a `#private` field that
+ *   `util.inspect` and `JSON.stringify` do not show.
+ * - Submission errors fail safe: only definite rejections are `SubmissionRejectedError`; any
+ *   error it does not recognise means "outcome unknown" (`ChainUnavailableError`).
  * - A call sent with the wrong signer is refused before anything touches the network.
  * - Transactions are sent with a fixed gas limit instead of an estimate, so a call that would
  *   revert is still mined and yields a `reverted` receipt with a decoded reason, exactly like the
@@ -126,9 +131,46 @@ function nodeText(error: unknown): string {
   return parts.join(' | ').toLowerCase();
 }
 
-/** The node's own one-line reason, when viem has one, for an error message. */
+/**
+ * Replaces every URL in a text. An RPC URL often carries an API key in its path or query, so no
+ * URL may reach an error message, a cause, a log line or `util.inspect` output.
+ */
+export function redactUrls(text: string): string {
+  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>|]+/gi, '<redacted-url>');
+}
+
+/** The node's own one-line reason, when viem has one, for an error message. URLs redacted. */
 function nodeDetails(error: unknown): string {
-  return error instanceof BaseError && error.details ? `: ${error.details}` : '';
+  return error instanceof BaseError && error.details ? `: ${redactUrls(error.details)}` : '';
+}
+
+/**
+ * A copy of an error chain that is safe to keep as a `cause`: each link keeps its name, its short
+ * message and the node's details (URLs redacted) and a numeric `code`, and drops everything else
+ * (viem's request URL, request body and metadata). Our own `ChainError`s are kept as they are.
+ */
+export function safeCause(error: unknown, depth = 0): Error | undefined {
+  if (error === undefined || error === null || depth > 8) return undefined;
+  if (error instanceof ChainError) return error;
+  let name = 'Error';
+  let text: string;
+  if (error instanceof BaseError) {
+    name = error.name;
+    text = [error.shortMessage, error.details].filter(Boolean).join(' Details: ');
+  } else if (error instanceof Error) {
+    name = error.name;
+    text = error.message;
+  } else {
+    text = String(error);
+  }
+  const inner = safeCause((error as { cause?: unknown }).cause, depth + 1);
+  const copy = new Error(redactUrls(text), inner ? { cause: inner } : undefined);
+  copy.name = name;
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === 'number' || typeof code === 'string') {
+    (copy as Error & { code?: unknown }).code = code;
+  }
+  return copy;
 }
 
 /** The revert data carried by a failed `eth_call`, if any. */
@@ -141,34 +183,64 @@ function revertData(error: unknown): Hex | undefined {
   return found?.data;
 }
 
+const NONCE_TOO_LOW = /nonce (is )?too low|nonce has already been used/;
+const ALREADY_KNOWN =
+  /already known|already imported|known transaction|already in (the )?(mem)?pool/;
+const REPLACEMENT_UNDERPRICED = /replacement[^|]*underpriced|underpriced replacement/;
+const INSUFFICIENT_FUNDS = /insufficient funds/;
+
+/**
+ * Node answers that mean the transaction was DEFINITELY not accepted, so retrying the same bytes
+ * cannot help and nothing can be mined from it. Anything not on this list (and not one of the
+ * specific cases above) is treated as an unknown outcome.
+ */
+const DEFINITE_REJECTIONS: readonly RegExp[] = [
+  /invalid (transaction )?signature|invalid sender|signature (is )?invalid/,
+  /intrinsic gas too low/,
+  /fee (per gas |cap )?(is )?(less than|below|lower than)[^|]*base ?fee|fee ?cap too low/,
+  /exceeds (the )?block gas limit|gas limit (is )?(above|exceeds|higher than) (the )?block/,
+  /invalid chain ?id|chain ?id mismatch|incompatible chain ?id|wrong chain ?id/,
+  /nonce (is )?too high|nonce gap/,
+  /priority fee per gas higher than max fee per gas|tip (above|higher than) fee cap/,
+];
+
 /**
  * Maps a failure of `eth_sendRawTransaction` to the typed errors. `hash` is the hash the signed
  * transaction would have, reported with `AlreadyKnownError`.
+ *
+ * Fail-safe: only the allowlisted DEFINITE rejections become `SubmissionRejectedError`. Every
+ * error it does not recognise (a proxy that forwarded the transaction and then failed, a
+ * `-32603`, "header not found", a provider's own wording) is `ChainUnavailableError`: the
+ * outcome is unknown and the caller must check by hash and by reference before re-sending.
+ * Matching is case-insensitive. The cause kept on the result is scrubbed of URLs.
  */
 export function mapSubmitError(error: unknown, hash?: TxHash): ChainError {
   if (error instanceof ChainError) return error;
+  const cause = safeCause(error);
   if (isTransportError(error)) {
     return new ChainUnavailableError(
       'submit: the node did not answer; the outcome is unknown',
-      error,
+      cause,
     );
   }
   const text = nodeText(error);
-  if (text.includes('nonce too low')) return new NonceTooLowError('submit: nonce too low', error);
-  if (
-    text.includes('already known') ||
-    text.includes('already imported') ||
-    text.includes('known transaction')
-  ) {
-    return new AlreadyKnownError('submit: the node already holds this transaction', hash, error);
+  if (NONCE_TOO_LOW.test(text)) return new NonceTooLowError('submit: nonce too low', cause);
+  if (ALREADY_KNOWN.test(text)) {
+    return new AlreadyKnownError('submit: the node already holds this transaction', hash, cause);
   }
-  if (text.includes('replacement') && text.includes('underpriced')) {
-    return new ReplacementUnderpricedError('submit: replacement transaction underpriced', error);
+  if (REPLACEMENT_UNDERPRICED.test(text)) {
+    return new ReplacementUnderpricedError('submit: replacement transaction underpriced', cause);
   }
-  if (text.includes('insufficient funds')) {
-    return new InsufficientFundsError('submit: insufficient funds for gas', error);
+  if (INSUFFICIENT_FUNDS.test(text)) {
+    return new InsufficientFundsError('submit: insufficient funds for gas', cause);
   }
-  return new SubmissionRejectedError(`submit: rejected by the node${nodeDetails(error)}`, error);
+  if (DEFINITE_REJECTIONS.some((pattern) => pattern.test(text))) {
+    return new SubmissionRejectedError(`submit: rejected by the node${nodeDetails(error)}`, cause);
+  }
+  return new ChainUnavailableError(
+    `submit: unrecognised node error, the outcome is unknown${nodeDetails(error)}`,
+    cause,
+  );
 }
 
 /** Lowercases an address. */
@@ -178,7 +250,7 @@ function lower(address: string): Address {
 
 /** A `ChainGateway` for a real node, built on viem. */
 export class ViemChainGateway implements ChainGateway {
-  private readonly client: PublicClient;
+  readonly #client: PublicClient;
   private readonly chainId: number;
   private readonly registry: Address;
   private readonly token: Address;
@@ -204,7 +276,7 @@ export class ViemChainGateway implements ChainGateway {
       settlement: ViemChainGateway.toAccount('settlement', options.signers?.settlement),
       compliance: ViemChainGateway.toAccount('compliance', options.signers?.compliance),
     };
-    this.client = createPublicClient({
+    this.#client = createPublicClient({
       transport: http(options.rpcUrl, {
         timeout: options.timeoutMs ?? 10_000,
         retryCount: options.retryCount ?? 0,
@@ -244,18 +316,18 @@ export class ViemChainGateway implements ChainGateway {
   // --- ChainGateway --------------------------------------------------------------------------
 
   async getChainId(): Promise<number> {
-    return this.run('getChainId', () => this.client.getChainId(), false);
+    return this.run('getChainId', () => this.#client.getChainId(), false);
   }
 
   async getHeadBlock(): Promise<bigint> {
-    return this.run('getHeadBlock', () => this.client.getBlockNumber({ cacheTime: 0 }));
+    return this.run('getHeadBlock', () => this.#client.getBlockNumber({ cacheTime: 0 }));
   }
 
   async getBlock(number: bigint): Promise<BlockRef | null> {
     if (number < 0n) return null;
     return this.run('getBlock', async () => {
       try {
-        const block = await this.client.getBlock({ blockNumber: number });
+        const block = await this.#client.getBlock({ blockNumber: number });
         return {
           number: block.number,
           hash: block.hash.toLowerCase() as Hex,
@@ -283,12 +355,12 @@ export class ViemChainGateway implements ChainGateway {
     return this.run('getNonce', async () => {
       if (blockNumber !== undefined) {
         // At a block there is no pool: both counts are what was mined up to and including it.
-        const mined = await this.client.getTransactionCount({ address, blockNumber });
+        const mined = await this.#client.getTransactionCount({ address, blockNumber });
         return { confirmed: mined, pending: mined };
       }
       const [confirmed, pending] = await Promise.all([
-        this.client.getTransactionCount({ address, blockTag: 'latest' }),
-        this.client.getTransactionCount({ address, blockTag: 'pending' }),
+        this.#client.getTransactionCount({ address, blockTag: 'latest' }),
+        this.#client.getTransactionCount({ address, blockTag: 'pending' }),
       ]);
       return { confirmed, pending };
     });
@@ -299,8 +371,8 @@ export class ViemChainGateway implements ChainGateway {
       // Same rule as the fake: twice the latest base fee plus the node's suggested tip, so the
       // transaction survives several full blocks of base-fee growth.
       const [block, tip] = await Promise.all([
-        this.client.getBlock({ blockTag: 'latest' }),
-        this.client.estimateMaxPriorityFeePerGas(),
+        this.#client.getBlock({ blockTag: 'latest' }),
+        this.#client.estimateMaxPriorityFeePerGas(),
       ]);
       const baseFee = block.baseFeePerGas ?? 0n;
       return { maxFeePerGas: baseFee * 2n + tip, maxPriorityFeePerGas: tip };
@@ -336,7 +408,7 @@ export class ViemChainGateway implements ChainGateway {
     try {
       ({ to, data } = this.encode(request.call));
     } catch (error) {
-      throw new SubmissionRejectedError(`submit: invalid arguments for ${kind}`, error);
+      throw new SubmissionRejectedError(`submit: invalid arguments for ${kind}`, safeCause(error));
     }
 
     await this.ensureChain();
@@ -360,7 +432,7 @@ export class ViemChainGateway implements ChainGateway {
     }
     const hash = keccak256(raw);
     try {
-      const sent = await this.client.sendRawTransaction({ serializedTransaction: raw });
+      const sent = await this.#client.sendRawTransaction({ serializedTransaction: raw });
       return sent.toLowerCase() as TxHash;
     } catch (error) {
       throw mapSubmitError(error, hash);
@@ -371,7 +443,7 @@ export class ViemChainGateway implements ChainGateway {
     return this.run('getReceipt', async () => {
       let receipt;
       try {
-        receipt = await this.client.getTransactionReceipt({ hash });
+        receipt = await this.#client.getTransactionReceipt({ hash });
       } catch (error) {
         if (error instanceof TransactionReceiptNotFoundError) return null;
         throw error;
@@ -394,7 +466,7 @@ export class ViemChainGateway implements ChainGateway {
     return this.run('getTransaction', async () => {
       let tx;
       try {
-        tx = await this.client.getTransaction({ hash });
+        tx = await this.#client.getTransaction({ hash });
       } catch (error) {
         if (error instanceof TransactionNotFoundError) return null;
         throw error;
@@ -418,11 +490,11 @@ export class ViemChainGateway implements ChainGateway {
 
   async getEvents(range: BlockRange): Promise<ChainEvent[]> {
     return this.run('getEvents', async () => {
-      const head = await this.client.getBlockNumber({ cacheTime: 0 });
+      const head = await this.#client.getBlockNumber({ cacheTime: 0 });
       const fromBlock = range.fromBlock < 0n ? 0n : range.fromBlock;
       const toBlock = range.toBlock > head ? head : range.toBlock;
       if (fromBlock > toBlock) return [];
-      const logs = await this.client.getLogs({
+      const logs = await this.#client.getLogs({
         address: [this.registry, this.token],
         fromBlock,
         toBlock,
@@ -452,7 +524,7 @@ export class ViemChainGateway implements ChainGateway {
 
   async readBalance(holder: Address, blockNumber?: bigint): Promise<bigint> {
     return this.run('readBalance', () =>
-      this.client.readContract({
+      this.#client.readContract({
         address: this.token,
         abi: settlementTokenAbi,
         functionName: 'balanceOf',
@@ -464,7 +536,7 @@ export class ViemChainGateway implements ChainGateway {
 
   async readTotalSupply(blockNumber?: bigint): Promise<bigint> {
     return this.run('readTotalSupply', () =>
-      this.client.readContract({
+      this.#client.readContract({
         address: this.token,
         abi: settlementTokenAbi,
         functionName: 'totalSupply',
@@ -483,14 +555,14 @@ export class ViemChainGateway implements ChainGateway {
     }
     return this.run('readReferenceUsed', () =>
       contract === 'token'
-        ? this.client.readContract({
+        ? this.#client.readContract({
             address: this.token,
             abi: settlementTokenAbi,
             functionName: 'referenceUsed',
             args: [ref],
             blockNumber,
           })
-        : this.client.readContract({
+        : this.#client.readContract({
             address: this.registry,
             abi: complianceRegistryAbi,
             functionName: 'referenceUsed',
@@ -504,14 +576,14 @@ export class ViemChainGateway implements ChainGateway {
     return this.run('readCompliance', async () => {
       const args = [lower(account)] as const;
       const [verified, frozen] = await Promise.all([
-        this.client.readContract({
+        this.#client.readContract({
           address: this.registry,
           abi: complianceRegistryAbi,
           functionName: 'isVerified',
           args,
           blockNumber,
         }),
-        this.client.readContract({
+        this.#client.readContract({
           address: this.registry,
           abi: complianceRegistryAbi,
           functionName: 'isFrozen',
@@ -531,12 +603,12 @@ export class ViemChainGateway implements ChainGateway {
       this.chainCheck = (async () => {
         let actual: number;
         try {
-          actual = await this.client.getChainId();
+          actual = await this.#client.getChainId();
         } catch (error) {
           this.chainCheck = undefined;
           throw isTransportError(error)
-            ? new ChainUnavailableError('chain id check: the node did not answer', error)
-            : new ChainError('chain id check failed', error);
+            ? new ChainUnavailableError('chain id check: the node did not answer', safeCause(error))
+            : new ChainError('chain id check failed', safeCause(error));
         }
         if (actual !== this.chainId) throw new ChainIdMismatchError(this.chainId, actual);
       })();
@@ -552,9 +624,9 @@ export class ViemChainGateway implements ChainGateway {
     } catch (error) {
       if (error instanceof ChainError) throw error;
       if (isTransportError(error)) {
-        throw new ChainUnavailableError(`${op}: the node did not answer`, error);
+        throw new ChainUnavailableError(`${op}: the node did not answer`, safeCause(error));
       }
-      throw new ChainError(`${op} failed${nodeDetails(error)}`, error);
+      throw new ChainError(`${op} failed${nodeDetails(error)}`, safeCause(error));
     }
   }
 
@@ -682,13 +754,13 @@ export class ViemChainGateway implements ChainGateway {
    * (for example an out-of-gas failure, which carries no data).
    */
   private async revertReason(hash: TxHash, blockNumber: bigint): Promise<string | undefined> {
-    const tx = await this.client.getTransaction({ hash });
+    const tx = await this.#client.getTransaction({ hash });
     if (!tx.to) return undefined;
     const to = lower(tx.to);
     const abi: Abi =
       to === this.token ? settlementTokenAbi : to === this.registry ? complianceRegistryAbi : [];
     try {
-      await this.client.call({
+      await this.#client.call({
         account: tx.from,
         to,
         data: tx.input,

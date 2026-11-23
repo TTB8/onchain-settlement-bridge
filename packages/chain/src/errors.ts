@@ -18,7 +18,12 @@ export class ChainError extends Error {
   }
 }
 
-/** The signer's nonce was already used on chain. Re-read the nonce and try again. */
+/**
+ * The signer's nonce was already used on chain. It may have been used by an EARLIER attempt of
+ * this same operation (a submit that timed out, or one that was replaced). Before re-signing,
+ * look up your earlier attempts for this nonce by hash and check the operation's reference with
+ * `readReferenceUsed`; only when neither shows the operation, re-read the nonce and try again.
+ */
 export class NonceTooLowError extends ChainError {}
 
 /**

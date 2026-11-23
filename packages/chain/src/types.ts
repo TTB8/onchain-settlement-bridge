@@ -176,6 +176,13 @@ export interface ChainGateway {
    * Sends a transaction. Throws `NonceTooLowError`, `ReplacementUnderpricedError`,
    * `AlreadyKnownError`, `InsufficientFundsError`, `ChainUnavailableError` (outcome unknown) or
    * `SubmissionRejectedError`. Throws `SubmissionRejectedError` if the call is for the wrong signer.
+   *
+   * Fail-safe: `SubmissionRejectedError` is only thrown for rejections that are DEFINITE (the
+   * transaction cannot have been accepted). Any node error the gateway does not recognise is a
+   * `ChainUnavailableError`: the transaction may have been forwarded and may still be mined. So
+   * the caller must keep a record of every transaction it signed (hash, nonce, fees, reference)
+   * until that nonce is final (see `getNonce` with a block), and look up those records and the
+   * reference (`readReferenceUsed`) before treating an operation as not sent.
    */
   submit(request: SubmitRequest): Promise<TxHash>;
 
