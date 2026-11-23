@@ -116,7 +116,7 @@ describe('toProblem', () => {
     ['null', null, 500, 'INTERNAL'],
   ];
 
-  it.each(cases)('%s -> %d %s', (_name, err, status, code) => {
+  it.each(cases)('%s', (_name, err, status, code) => {
     const mapped = toProblem(err, 'req-1');
     expect(mapped.body.status).toBe(status);
     expect(mapped.body.code).toBe(code);
