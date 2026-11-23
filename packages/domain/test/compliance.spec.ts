@@ -4,6 +4,7 @@ import {
   assertCanStart,
   canTransact,
   type ComplianceChangeContent,
+  confirmComplianceChangeLate,
   complianceEventContent,
   complianceEventMatches,
   type ComplianceEventLike,
@@ -202,7 +203,6 @@ describe('compliance change state machine', () => {
     'submitted:CONFIRM': 'confirmed',
     'submitted:FAIL': 'failed',
     'requested:FAIL': 'failed',
-    'failed:CONFIRM': 'confirmed',
   };
 
   it('allows exactly the specified edges', () => {
@@ -296,9 +296,22 @@ describe('compliance events against changes (review M-2, N-2)', () => {
     ).toEqual({ verdict: 'wait' });
   });
 
-  it('a change refused before sending can fail, and a failed one can confirm late', () => {
+  it('a change refused before sending can fail; a failed one confirms late only when gated (N-4)', () => {
     expect(transitionComplianceChange('requested', 'FAIL')).toBe('failed');
-    expect(transitionComplianceChange('failed', 'CONFIRM')).toBe('confirmed');
+    expect(() => transitionComplianceChange('failed', 'CONFIRM')).toThrow(InvalidTransitionError);
     expect(() => transitionComplianceChange('confirmed', 'FAIL')).toThrow(InvalidTransitionError);
+    const ok = judgeComplianceEvent(change, frozenSet(alice, true, 98n), fin);
+    expect(confirmComplianceChangeLate('failed', ok)).toBe('confirmed');
+  });
+
+  it('confirmComplianceChangeLate refuses other verdicts and other statuses', () => {
+    const wait = judgeComplianceEvent(change, frozenSet(alice, true, 99n), fin);
+    const conflict = judgeComplianceEvent(change, frozenSet(bob, true, 98n), fin);
+    const ok = judgeComplianceEvent(change, frozenSet(alice, true, 98n), fin);
+    expect(() => confirmComplianceChangeLate('failed', wait)).toThrow(/CONFIRM_LATE:wait/);
+    expect(() => confirmComplianceChangeLate('failed', conflict)).toThrow(/CONFIRM_LATE:conflict/);
+    for (const status of ['requested', 'submitted', 'confirmed'] as const) {
+      expect(() => confirmComplianceChangeLate(status, ok)).toThrow(InvalidTransitionError);
+    }
   });
 });

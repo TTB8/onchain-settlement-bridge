@@ -8,17 +8,19 @@
  *
  *   requested --RESERVE--> ledger_reserved --SUBMIT--> submitted --CONFIRM--> confirmed (terminal)
  *                               |                        |  ^                     ^
- *                               |                        +--+ SUBMIT              | CONFIRM (late,
- *                               |                          (gas bump / resubmit)  |  gated)
+ *                               |                        +--+ SUBMIT              | confirmLate(...)
+ *                               |                          (gas bump / resubmit)  | (not in the table)
  *                               +--------FAIL------------+--FAIL--> failed -------+
  *                                                                     |
  *                                                                     +--REVERSE--> reversed (terminal)
  *
  * `failed` is not terminal: an attempt the engine gave up on can still land, and then the
- * operation must settle late (`failed:CONFIRM`). That edge is GATED: the engine may apply it only
- * on a `confirm` verdict from `lateConfirmation` (a final event that matches exactly). Funds stay
- * held while an operation is failed and not reversed, so the ordinary settle entry is still valid.
- * Nothing leaves `confirmed` or `reversed`.
+ * operation must settle late. That move is NOT in the general table (`transition('failed',
+ * 'CONFIRM')` throws like every illegal edge). It exists only as `confirmLate(status, judgement)`,
+ * which demands a `confirm` judgement from `lateConfirmation` (a final, canonical event that
+ * matches exactly, reference included), so the gate is code, not a comment. Funds stay held while
+ * an operation is failed and not reversed, so the ordinary settle entry is still valid. Nothing
+ * leaves `confirmed` or `reversed`.
  *
  * Escalations: a failure with reason `duplicate_reference` or `reference_conflict` means the
  * reference may already have settled on chain. Such an operation stays `failed` until a person
@@ -91,8 +93,7 @@ export const OPERATION_TRANSITIONS: ReadonlyMap<string, OperationStatus> = new M
   ['ledger_reserved:FAIL', 'failed'],
   ['submitted:FAIL', 'failed'],
   ['failed:REVERSE', 'reversed'],
-  // Late settlement of a failed operation. Gated: apply only on lateConfirmation(...) === confirm.
-  ['failed:CONFIRM', 'confirmed'],
+  // No failed:CONFIRM here on purpose: late settlement goes through confirmLate(...) only.
 ]);
 
 /** Whether `event` is legal from `status`. */
@@ -292,9 +293,8 @@ function judgeSettlementEvent(
 /**
  * Whether a FAILED (not reversed) operation may settle late on the strength of `event`: `confirm`
  * only when the event is final and matches the operation exactly, `wait` while it is not final,
- * `reference_conflict` when it is final but differs. This is the only evidence on which the engine
- * may apply the gated `failed:CONFIRM` edge, so a failed operation is never confirmed on weaker
- * evidence than a submitted one.
+ * `reference_conflict` when it is final but differs. Its result is the only input `confirmLate`
+ * accepts, so a failed operation is never confirmed on weaker evidence than a submitted one.
  *
  * @param op The failed operation.
  * @param event The settling-kind event on chain carrying the operation's reference.
@@ -307,6 +307,28 @@ export function lateConfirmation(
 ): SettlementJudgement {
   assertConsistentExpectation(op);
   return judgeSettlementEvent(op, event, finality);
+}
+
+/**
+ * The gated late settlement of a failed operation: returns `confirmed` only for status `failed`
+ * and a `confirm` judgement (from `lateConfirmation`). Throws `InvalidTransitionError` for any
+ * other status or verdict, exactly as an illegal edge would. The engine then writes the ordinary
+ * settle entry.
+ *
+ * @param status The operation's current status; must be `failed`.
+ * @param judgement The verdict of `lateConfirmation` on the operation's settling event.
+ */
+export function confirmLate(
+  status: OperationStatus,
+  judgement: SettlementJudgement,
+): Extract<OperationStatus, 'confirmed'> {
+  if (status !== 'failed') {
+    throw new InvalidTransitionError(status, 'CONFIRM_LATE', 'operation');
+  }
+  if (judgement.verdict !== 'confirm') {
+    throw new InvalidTransitionError(status, `CONFIRM_LATE:${judgement.verdict}`, 'operation');
+  }
+  return 'confirmed';
 }
 
 /** The contract error the token raises when a reference was already consumed. */

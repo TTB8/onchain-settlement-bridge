@@ -174,13 +174,13 @@ export type ComplianceChangeEvent = 'SUBMIT' | 'CONFIRM' | 'FAIL';
  *
  *   requested --SUBMIT--> submitted --CONFIRM--> confirmed (terminal)
  *       |                  |  ^                      ^
- *       |                  +--+ SUBMIT (re-attempt)  | CONFIRM (late, gated)
- *       +------FAIL------> failed -------------------+
+ *       |                  +--+ SUBMIT (re-attempt)  | confirmComplianceChangeLate(...)
+ *       +------FAIL------> failed -------------------+ (not in the table)
  *                  submitted --FAIL--^
  *
- * `requested:FAIL` covers a change refused before it is ever sent. `failed:CONFIRM` covers an
- * attempt that landed after the engine gave up; it is GATED: apply it only when
- * `judgeComplianceEvent` returns `confirm` (a final event whose content matches the change).
+ * `requested:FAIL` covers a change refused before it is ever sent. An attempt that landed after
+ * the engine gave up confirms late only through `confirmComplianceChangeLate`, which demands a
+ * `confirm` judgement from `judgeComplianceEvent`; `failed:CONFIRM` is not in this table.
  */
 export const COMPLIANCE_CHANGE_TRANSITIONS: ReadonlyMap<string, ComplianceChangeStatus> = new Map<
   string,
@@ -192,8 +192,8 @@ export const COMPLIANCE_CHANGE_TRANSITIONS: ReadonlyMap<string, ComplianceChange
   ['submitted:SUBMIT', 'submitted'],
   ['submitted:CONFIRM', 'confirmed'],
   ['submitted:FAIL', 'failed'],
-  // Late confirmation of a failed change. Gated: only on judgeComplianceEvent(...) === confirm.
-  ['failed:CONFIRM', 'confirmed'],
+  // No failed:CONFIRM here on purpose: late confirmation goes through
+  // confirmComplianceChangeLate(...) only.
 ]);
 
 /** The status after applying `event`. Throws `InvalidTransitionError` for an edge not in the table. */
@@ -271,7 +271,7 @@ export type ComplianceEventJudgement =
  * Judges a registry event carrying a change's reference: `wait` until it is final and its block is
  * canonical (an event cached from an orphaned block never counts), then `confirm`
  * if it matches the change exactly, else `conflict` (a person decides). The only evidence on which
- * the engine may apply `submitted:CONFIRM` or the gated `failed:CONFIRM`.
+ * the engine may apply `submitted:CONFIRM`, and the only input `confirmComplianceChangeLate` accepts.
  */
 export function judgeComplianceEvent(
   change: ComplianceChangeContent,
@@ -282,4 +282,29 @@ export function judgeComplianceEvent(
   return complianceEventMatches(change, event)
     ? { verdict: 'confirm', event: 'CONFIRM' }
     : { verdict: 'conflict' };
+}
+
+/**
+ * The gated late confirmation of a failed compliance change: returns `confirmed` only for status
+ * `failed` and a `confirm` judgement (from `judgeComplianceEvent`). Throws
+ * `InvalidTransitionError` for any other status or verdict, exactly as an illegal edge would.
+ *
+ * @param status The change's current status; must be `failed`.
+ * @param judgement The verdict of `judgeComplianceEvent` on the change's registry event.
+ */
+export function confirmComplianceChangeLate(
+  status: ComplianceChangeStatus,
+  judgement: ComplianceEventJudgement,
+): Extract<ComplianceChangeStatus, 'confirmed'> {
+  if (status !== 'failed') {
+    throw new InvalidTransitionError(status, 'CONFIRM_LATE', 'compliance_change');
+  }
+  if (judgement.verdict !== 'confirm') {
+    throw new InvalidTransitionError(
+      status,
+      `CONFIRM_LATE:${judgement.verdict}`,
+      'compliance_change',
+    );
+  }
+  return 'confirmed';
 }

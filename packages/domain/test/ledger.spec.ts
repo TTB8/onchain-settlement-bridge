@@ -7,6 +7,7 @@ import {
   deriveBalances,
   FIAT_CLEARING,
   heldOf,
+  confirmLate,
   incomingOf,
   journalKindFor,
   transition,
@@ -237,7 +238,8 @@ describe('a failed operation settling late (review M-2)', () => {
     expect(status).toBe('failed');
     // While failed, the transfer's funds are still held.
     expect(balanceOf(deriveBalances(entries), heldOf('u1'))).toBe(25n);
-    status = transition(status, 'CONFIRM');
+    // Late settlement goes through the gated confirmLate (the judgement comes from lateConfirmation).
+    status = confirmLate(status, { verdict: 'confirm', event: 'CONFIRM' });
     expect(status).toBe('confirmed');
     entries.push(buildEntry(tr, journalKindFor('CONFIRM') as 'settle'));
     const b = deriveBalances(entries);

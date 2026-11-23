@@ -1,6 +1,7 @@
 import {
   type Address,
   canTransition,
+  confirmLate,
   type Finality,
   InvalidInputError,
   InvalidTransitionError,
@@ -42,8 +43,6 @@ const LEGAL: Record<string, OperationStatus> = {
   'ledger_reserved:FAIL': 'failed',
   'submitted:FAIL': 'failed',
   'failed:REVERSE': 'reversed',
-  // Late, gated settlement of a failed operation (review M-2 decision).
-  'failed:CONFIRM': 'confirmed',
 };
 
 describe('operation state machine', () => {
@@ -60,10 +59,10 @@ describe('operation state machine', () => {
     });
   });
 
-  it('has exactly eight legal edges', () => {
+  it('has exactly seven legal edges (late settlement is not a general edge)', () => {
     let legal = 0;
     for (const s of STATUSES) for (const e of EVENTS) if (canTransition(s, e)) legal += 1;
-    expect(legal).toBe(8);
+    expect(legal).toBe(7);
   });
 
   it('reports the refused edge in the error', () => {
@@ -362,13 +361,31 @@ describe('lateConfirmation: a failed operation settling late (review M-2)', () =
     ...at(blockNumber),
   });
 
-  it('confirms on a final, exactly matching event, and the edge failed -> confirmed exists', () => {
-    expect(lateConfirmation(deposit, mint(1000n, FINAL_BLOCK), FIN)).toEqual({
-      verdict: 'confirm',
-      event: 'CONFIRM',
-    });
-    expect(transition('failed', 'CONFIRM')).toBe('confirmed');
+  it('confirms on a final, exactly matching event, only through confirmLate (review N-4)', () => {
+    const judgement = lateConfirmation(deposit, mint(1000n, FINAL_BLOCK), FIN);
+    expect(judgement).toEqual({ verdict: 'confirm', event: 'CONFIRM' });
+    expect(confirmLate('failed', judgement)).toBe('confirmed');
+    // The general table has no such edge: it throws like every illegal edge.
+    expect(canTransition('failed', 'CONFIRM')).toBe(false);
+    expect(() => transition('failed', 'CONFIRM')).toThrow(InvalidTransitionError);
   });
+
+  it('confirmLate refuses any judgement other than confirm', () => {
+    expect(() =>
+      confirmLate('failed', lateConfirmation(deposit, mint(1000n, SHALLOW_BLOCK), FIN)),
+    ).toThrow(/CONFIRM_LATE:wait/);
+    expect(() =>
+      confirmLate('failed', lateConfirmation(deposit, mint(999n, FINAL_BLOCK), FIN)),
+    ).toThrow(/CONFIRM_LATE:reference_conflict/);
+  });
+
+  it.each(['requested', 'ledger_reserved', 'submitted', 'confirmed', 'reversed'] as const)(
+    'confirmLate refuses status %s even with a confirm judgement',
+    (status) => {
+      const ok = lateConfirmation(deposit, mint(1000n, FINAL_BLOCK), FIN);
+      expect(() => confirmLate(status, ok)).toThrow(InvalidTransitionError);
+    },
+  );
 
   it('waits on a matching event that is not final', () => {
     expect(lateConfirmation(deposit, mint(1000n, SHALLOW_BLOCK), FIN)).toEqual({ verdict: 'wait' });
