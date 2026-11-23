@@ -308,8 +308,10 @@ export async function startApi(
     app.enableShutdownHooks();
     await app.listen(config.port, config.host);
     const url = `http://${config.host}:${config.port}`;
+    // Host and port as separate fields: the host may also be part of a redacted secret.
     logger.emit('log', 'api listening', {
-      url,
+      host: config.host,
+      port: config.port,
       chainId: config.chain.chainId,
       chainClass: config.chain.chainClass,
     });

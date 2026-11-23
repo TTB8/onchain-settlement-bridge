@@ -28,6 +28,9 @@
     "node": ">=20"
   },
   "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "start:api": "pnpm --filter @bridge/api start",
+    "start:worker": "pnpm --filter @bridge/worker start",
     "lint": "eslint . && pnpm lint:sol",
     "lint:sol": "cd contracts && forge fmt --check",
     "format": "prettier --write . && cd contracts && forge fmt",

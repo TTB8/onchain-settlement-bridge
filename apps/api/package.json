@@ -4,7 +4,7 @@
   "private": true,
   "description": "The bridge's HTTP API (NestJS): users, deposits, withdrawals, transfers, balances, compliance requests and reconciliation runs, on top of @bridge/engine. Holds no signing key.",
   "scripts": {
-    "start": "ts-node --transpile-only -r tsconfig-paths/register src/main.ts",
+    "start": "node -r ts-node/register/transpile-only -r tsconfig-paths/register src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "jest --runInBand",
     "test:cov": "jest --runInBand --coverage"
