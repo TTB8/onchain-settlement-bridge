@@ -722,3 +722,51 @@ describe('deployment binding and alarms (obligations 10, 17)', () => {
     expect(rig.alarms.ofKind('head_stalled')).toHaveLength(1);
   });
 });
+
+describe('submitter edges', () => {
+  const ctx = () => ({ stillHolds: async () => true, signal: new AbortController().signal });
+
+  it('a fee estimate above the cap: the row waits, nothing is signed', async () => {
+    const rig = await makeRig(db.prisma, { feeCap: 1n });
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 2n);
+    const r = await rig.engine.dispatcher.runOnce();
+    expect(r.retried).toBe(1);
+    expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(0);
+    expect(await statusOf(dep.id)).toBe('ledger_reserved');
+  });
+
+  it('refuses rows that are not its own, or that do not match their operation', async () => {
+    const rig = await makeRig(db.prisma);
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 2n);
+    const row = await db.prisma.outboxMessage.findFirstOrThrow({ where: { operationId: dep.id } });
+    const s = rig.engine.submitter;
+    expect(await s.handle({ ...row, signer: 'compliance' }, ctx())).toEqual({
+      failed: 'not_a_settlement_row',
+    });
+    expect(await s.handle({ ...row, operationId: null }, ctx())).toEqual({
+      failed: 'not_a_settlement_row',
+    });
+    expect(await s.handle({ ...row, operationId: randomUUID() }, ctx())).toEqual({
+      failed: 'operation_missing',
+    });
+    expect(await s.handle({ ...row, call: { kind: 'mint' } }, ctx())).toMatchObject({
+      failed: 'invalid_call',
+    });
+    expect(await s.handle({ ...row, ref: ref32() }, ctx())).toEqual({
+      failed: 'reference_mismatch',
+    });
+    expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(0);
+  });
+
+  it('a final successful receipt whose event is not indexed yet: wait and alarm, never confirm without the event', async () => {
+    const rig = await makeRig(db.prisma);
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 2n);
+    await rig.engine.dispatcher.runOnce();
+    await rig.engine.monitor.runOnce();
+    expect(await statusOf(dep.id)).toBe('submitted');
+    expect(rig.alarms.ofKind('settled_without_event')).toHaveLength(1);
+  });
+});
