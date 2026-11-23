@@ -14,6 +14,8 @@ gives the engine a schema, a few thin helpers, and a database that fails closed.
   (hand-written; every guard has a comment saying which bug it stops)
 - Review fixes for the engine: `prisma/migrations/20261124000000_engine_review/migration.sql`
   (deployment row held FOR SHARE by new work, outbox `last_error`, per-user idempotency keys)
+- Nonce backstop: `prisma/migrations/20261125000000_attempt_nonce_guard/migration.sql`
+  (a signer's nonce belongs to one outbox row; attempts recorded at READ COMMITTED only)
 
 ## Tables
 
@@ -67,6 +69,7 @@ assert, so a test passes only when the guard it is about fired.
 | 7   | New operations and compliance changes hold FOR SHARE on their deployment row until commit, so a deactivation racing an insert never commits alongside it [`deployment_in_flight` / `deployment_inactive`] | engine-review: "a deactivation racing a operation insert / a compliance_change insert: insert first: the deactivation waits for the commit, then is refused", "... deactivation first: the insert waits, then is refused" |
 | --  | Outbox `last_error` at most 1000 characters, non-empty, set together with `last_error_at` (`outbox_last_error_length`, `outbox_last_error_at_with_error`) | engine-review: "accepts a message up to 1000 characters ...", "refuses a message over 1000 characters, an empty one, and either column alone" |
 | --  | Idempotency key unique per user (`operation_user_id_idempotency_key_key`); two users may use the same key | operation: "idempotency key is unique per user, and two users may use the same key" |
+| 8   | A (deployment, signer, nonce) is held by ONE outbox row: the same row may record it again (bump, rebroadcast), another row may not; attempts are only recorded at READ COMMITTED (a staler snapshot could miss a concurrent winner); an advisory lock per nonce serialises racing inserts [`chain_attempt_nonce_taken`, `chain_attempt_isolation`] | attempt-nonce: "the same outbox row may record its nonce again ...", "another outbox row may not use a nonce already held", "the same number on another deployment is another nonce", "refuses any isolation level but READ COMMITTED", "two concurrent READ COMMITTED / REPEATABLE READ transactions ...: at most one commits" |
 | --  | Happy path: deposit, withdrawal and transfer, each settled and reversed, written as the engine will write them                         | ledger-balance: "deposit settle, withdrawal settle, transfer settle and their reversals give hand-computed balances", "the view shows 0 ... maximum bigint amount round-trips"                                                                                               |
 
 What guard 5 does **not** enforce: which accounts and sides each step uses (the posting table in

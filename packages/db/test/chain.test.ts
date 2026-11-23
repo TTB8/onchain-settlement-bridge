@@ -80,6 +80,8 @@ interface AttemptInput {
   contract?: string;
 }
 
+let nextTestNonce = 0;
+
 function insertAttempt(a: AttemptInput) {
   return c.query<{ id: string }>(
     `INSERT INTO chain_attempt (deployment_id, outbox_id, signer, nonce, hash, raw_transaction,
@@ -89,7 +91,9 @@ function insertAttempt(a: AttemptInput) {
       a.deploymentId ?? dep.id,
       a.outboxId,
       a.signer ?? 'settlement',
-      a.nonce ?? 0,
+      // Each attempt its own nonce unless a test says otherwise: a nonce shared between two
+      // outbox rows is refused (guard 8, chain_attempt_nonce_taken).
+      a.nonce ?? nextTestNonce++,
       a.hash ?? ref(),
       a.raw ?? '0x02f8ab',
       (a.maxFee ?? 100n).toString(),
