@@ -9,7 +9,9 @@
 # the reason it should. Uses only Anvil's public dev accounts (addresses, never keys). Promotion runs
 # in a temporary deployments directory (PROMOTE_DEPLOYMENTS_DIR), so it never touches
 # contracts/deployments; it refuses to start if a 31337.pending.json is already there, because the
-# deploy script writes one. The anvil and every temporary file are removed on exit.
+# deploy script writes one. The anvil and every temporary file are removed on exit. The deploy uses
+# --slow (one transaction per block, so block heights are deterministic) and every call that could
+# wait on the chain runs under `timeout`, so a stuck node fails the test instead of hanging it.
 if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo "test-promote: bash >= 4 is required" >&2
   exit 2
@@ -19,7 +21,7 @@ set -uo pipefail
 contracts_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 promote="$contracts_dir/script/promote-deployment.sh"
 deploy_pending="$contracts_dir/deployments/31337.pending.json"
-for tool in anvil forge cast python3; do
+for tool in anvil forge cast python3 timeout; do
   command -v "$tool" >/dev/null 2>&1 || { echo "test-promote: $tool not found" >&2; exit 2; }
 done
 if [[ -e "$deploy_pending" ]]; then
@@ -58,14 +60,14 @@ passed=0
 failed=0
 ok() { echo "  PASS  $1"; passed=$((passed + 1)); }
 bad() { echo "  FAIL  $1"; failed=$((failed + 1)); }
-mine() { cast rpc anvil_mine "$(printf '0x%x' "$1")" --rpc-url "$rpc" >/dev/null; }
+mine() { timeout 30 cast rpc anvil_mine "$(printf '0x%x' "$1")" --rpc-url "$rpc" >/dev/null; }
 sha() { [[ -e "$1" ]] && sha256sum "$1" | cut -d' ' -f1 || echo absent; }
 
 D="$T/deployments"
 mkdir -p "$D"
 P="$D/31337.pending.json"
 F="$D/31337.json"
-run_promote() { PROMOTE_DEPLOYMENTS_DIR="$D" "$promote" "$@" >"$T/out" 2>&1; }
+run_promote() { PROMOTE_DEPLOYMENTS_DIR="$D" timeout 120 "$promote" "$@" >"$T/out" 2>&1; }
 
 # expect_refusal <name> <expected message part> <promote args...>: must exit non-zero, for the
 # expected reason, and leave every file in the deployments directory exactly as it was.
@@ -96,7 +98,8 @@ echo "test-promote: anvil on port $port; deploying"
       SETTLER_ADDRESS="$settler" PAUSER_ADDRESS="$pauser" TOKEN_NAME="Settlement Token" \
       TOKEN_SYMBOL="STK" ALLOW_MAINNET=false ALLOW_UNKNOWN_CHAIN=false ALLOW_EOA_ADMIN=false \
       HOLDER_TRANSFERS_ENABLED=false \
-      forge script script/Deploy.s.sol --rpc-url "$rpc" --sender "$deployer" --unlocked --broadcast
+      timeout 300 forge script script/Deploy.s.sol --rpc-url "$rpc" --sender "$deployer" \
+        --unlocked --broadcast --slow
 ) >"$T/deploy.log" 2>&1
 created_pending=1
 if [[ ! -f "$deploy_pending" ]]; then
@@ -129,19 +132,21 @@ expect_refusal "pending file with a swapped minter" "differ from the record" 313
 tampered admin "$eoa"
 expect_refusal "record pointing the admin role at an EOA that does not hold it" \
   "differ from the record" 31337 "$rpc"
-python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d["deploymentBlock"]=5; json.dump(d,open(sys.argv[2],"w"))' \
-  "$T/pristine.json" "$P"
+# A deploymentBlock after the contracts were created (head - 1, still deep enough for the depth rule).
+late_block=$(($(cast block-number --rpc-url "$rpc") - 1))
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d["deploymentBlock"]=int(sys.argv[3]); json.dump(d,open(sys.argv[2],"w"))' \
+  "$T/pristine.json" "$P" "$late_block"
 expect_refusal "record with a deploymentBlock after the contracts existed" \
   "existed before deploymentBlock" 31337 "$rpc"
 cp "$T/pristine.json" "$P"
 
 # An extra MINTER_ROLE grantee on chain.
 minter_role="$(cast keccak MINTER_ROLE)"
-cast send --unlocked --from "$admin" "$token" "grantRole(bytes32,address)" "$minter_role" "$stranger" \
+timeout 60 cast send --unlocked --from "$admin" "$token" "grantRole(bytes32,address)" "$minter_role" "$stranger" \
   --rpc-url "$rpc" >/dev/null
 mine 2
 expect_refusal "an extra MINTER_ROLE grant on chain" "extra: $(echo "$stranger" | tr '[:upper:]' '[:lower:]')" 31337 "$rpc"
-cast send --unlocked --from "$admin" "$token" "revokeRole(bytes32,address)" "$minter_role" "$stranger" \
+timeout 60 cast send --unlocked --from "$admin" "$token" "revokeRole(bytes32,address)" "$minter_role" "$stranger" \
   --rpc-url "$rpc" >/dev/null
 mine 2
 
