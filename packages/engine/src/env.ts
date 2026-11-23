@@ -230,7 +230,7 @@ export interface ApiConfig extends CommonConfig {
   readonly maxAmount: bigint;
   /** `API_BODY_LIMIT_BYTES`. */
   readonly bodyLimitBytes: number;
-  /** `API_DOCS_ENABLED`: serve the OpenAPI document and UI at /docs. */
+  /** `API_DOCS_ENABLED`: serve the OpenAPI document and UI at /docs (default: local chains only). */
   readonly docsEnabled: boolean;
 }
 
@@ -580,7 +580,9 @@ export function loadApiConfig(env: Env): ApiConfig {
     max: 1_048_576,
     default: DEFAULT_BODY_LIMIT_BYTES,
   });
-  const docsEnabled = r.flag('API_DOCS_ENABLED', true);
+  // The OpenAPI document maps the whole attack surface: served by default only on a local chain;
+  // anywhere else an operator opts in with API_DOCS_ENABLED=true.
+  const docsEnabled = r.flag('API_DOCS_ENABLED', chainClass === 'local');
   r.finish();
   const chain = complete<ChainSettings>(common.chainPartial, CHAIN_KEYS);
   return complete<ApiConfig>(

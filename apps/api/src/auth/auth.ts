@@ -13,8 +13,9 @@
  *   a compliance and a funds compromise, and audit trails stop telling the two apart.
  * - 401 means "no valid credential at all" (missing, malformed, unknown token), with
  *   `WWW-Authenticate: Bearer`; 403 means "a valid credential, the wrong one for this route".
- * - Every route must declare its access with `@Access(...)`; a route without it is refused
- *   (deny by default), so a forgotten decorator can never publish a route.
+ * - Every CONTROLLER route must declare its access with `@Access(...)`; one without it is
+ *   refused (deny by default), so a forgotten decorator can never publish a route. The Swagger
+ *   pages are not controller routes and bypass this guard (hence off by default off local).
  *
  * Real deployments put an identity provider in front (OIDC / OAuth 2 client credentials for the
  * platform, SSO with MFA for operators), issue short-lived tokens with per-user subjects, and add

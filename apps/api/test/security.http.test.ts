@@ -344,6 +344,23 @@ describe('OpenAPI', () => {
     expect(doc.paths['/v1/admin/reconciliations']?.post?.security).toEqual([{ 'admin-token': [] }]);
   });
 
+  it('is not served by default off a local chain, and is when explicitly enabled', async () => {
+    const testnet = { chain: { chainId: 11155111 }, env: { ALLOW_TESTNET: 'true' } };
+    const off = await makeRig(testnet);
+    try {
+      expect((await request(off.app.getHttpServer()).get('/docs/openapi.json')).status).toBe(404);
+      expect((await request(off.app.getHttpServer()).get('/docs')).status).toBe(404);
+    } finally {
+      await off.close();
+    }
+    const on = await makeRig({ ...testnet, env: { ...testnet.env, API_DOCS_ENABLED: 'true' } });
+    try {
+      expect((await request(on.app.getHttpServer()).get('/docs/openapi.json')).status).toBe(200);
+    } finally {
+      await on.close();
+    }
+  });
+
   it('is not served when API_DOCS_ENABLED=false', async () => {
     const off = await makeRig({ env: { API_DOCS_ENABLED: 'false' } });
     try {

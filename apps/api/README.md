@@ -18,7 +18,8 @@ Startup fails fast, before serving a request: the environment is validated (ever
 by name, never a value; `packages/engine/src/env.ts`), a mainnet / testnet / unknown chain is
 refused unless its `ALLOW_*` flag is `true`, and the node must report `CHAIN_ID`.
 
-OpenAPI: `GET /docs` (UI) and `GET /docs/openapi.json` (`API_DOCS_ENABLED=false` turns both off).
+OpenAPI: `GET /docs` (UI) and `GET /docs/openapi.json`. Served by default only on a local chain;
+elsewhere set `API_DOCS_ENABLED=true` explicitly (and `false` turns them off anywhere).
 
 ## Operators: connect as a NON-OWNER database role
 
@@ -79,7 +80,10 @@ then `timingSafeEqual`; both tokens are always compared), at least 32 characters
 The scopes are **disjoint**: the admin token on a platform route is **403**, never silently
 accepted (an operator credential that can also move users' money doubles what one leak costs and
 blurs the audit trail). No or an unknown credential is **401** with `WWW-Authenticate: Bearer`.
-Every route must declare `@Access(...)`; a route without it is refused (deny by default).
+The guard is global and deny-by-default: a controller route that declares no `@Access(...)` is
+refused with 403, so a forgotten decorator can never publish a route. `/docs` and
+`/docs/openapi.json` are not controller routes (Swagger serves them outside the guard), which is
+why they are off by default except on a local chain; unknown paths answer 404 before any guard.
 
 **Real deployments put an identity provider in front**: OAuth 2 client credentials or OIDC for
 the platform, SSO with MFA for operators, short-lived tokens with per-user subjects, an

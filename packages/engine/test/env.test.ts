@@ -270,6 +270,17 @@ describe('loadApiConfig', () => {
     expect(isPlaceholderToken('changeme-but-no-dash')).toBe(false);
   });
 
+  it('serves the docs by default on a local chain only; an explicit value always wins', () => {
+    expect(loadApiConfig(api).docsEnabled).toBe(true);
+    expect(loadApiConfig({ ...api, API_DOCS_ENABLED: 'false' }).docsEnabled).toBe(false);
+    const mainnet = { ...api, CHAIN_ID: '1', ALLOW_MAINNET: 'true' };
+    expect(loadApiConfig(mainnet).docsEnabled).toBe(false);
+    expect(loadApiConfig({ ...mainnet, API_DOCS_ENABLED: 'true' }).docsEnabled).toBe(true);
+    expect(loadApiConfig({ ...api, CHAIN_ID: '11155111', ALLOW_TESTNET: 'true' }).docsEnabled).toBe(
+      false,
+    );
+  });
+
   it('refuses one address for token and registry', () => {
     expect(
       problemsOf(() => loadApiConfig({ ...api, REGISTRY_ADDRESS: common.TOKEN_ADDRESS })),
