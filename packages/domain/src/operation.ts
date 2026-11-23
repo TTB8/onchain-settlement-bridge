@@ -22,6 +22,9 @@
  * an operation is failed and not reversed, so the ordinary settle entry is still valid. Nothing
  * leaves `confirmed` or `reversed`.
  *
+ * Compliance changes follow their own lifecycle (see `compliance.ts`); a late one must not be
+ * applied in database order over a newer final change for the same account and flag.
+ *
  * Escalations: a failure with reason `duplicate_reference` or `reference_conflict` means the
  * reference may already have settled on chain. Such an operation stays `failed` until a person
  * decides; it is NEVER reversed automatically (`mayReverse` refuses both reasons). REVERSE is the

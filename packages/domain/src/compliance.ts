@@ -6,6 +6,15 @@
  * verified or is frozen. These checks exist so the bridge refuses EARLY (before reserving funds or
  * spending gas) and so it agrees with the chain about why something failed. Missing state is
  * treated as "not allowed": a check that cannot see its input must fail closed.
+ *
+ * Ordering of compliance changes (review N-7): a change can land late (it was resubmitted, or it
+ * confirms after the engine gave up on it), so the order in which the database records
+ * confirmations is NOT the order the registry applied them. An old change landing late must never
+ * override a newer final change for the same account and flag. The engine therefore derives each
+ * address's expected flags from the FINAL registry events in chain order (block, then log index),
+ * cross-checked against the bridge's latest decision for that account and flag, and never from the
+ * order of confirmations in its own tables. If the final chain order and the latest decision
+ * disagree, that is a finding for a person (and `reconcile` reports it as `compliance_mismatch`).
  */
 
 import { type Finality, isFinalAndCanonical } from './confirmation';
