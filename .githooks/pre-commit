@@ -1,0 +1,6 @@
+#!/bin/sh
+# harness-kit v0.9.0 - installed copy. Fast checks on staged files, for every author.
+# Human escape hatch for one commit: HARNESS_SKIP=1 git commit ...
+[ "$HARNESS_SKIP" = "1" ] && exit 0
+top="$(git rev-parse --show-toplevel)"
+exec sh "$top/scripts/harness/py" "$top/scripts/harness/verify.py" fast --staged

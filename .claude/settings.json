@@ -1,0 +1,51 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|MultiEdit|NotebookEdit|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/harness/py\" \"$CLAUDE_PROJECT_DIR/scripts/harness/guard.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "SubagentHandback",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/harness/py\" \"$CLAUDE_PROJECT_DIR/scripts/harness/stop.py\"",
+            "timeout": 600,
+            "statusMessage": "harness: checking the worker's changes..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/harness/py\" \"$CLAUDE_PROJECT_DIR/scripts/harness/stop.py\"",
+            "timeout": 600,
+            "statusMessage": "harness: running fast checks..."
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/harness/py\" \"$CLAUDE_PROJECT_DIR/scripts/harness/stop.py\"",
+            "timeout": 600,
+            "statusMessage": "harness: checking the worker's changes..."
+          }
+        ]
+      }
+    ]
+  }
+}

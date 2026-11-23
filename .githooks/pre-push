@@ -1,0 +1,4 @@
+#!/bin/sh
+# harness-kit v0.9.0 - installed copy. Blocks pushes to protected branches, for every author.
+top="$(git rev-parse --show-toplevel)"
+exec sh "$top/scripts/harness/py" "$top/scripts/harness/prepush.py"

@@ -1,0 +1,18 @@
+#!/bin/sh
+# harness-kit v0.9.0 - installed copy. Edit in harness-kit, then re-install.
+# Run a harness script with a Python 3 that actually works, on Linux, macOS,
+# WSL and Windows (Git Bash). On Windows `python3` is often the Microsoft Store
+# stub, which exists on PATH but only prints "install me", so each candidate is
+# tried for real. -X utf8: text is UTF-8 everywhere, whatever the system locale
+# (Windows defaults to cp1252, which crashes on non-ASCII docs).
+# Never silent: if no Python works, say so and fail.
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+    exec "$c" -I -X utf8 "$@"
+  fi
+done
+if command -v py >/dev/null 2>&1 && py -3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+  exec py -3 -I -X utf8 "$@"
+fi
+echo "harness: no working Python 3.8+ found (tried python3, python, py -3). The harness checks are NOT running. Install Python 3 and put it on PATH." >&2
+exit 1

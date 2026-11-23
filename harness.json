@@ -1,0 +1,84 @@
+{
+  "kit": "0.9.0",
+  "name": "onchain-settlement-bridge",
+  "kind": "portfolio",
+  "tier": "standard",
+  "tools": [
+    "claude"
+  ],
+  "stacks": [
+    {
+      "pack": "foundry",
+      "paths": [
+        "contracts"
+      ]
+    },
+    {
+      "pack": "node-ts",
+      "paths": [
+        "packages/domain",
+        "packages/chain",
+        "packages/db",
+        "packages/engine"
+      ]
+    },
+    {
+      "pack": "nestjs-prisma",
+      "paths": [
+        "apps/api",
+        "apps/worker"
+      ]
+    }
+  ],
+  "zones": [
+    {
+      "risk": "onchain",
+      "paths": [
+        "contracts/src/**",
+        "contracts/script/**"
+      ],
+      "requires": [
+        "zone-tests",
+        "reviewer-label"
+      ]
+    },
+    {
+      "risk": "money",
+      "paths": [
+        "packages/domain/src/**",
+        "packages/engine/src/**",
+        "apps/api/src/operations/**",
+        "apps/api/src/balances/**"
+      ],
+      "requires": [
+        "zone-tests",
+        "reviewer-label"
+      ]
+    }
+  ],
+  "review": {
+    "agent": "patrick",
+    "skill": "audit",
+    "lenses": [
+      "cyfrin-audit-methodology"
+    ],
+    "on": [
+      "onchain",
+      "money",
+      "release"
+    ]
+  },
+  "protected": {
+    "branches": [
+      "main"
+    ],
+    "deployOnPush": false
+  },
+  "budgets": {
+    "verifyFastSeconds": 45,
+    "ciMinutesPerMonth": null
+  },
+  "docs": [
+    "AGENTS.md"
+  ]
+}
