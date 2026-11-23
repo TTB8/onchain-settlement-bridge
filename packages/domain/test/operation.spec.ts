@@ -4,11 +4,13 @@ import {
   InvalidTransitionError,
   isTerminal,
   journalKindFor,
+  ESCALATION_REASONS,
   mayReverse,
   NOT_ALLOWED,
   type OperationEvent,
   type OperationStatus,
   REFERENCE_ALREADY_USED,
+  type ReversalEvidence,
   resolveRevert,
   type SettlementExpectation,
   settlementDifferences,
@@ -238,6 +240,7 @@ describe('resolveRevert: the duplicate-submission rule', () => {
           failureReason: 'reference_conflict',
           anAttemptCanStillMine: false,
           chainHasEventForRef: false,
+          referenceConsumedOnChain: false,
         }),
       ).toBe(false);
     });
@@ -320,27 +323,45 @@ describe('an operation whose type disagrees with its parties', () => {
 });
 
 describe('mayReverse', () => {
-  it('allows reversal only when no attempt can land, no event exists and it is not a conflict', () => {
+  const clean: ReversalEvidence = {
+    failureReason: 'reverted',
+    anAttemptCanStillMine: false,
+    chainHasEventForRef: false,
+    referenceConsumedOnChain: false,
+  };
+
+  it('allows reversal only when every piece of evidence is clean', () => {
+    expect(mayReverse(clean)).toBe(true);
+    expect(mayReverse({ ...clean, failureReason: 'dropped' })).toBe(true);
+    expect(mayReverse({ ...clean, failureReason: 'compliance_rejected' })).toBe(true);
+  });
+
+  it('refuses while an attempt can still land', () => {
+    expect(mayReverse({ ...clean, anAttemptCanStillMine: true })).toBe(false);
+  });
+
+  it('refuses when the index shows a settling event', () => {
+    expect(mayReverse({ ...clean, chainHasEventForRef: true })).toBe(false);
+  });
+
+  it('refuses when the contract says the reference was consumed, whatever the index shows', () => {
+    expect(mayReverse({ ...clean, referenceConsumedOnChain: true })).toBe(false);
+  });
+
+  it('review H-1: duplicate_reference, no visible event, nothing pending, consumed flag true -> false', () => {
     expect(
       mayReverse({
-        failureReason: 'reverted',
+        failureReason: 'duplicate_reference',
         anAttemptCanStillMine: false,
         chainHasEventForRef: false,
-      }),
-    ).toBe(true);
-    expect(
-      mayReverse({
-        failureReason: 'reverted',
-        anAttemptCanStillMine: true,
-        chainHasEventForRef: false,
+        referenceConsumedOnChain: true,
       }),
     ).toBe(false);
-    expect(
-      mayReverse({
-        failureReason: 'dropped',
-        anAttemptCanStillMine: false,
-        chainHasEventForRef: true,
-      }),
-    ).toBe(false);
+  });
+
+  it('never auto-reverses an escalation, even with every other flag clean', () => {
+    expect(mayReverse({ ...clean, failureReason: 'duplicate_reference' })).toBe(false);
+    expect(mayReverse({ ...clean, failureReason: 'reference_conflict' })).toBe(false);
+    expect([...ESCALATION_REASONS].sort()).toEqual(['duplicate_reference', 'reference_conflict']);
   });
 });

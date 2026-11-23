@@ -33,7 +33,10 @@ export type JournalKind = 'reserve' | 'settle' | 'reverse';
  * - `reverted`: mined and reverted for a reason other than the ones below.
  * - `dropped`: the node forgot the transaction and it could not be resubmitted.
  * - `compliance_rejected`: a party was not allowed (caught before sending or by the chain).
- * - `duplicate_reference`: the chain says the reference is used, but shows no event for it.
+ * - `duplicate_reference`: the chain says the reference is used, but our index shows no event for
+ *   it. On the token only a successful settlement consumes a reference, and it always emits an
+ *   event, so this means our index is incomplete and the money most likely already moved.
+ *   Decision: an escalation to a person, never reversed automatically (`mayReverse` refuses).
  * - `reference_conflict`: the chain shows a settling event for the reference that does NOT match
  *   the operation (kind, party or amount). Decision: the engine FAILs the operation with this
  *   reason so it is visible, and never reverses it (`mayReverse` refuses): a person decides.
@@ -272,29 +275,53 @@ export function resolveRevert(
   return { verdict: 'failed', event: 'FAIL', reason: 'reverted' };
 }
 
-/** Evidence needed before a failed operation may be reversed (its funds released). */
+/** Failure reasons that are escalations to a person and are never reversed automatically. */
+export const ESCALATION_REASONS: ReadonlySet<FailureReason> = new Set<FailureReason>([
+  'duplicate_reference',
+  'reference_conflict',
+]);
+
+/**
+ * Evidence needed before a failed operation may be reversed (its funds released). Each field is an
+ * obligation on the engine, which must gather it from FINAL chain state, not from the head.
+ */
 export interface ReversalEvidence {
-  /** Why the operation failed. A `reference_conflict` is never reversed automatically. */
+  /** Why the operation failed. Escalation reasons (see `ESCALATION_REASONS`) are never reversed. */
   readonly failureReason: FailureReason;
   /**
-   * Whether any attempt for this operation could still be mined: an attempt whose nonce the signer
-   * has not yet consumed. A transaction sitting in some node's pool can land at any time.
+   * Whether any attempt for this operation could still be mined. The engine must compute it as
+   * `attempts.some(a => attemptCanStillMine(a, observation, depth))` over EVERY signed attempt it
+   * holds for the operation (see `confirmation.ts`). A transaction in some node's pool, or one whose
+   * nonce use is not yet final, can still land.
    */
   readonly anAttemptCanStillMine: boolean;
-  /** Whether the chain shows any settling event carrying the operation's reference. */
+  /** Whether the bridge's index shows any settling event carrying the operation's reference. */
   readonly chainHasEventForRef: boolean;
+  /**
+   * The contract's own `referenceUsed(ref)` flag, read at a FINAL block (`head - depth + 1`). This
+   * is authoritative where the index may be incomplete: if it is true, something settled with this
+   * reference, whatever the index shows.
+   */
+  readonly referenceConsumedOnChain: boolean;
 }
 
 /**
  * Whether REVERSE is safe. Reversing releases held funds back to the user; if the chain later (or
- * already) settles the same operation, the user is paid twice. So reversal requires proof that no
- * attempt can still land, that no event uses the reference, and that the failure is not a conflict
- * waiting for a person.
+ * already) settles the same operation, the user is paid twice. So reversal requires ALL of:
+ *
+ * - the failure is not an escalation (`duplicate_reference`, `reference_conflict`): those mean the
+ *   reference may already have settled, and a person must decide;
+ * - no attempt can still land (each attempt's nonce use is final, or it has a final receipt);
+ * - the index shows no settling event for the reference;
+ * - the contract says, at a final block, that the reference was NOT consumed. Only a successful
+ *   settlement consumes a reference, so a consumed one means the money moved even if the index
+ *   missed the event.
  */
 export function mayReverse(evidence: ReversalEvidence): boolean {
   return (
-    evidence.failureReason !== 'reference_conflict' &&
+    !ESCALATION_REASONS.has(evidence.failureReason) &&
     !evidence.anAttemptCanStillMine &&
-    !evidence.chainHasEventForRef
+    !evidence.chainHasEventForRef &&
+    !evidence.referenceConsumedOnChain
   );
 }
