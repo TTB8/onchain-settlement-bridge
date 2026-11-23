@@ -1155,6 +1155,52 @@ describe('review M-3: signed bytes are verified before they are stored', () => {
   });
 });
 
+describe('review M-3: bumps and broadcasts are checked too', () => {
+  it('a fee bump whose signed bytes differ from the request is refused: no attempt stored, nothing sent', async () => {
+    const rig = await makeRig(db.prisma, { stuckAfterSeconds: 60 }, { automine: false });
+    const alice = await verifiedUser(rig);
+    rig.chain.mine();
+    const dep = await deposit(rig, alice, 13n);
+    await rig.engine.tick();
+    const [first] = await attemptsOf(db.prisma, dep.id);
+    rig.chain.setBaseFee((first?.maxFeePerGas ?? 0n) + 1n);
+    rig.clock.advance(61_000);
+    const sent = rig.signer.broadcasts.length;
+    rig.chain.tamper = async (_signed, request) =>
+      new SpyChain({ chainId: rig.chain.chainId }).signTransaction({
+        ...request,
+        call: { kind: 'mint', to: `0x${'1'.repeat(40)}`, amount: 13n, ref: request.call.ref },
+      });
+    const t = await rig.engine.tick();
+    expect(t.monitor.bumped).toBe(0);
+    expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(1);
+    expect(rig.signer.broadcasts.length).toBe(sent);
+    expect(
+      rig.alarms
+        .ofKind('examine_error')
+        .some((a) => a.detail.includes('SignedTransactionMismatchError')),
+    ).toBe(true);
+  });
+
+  it('a broadcast reporting another hash than the recorded one is an unknown outcome (retried, never "sent")', async () => {
+    const rig = await makeRig(db.prisma);
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 2n);
+    const real = rig.chain.sendRaw.bind(rig.chain);
+    rig.chain.sendRaw = async (raw) => {
+      await real(raw);
+      return `0x${'e'.repeat(64)}`;
+    };
+    const r = await rig.engine.dispatcher.runOnce();
+    rig.chain.sendRaw = real;
+    expect(r.retried).toBe(1);
+    const row = await db.prisma.outboxMessage.findFirstOrThrow({ where: { operationId: dep.id } });
+    expect(row.lastError).toContain('SignedTransactionMismatchError');
+    const [attempt] = await attemptsOf(db.prisma, dep.id);
+    expect(attempt?.status).toBe('signed');
+  });
+});
+
 describe('review M-2: the gateway deployment must be the active deployment', () => {
   it('a gateway on another token: tick() refuses to run and raises deployment_mismatch', async () => {
     const rig = await makeRig(db.prisma);
