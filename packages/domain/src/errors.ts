@@ -19,7 +19,8 @@ export type DomainErrorCode =
   | 'INVALID_TRANSITION'
   | 'INVALID_REFERENCE'
   | 'COMPLIANCE_REJECTED'
-  | 'FEE_CAP_EXCEEDED';
+  | 'FEE_CAP_EXCEEDED'
+  | 'JOURNAL_INTEGRITY';
 
 /** Base class of every error this package throws. Never thrown directly. */
 export abstract class DomainError extends Error {
@@ -169,5 +170,25 @@ export class FeeCapExceededError extends DomainError {
     readonly cap: bigint,
   ) {
     super(`fee ${required} exceeds cap ${cap}`);
+  }
+}
+
+/**
+ * The journal as a whole breaks the ledger's rules: an operation reserved twice, settled without a
+ * reserve, both settled and reversed, an entry that does not match its operation, or a balance that
+ * went negative. Each entry can be balanced on its own and the journal still be wrong.
+ */
+export class JournalIntegrityError extends DomainError {
+  readonly code = 'JOURNAL_INTEGRITY' as const;
+
+  /**
+   * @param operationId The operation whose entries are wrong, or `null` when none applies.
+   * @param message What is wrong.
+   */
+  constructor(
+    readonly operationId: string | null,
+    message: string,
+  ) {
+    super(message);
   }
 }
