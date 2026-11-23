@@ -214,6 +214,48 @@ describe('deposit -> withdrawal -> transfer through the engine', () => {
     expect(listB.body.items.map((o: { id: string }) => o.id)).toEqual([tr.body.id]);
   });
 
+  it('an operation shows its chain transactions: none before signing, then each attempt with its hash', async () => {
+    const erin = await createUser();
+    const dep = await deposit(erin.id, '700', 'dep-tx-1');
+    expect(dep.status).toBe(201);
+    expect(dep.body.transactions).toEqual([]);
+
+    await settle(rig);
+    const attempts = await rig.db.prisma.chainAttempt.findMany({
+      where: { outbox: { operationId: dep.body.id } },
+    });
+    expect(attempts).toHaveLength(1);
+    const attempt = attempts[0]!;
+    const read = await http().get(`/v1/operations/${dep.body.id}`).set(auth);
+    expect(read.body.status).toBe('confirmed');
+    expect(read.body.transactions).toEqual([
+      {
+        hash: attempt.hash,
+        nonce: attempt.nonce,
+        status: attempt.status,
+        blockNumber: attempt.blockNumber === null ? null : attempt.blockNumber.toString(),
+      },
+    ]);
+    expect(read.body.transactions[0].hash).toMatch(/^0x[0-9a-f]{64}$/);
+
+    // The list shows the same, and only this operation's attempts (one query for the page).
+    const other = await deposit(erin.id, '5', 'dep-tx-2');
+    await settle(rig);
+    const list = await http().get(`/v1/users/${erin.id}/operations`).set(auth);
+    const byId = new Map(
+      list.body.items.map((o: { id: string; transactions: { hash: string }[] }) => [o.id, o]),
+    );
+    const first = byId.get(dep.body.id) as { transactions: { hash: string }[] };
+    const second = byId.get(other.body.id) as { transactions: { hash: string }[] };
+    expect(first.transactions.map((t) => t.hash)).toEqual([attempt.hash]);
+    expect(second.transactions).toHaveLength(1);
+    expect(second.transactions[0]!.hash).not.toBe(attempt.hash);
+    // A replay returns the stored operation with its transactions too.
+    const replay = await deposit(erin.id, '700', 'dep-tx-1');
+    expect(replay.status).toBe(200);
+    expect(replay.body.transactions.map((t: { hash: string }) => t.hash)).toEqual([attempt.hash]);
+  });
+
   it('insufficient funds is 422 and writes nothing', async () => {
     const carol = await createUser();
     const before = await rig.db.prisma.operation.count();

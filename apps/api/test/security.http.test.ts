@@ -376,6 +376,18 @@ describe('OpenAPI', () => {
     ).properties.amount;
     expect(amount.type).toBe('string');
     expect(amount.example).toBe('1500000');
+    // An operation documents its chain transactions (hash per signed attempt).
+    const operation = doc.components.schemas.OperationDto as {
+      properties: { transactions: { type: string; items: { $ref: string } } };
+      required: string[];
+    };
+    expect(operation.properties.transactions.type).toBe('array');
+    expect(operation.properties.transactions.items.$ref).toBe(
+      '#/components/schemas/TransactionDto',
+    );
+    expect(operation.required).toContain('transactions');
+    const tx = doc.components.schemas.TransactionDto as { properties: Record<string, unknown> };
+    expect(Object.keys(tx.properties).sort()).toEqual(['blockNumber', 'hash', 'nonce', 'status']);
     expect(doc.paths['/v1/admin/reconciliations']?.post?.security).toEqual([{ 'admin-token': [] }]);
     // The deposit route says plainly that it mints and when it may be called.
     const depositDoc = deposit as unknown as { summary: string; description: string };

@@ -72,6 +72,15 @@ nothing written. Same key + another body: **409** naming only the caller's own o
 is the wallet and nothing else, so a repeat IS the same request and the route is safe to retry
 without a key; if the body ever gains fields, a repeat whose other fields differ must be a 409.
 
+### Transactions of an operation
+
+Every operation response (`POST` deposits / withdrawals / transfers, `GET /v1/operations/:id`, the
+user's list) carries `transactions`: each chain transaction the worker signed for it, as
+`{ hash, nonce, status, blockNumber }`, ordered by (nonce, fee bumps). It is empty until the worker
+signs; a fee bump or a resubmission adds an entry, and at most one of them settles the operation.
+`status` and `blockNumber` are what the worker last observed (`blockNumber` is a decimal string or
+null). The attempts are read through the operation's outbox rows, one query per page.
+
 ### Balances
 
 Derived from the ledger on every read, never stored. `incoming` is a pending deposit (not minted
@@ -171,6 +180,7 @@ SQL guard is live) with the `FakeChainGateway` and a `BridgeEngine` ticking in t
 | Property                                       | Test (file: name)                                                     |
 | ---------------------------------------------- | --------------------------------------------------------------------- |
 | Deposit / withdrawal / transfer, balances      | operations.http: "moves the balances exactly, derived on every read"  |
+| `transactions` on the operation (hash per attempt) | operations.http: "an operation shows its chain transactions ..."; security.http: "serves the document ..." |
 | 422, self transfer, unknown user               | operations.http: "insufficient funds is 422 ...", "a transfer to oneself ..." |
 | Replay, 409, concurrent copies, missing key    | operations.http: "idempotency" (4)                                    |
 | Amount spellings, cap                          | operations.http: "amounts" (18); units: "parseAmount"                 |

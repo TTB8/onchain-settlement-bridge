@@ -13,7 +13,12 @@
  * funds, 503 + Retry-After while no deployment is active.
  *
  * Reads go to the database directly (read-only Prisma queries); the full row is returned so a
- * caller sees `failureReason` and `confirmedBlock` as the engine moves the operation along.
+ * caller sees `failureReason` and `confirmedBlock` as the engine moves the operation along, plus
+ * `transactions`: every signed chain transaction (attempt) of the operation, so a caller can look
+ * the hash up in a block explorer. WHY a list, not one hash: a fee bump or a resubmission signs a
+ * new transaction for the same operation, and only one of them can settle it; the list is ordered
+ * by (nonce, bumps) so the last entry is the newest. Attempts are read through the operation's
+ * outbox rows (`chain_attempt.outbox_id`), never matched by `ref` alone.
  */
 
 import {
@@ -39,7 +44,7 @@ import {
   ApiQuery,
   ApiTags,
 } from '@nestjs/swagger';
-import type { Operation, PrismaClient } from '@bridge/db';
+import type { ChainAttempt, Operation, PrismaClient } from '@bridge/db';
 import type { ApiConfig } from '@bridge/engine/env';
 import type { OperationRequest, OperationService } from '@bridge/engine';
 import { IsDefined, IsString, IsUUID } from 'class-validator';
@@ -91,6 +96,32 @@ export class TransferDto extends AmountDto {
   readonly toUserId?: string;
 }
 
+/** One signed chain transaction of an operation, as the API returns it. */
+export interface TransactionView {
+  /** The transaction hash (lowercase 0x + 64 hex). */
+  readonly hash: string;
+  /** The signer's nonce. */
+  readonly nonce: number;
+  /** signed, sent, mined, reverted, dropped or replaced (as last observed by the worker). */
+  readonly status: ChainAttempt['status'];
+  /** The block it was mined in, once observed; null before. Decimal string. */
+  readonly blockNumber: string | null;
+}
+
+/** Schema of `TransactionView`. */
+export class TransactionDto {
+  /** Hash. */
+  @ApiProperty({ example: `0x${'cd'.repeat(32)}` }) readonly hash?: string;
+  /** Nonce. */
+  @ApiProperty({ example: 7 }) readonly nonce?: number;
+  /** Status. */
+  @ApiProperty({ enum: ['signed', 'sent', 'mined', 'reverted', 'dropped', 'replaced'] })
+  readonly status?: string;
+  /** Block. */
+  @ApiProperty({ nullable: true, type: String, example: '1234' })
+  readonly blockNumber?: string | null;
+}
+
 /** An operation as the API returns it. Amounts and block numbers are decimal strings. */
 export interface OperationView {
   /** The operation id. */
@@ -117,6 +148,8 @@ export interface OperationView {
   readonly createdAt: string;
   /** Last changed (ISO 8601, UTC). */
   readonly updatedAt: string;
+  /** Every signed chain transaction of the operation, oldest first; empty until the worker signs. */
+  readonly transactions: readonly TransactionView[];
 }
 
 /** Schema of `OperationView`. */
@@ -165,6 +198,13 @@ export class OperationDto {
   @ApiProperty({ format: 'date-time' }) readonly createdAt?: string;
   /** Updated. */
   @ApiProperty({ format: 'date-time' }) readonly updatedAt?: string;
+  /** Chain transactions. */
+  @ApiProperty({
+    type: [TransactionDto],
+    description:
+      'Every transaction the worker signed for this operation, ordered by (nonce, fee bumps): a fee bump or a resubmission adds one, and at most one of them settles the operation. Empty until the worker signs.',
+  })
+  readonly transactions?: TransactionDto[];
 }
 
 /** A page of a user's operations. */
@@ -183,12 +223,33 @@ export class OperationPageDto {
   @ApiPropertyOptional({ nullable: true, type: String }) readonly nextCursor?: string | null;
 }
 
+/** The attempt columns the view needs. */
+type AttemptRow = Pick<ChainAttempt, 'hash' | 'nonce' | 'status' | 'blockNumber' | 'bumpsSoFar'>;
+
+/**
+ * The API view of one chain attempt.
+ *
+ * @param a The attempt row.
+ */
+export function toTransactionView(a: AttemptRow): TransactionView {
+  return {
+    hash: a.hash,
+    nonce: a.nonce,
+    status: a.status,
+    blockNumber: a.blockNumber === null ? null : a.blockNumber.toString(),
+  };
+}
+
 /**
  * The API view of an operation row.
  *
  * @param op The row.
+ * @param attempts Its chain attempts, in (nonce, bumps) order.
  */
-export function toOperationView(op: Operation): OperationView {
+export function toOperationView(
+  op: Operation,
+  attempts: readonly AttemptRow[] = [],
+): OperationView {
   return {
     id: op.id,
     type: op.type,
@@ -202,8 +263,18 @@ export function toOperationView(op: Operation): OperationView {
     deploymentId: op.deploymentId,
     createdAt: op.createdAt.toISOString(),
     updatedAt: op.updatedAt.toISOString(),
+    transactions: attempts.map(toTransactionView),
   };
 }
+
+const ATTEMPT_SELECT = {
+  hash: true,
+  nonce: true,
+  status: true,
+  blockNumber: true,
+  bumpsSoFar: true,
+  outbox: { select: { operationId: true } },
+} as const;
 
 /** A keyset cursor: the last item's creation time and id. */
 interface Cursor {
@@ -262,7 +333,31 @@ export class OperationsService {
     const row = await this.prisma.operation.findUniqueOrThrow({
       where: { id: result.operation.id },
     });
-    return { view: toOperationView(row), replayed: result.replayed };
+    const views = await this.withTransactions([row]);
+    return { view: views[0] as OperationView, replayed: result.replayed };
+  }
+
+  /**
+   * Views of operations with their chain transactions, in ONE attempt query for all of them.
+   *
+   * @param ops The rows.
+   */
+  private async withTransactions(ops: readonly Operation[]): Promise<OperationView[]> {
+    if (ops.length === 0) return [];
+    const attempts = await this.prisma.chainAttempt.findMany({
+      where: { outbox: { operationId: { in: ops.map((o) => o.id) } } },
+      select: ATTEMPT_SELECT,
+      orderBy: [{ nonce: 'asc' }, { bumpsSoFar: 'asc' }, { submittedAt: 'asc' }],
+    });
+    const byOperation = new Map<string, AttemptRow[]>();
+    for (const a of attempts) {
+      const id = a.outbox.operationId;
+      if (id === null) continue;
+      const list = byOperation.get(id) ?? [];
+      list.push(a);
+      byOperation.set(id, list);
+    }
+    return ops.map((op) => toOperationView(op, byOperation.get(op.id) ?? []));
   }
 
   /**
@@ -273,7 +368,8 @@ export class OperationsService {
   async get(id: string): Promise<OperationView> {
     const op = await this.prisma.operation.findUnique({ where: { id } });
     if (op === null) throw new ApiProblem('OPERATION_NOT_FOUND');
-    return toOperationView(op);
+    const views = await this.withTransactions([op]);
+    return views[0] as OperationView;
   }
 
   /**
@@ -309,7 +405,7 @@ export class OperationsService {
     const page = rows.slice(0, limit);
     const last = page[page.length - 1];
     return {
-      items: page.map(toOperationView),
+      items: await this.withTransactions(page),
       nextCursor:
         rows.length > limit && last !== undefined
           ? encodeCursor({ t: last.createdAt, id: last.id })
