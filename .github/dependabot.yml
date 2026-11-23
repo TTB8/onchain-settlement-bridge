@@ -1,0 +1,30 @@
+# Dependency updates. One weekly PR per ecosystem for minor and patch bumps; majors arrive one per
+# PR so each can be read on its own.
+#
+# Not covered: the Solidity libraries (forge-std, OpenZeppelin) are git submodules under
+# contracts/lib, pinned to exact commits and updated by hand with `forge install` / a submodule
+# bump, followed by the full Foundry suite and the ABI check.
+version: 2
+updates:
+  - package-ecosystem: npm
+    # The pnpm workspace root: one lockfile covers every package and app.
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(ci)
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
