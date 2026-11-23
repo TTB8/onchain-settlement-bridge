@@ -392,7 +392,7 @@ describe('each mismatch kind is caught, persisted and alarmed', () => {
 
 describe('review M-1: the latest CONFIRMED decision (by decision_seq) is the expectation', () => {
   /**
-   * Patrick's scenario, end to end on the fake chain: U1 (unfreeze, decided first) loses its nonce
+   * The review scenario, end to end on the fake chain: U1 (unfreeze, decided first) loses its nonce
    * and lands LATE, at a higher block than F2 (freeze, decided second). A third decision F3
    * (freeze) failed, or is still in flight. The registry ends UNFROZEN (U1 last), the bridge's
    * newest applied decision says FROZEN: the reconciler must report compliance_mismatch, and the
@@ -800,7 +800,7 @@ describe('deriveExpectedCompliance (checklist 13, pure)', () => {
     expect(out.get(A)).toEqual({ verified: false, frozen: false });
   });
 
-  it("Patrick's PoC: a newer FAILED or IN-FLIGHT freeze never hides a late-landing old unfreeze", () => {
+  it("Review PoC: a newer FAILED or IN-FLIGHT freeze never hides a late-landing old unfreeze", () => {
     const f2Ref = `0x${'03'.repeat(32)}` as `0x${string}`;
     const f3Ref = `0x${'04'.repeat(32)}` as `0x${string}`;
     const u1: KnownComplianceChange = { ...unfreeze, decisionSeq: 1n };
