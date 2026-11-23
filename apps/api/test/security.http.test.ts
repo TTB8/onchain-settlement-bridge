@@ -200,6 +200,31 @@ describe('problem+json', () => {
     expect(res.text).not.toMatch(/SyntaxError|at JSON|Unexpected/);
   });
 
+  it('a non-JSON body is a 400 problem, never a 500', async () => {
+    const user = await http().post('/v1/users').set(auth).send({ walletAddress: wallet() });
+    for (const [type, body] of [
+      ['text/plain', 'amount=5'],
+      ['application/x-www-form-urlencoded', 'amount=5'],
+    ] as const) {
+      const res = await http()
+        .post(`/v1/users/${user.body.id}/deposits`)
+        .set(auth)
+        .set('Idempotency-Key', `ctype-${type.length}`)
+        .set('Content-Type', type)
+        .send(body);
+      expect({ type, status: res.status, code: res.body.code }).toEqual({
+        type,
+        status: 400,
+        code: 'VALIDATION_FAILED',
+      });
+    }
+    const array = await http()
+      .post('/v1/users')
+      .set(auth)
+      .send([{ walletAddress: wallet() }]);
+    expect(array.status).toBe(400);
+  });
+
   it('a body above the limit is a 413 problem', async () => {
     const res = await http()
       .post('/v1/users')
