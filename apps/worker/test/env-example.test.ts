@@ -7,7 +7,12 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 
-import { ANVIL_DEV_KEYS, loadApiConfig, loadWorkerConfig } from '@bridge/engine/env';
+import {
+  ANVIL_DEV_KEYS,
+  type ConfigError,
+  loadApiConfig,
+  loadWorkerConfig,
+} from '@bridge/engine/env';
 
 const text = readFileSync(resolve(__dirname, '..', '..', '..', '.env.example'), 'utf8');
 const env = parseEnv(text) as Record<string, string>;
@@ -31,6 +36,28 @@ describe('.env.example', () => {
     expect(() => loadWorkerConfig({ ...env, CHAIN_ID: '11155111', ALLOW_TESTNET: 'true' })).toThrow(
       /publicly known development key/,
     );
+  });
+
+  it.each([
+    ['mainnet', { CHAIN_ID: '1', ALLOW_MAINNET: 'true' }],
+    ['testnet', { CHAIN_ID: '11155111', ALLOW_TESTNET: 'true' }],
+  ])('copied unchanged to a %s, its example tokens are refused by the api', (_name, chain) => {
+    let problems: { variable: string; reason: string }[] = [];
+    try {
+      loadApiConfig({ ...env, ...chain });
+    } catch (err) {
+      problems = [...(err as ConfigError).problems];
+    }
+    expect(problems).toEqual([
+      {
+        variable: 'API_PLATFORM_TOKEN',
+        reason: 'is a placeholder development token: refused on a non-local chain',
+      },
+      {
+        variable: 'API_ADMIN_TOKEN',
+        reason: 'is a placeholder development token: refused on a non-local chain',
+      },
+    ]);
   });
 
   it('documents every variable either process reads', () => {

@@ -20,6 +20,7 @@ import {
   DEFAULT_POLL_INTERVAL_MS,
   DEFAULT_RECONCILE_EVERY_TICKS,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  isPlaceholderToken,
   type Env,
   loadApiConfig,
   loadWorkerConfig,
@@ -237,6 +238,36 @@ describe('loadApiConfig', () => {
     expect(problemsOf(() => loadApiConfig({ ...api, API_ADMIN_TOKEN: TOKEN_A }))).toEqual([
       { variable: 'API_ADMIN_TOKEN', reason: 'must differ from API_PLATFORM_TOKEN' },
     ]);
+  });
+
+  it('refuses placeholder tokens (change-me / dev-only, any case) on every non-local chain', () => {
+    const placeholder = {
+      API_PLATFORM_TOKEN: 'dev-only-platform-token-change-me-0123456789',
+      API_ADMIN_TOKEN: 'my-admin-token-CHANGE-ME-0123456789abcdefgh',
+    };
+    expect(loadApiConfig({ ...api, ...placeholder }).chain.chainClass).toBe('local');
+    for (const chain of [
+      { CHAIN_ID: '1', ALLOW_MAINNET: 'true' },
+      { CHAIN_ID: '11155111', ALLOW_TESTNET: 'true' },
+      { CHAIN_ID: '999999999', ALLOW_UNKNOWN_CHAIN: 'true' },
+    ]) {
+      expect(problemsOf(() => loadApiConfig({ ...api, ...placeholder, ...chain }))).toEqual([
+        {
+          variable: 'API_PLATFORM_TOKEN',
+          reason: 'is a placeholder development token: refused on a non-local chain',
+        },
+        {
+          variable: 'API_ADMIN_TOKEN',
+          reason: 'is a placeholder development token: refused on a non-local chain',
+        },
+      ]);
+    }
+    // Real-looking tokens pass on a real chain.
+    expect(loadApiConfig({ ...api, CHAIN_ID: '1', ALLOW_MAINNET: 'true' }).chain.chainClass).toBe(
+      'mainnet',
+    );
+    expect(isPlaceholderToken('xDev-Onlyx')).toBe(true);
+    expect(isPlaceholderToken('changeme-but-no-dash')).toBe(false);
   });
 
   it('refuses one address for token and registry', () => {

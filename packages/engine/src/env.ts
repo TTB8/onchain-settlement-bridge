@@ -21,7 +21,8 @@
  *   a known testnet needs `ALLOW_TESTNET=true`, a known mainnet `ALLOW_MAINNET=true`, and any other
  *   chain id `ALLOW_UNKNOWN_CHAIN=true`. The flags accept only the literal `true` / `false`.
  * - **Development keys stay local.** Anvil's ten well-known keys (public since the day Foundry
- *   shipped) are refused as signer keys on anything but a local chain.
+ *   shipped) are refused as signer keys on anything but a local chain, and so are bearer tokens
+ *   that look like the `.env.example` placeholders (`change-me`, `dev-only`).
  */
 
 import { inspect } from 'node:util';
@@ -310,6 +311,25 @@ const DECIMAL = /^(0|[1-9][0-9]*)$/;
 const TOKEN_CHARS = /^[\x21-\x7e]+$/;
 const WORKER_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 
+/**
+ * Markers of the example tokens shipped in `.env.example` (and of any token someone wrote by hand
+ * following that pattern). Matched case-insensitively, anywhere in the token.
+ */
+export const PLACEHOLDER_TOKEN_MARKERS: readonly string[] = Object.freeze([
+  'change-me',
+  'dev-only',
+]);
+
+/**
+ * Whether a bearer token is a placeholder (contains a `PLACEHOLDER_TOKEN_MARKERS` entry).
+ *
+ * @param token The token.
+ */
+export function isPlaceholderToken(token: string): boolean {
+  const lower = token.toLowerCase();
+  return PLACEHOLDER_TOKEN_MARKERS.some((m) => lower.includes(m));
+}
+
 /** Collects every problem while reading variables; throws once at the end. */
 class Reader {
   readonly problems: ConfigProblem[] = [];
@@ -536,6 +556,19 @@ export function loadApiConfig(env: Env): ApiConfig {
   ) {
     // One value for both would make every platform caller an admin.
     r.problem('API_ADMIN_TOKEN', 'must differ from API_PLATFORM_TOKEN');
+  }
+  const chainClass = common.chainPartial.chainClass;
+  if (chainClass !== undefined && chainClass !== 'local') {
+    // The example tokens of `.env.example` are public (they are in the repository): like the Anvil
+    // keys, they must never guard a real chain, even when someone copies the file unchanged.
+    for (const [name, token] of [
+      ['API_PLATFORM_TOKEN', platformToken],
+      ['API_ADMIN_TOKEN', adminToken],
+    ] as const) {
+      if (token !== undefined && isPlaceholderToken(token.reveal())) {
+        r.problem(name, 'is a placeholder development token: refused on a non-local chain');
+      }
+    }
   }
   const maxAmount = r.bigint('API_MAX_AMOUNT', {
     min: 1n,
