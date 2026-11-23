@@ -17,13 +17,21 @@ jobs:
   typescript:
     name: TypeScript (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         node: [20, 22]
     steps:
+      # The chain package deploys the contracts to a real Anvil in its tests, so it needs the
+      # Solidity libraries (submodules) and Foundry, same release as the local stack.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
 
       # The pnpm version comes from "packageManager" in package.json.
       - uses: pnpm/action-setup@v4
@@ -36,14 +44,28 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: Lint
+        run: pnpm lint
+
       - name: Check formatting
         run: pnpm format:check
 
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Unit tests with coverage
+      - name: Build the contracts (the chain tests deploy from the build output)
+        working-directory: contracts
+        run: forge build
+
+      - name: Committed ABIs match the Foundry build
+        run: pnpm --filter @bridge/chain abi:check
+
+      - name: Unit and integration tests with coverage
         run: pnpm test:cov
+
+      - name: Coverage summary
+        if: always()
+        run: node scripts/coverage-summary.mjs >> "$GITHUB_STEP_SUMMARY"
 
   contracts:
     name: Contracts (Foundry)
