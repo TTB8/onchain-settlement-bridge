@@ -157,6 +157,11 @@ export interface BridgeEngineConfig {
    */
   readonly complianceFailedLookbackSeconds?: number;
   /**
+   * Seconds between `compliance_unapplied` alarms for one failed, unsuperseded change. Default
+   * `DEFAULT_COMPLIANCE_UNAPPLIED_ALARM_SECONDS` (1 h).
+   */
+  readonly complianceUnappliedAlarmSeconds?: number;
+  /**
    * Literal secrets (the RPC URL, its API key, its host) removed from every error text the engine
    * writes (outbox `last_error`, audit notes, alarms). The gateway scrubs its own errors too; this
    * is the second layer.
@@ -407,6 +412,9 @@ export class BridgeEngine {
         : {}),
       ...(config.complianceFailedLookbackSeconds !== undefined
         ? { failedLookbackSeconds: config.complianceFailedLookbackSeconds }
+        : {}),
+      ...(config.complianceUnappliedAlarmSeconds !== undefined
+        ? { unappliedAlarmEverySeconds: config.complianceUnappliedAlarmSeconds }
         : {}),
     });
     this.reconciler = new Reconciler({

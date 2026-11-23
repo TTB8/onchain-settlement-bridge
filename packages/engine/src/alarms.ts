@@ -60,6 +60,11 @@ export type AlarmKind =
   | 'compliance_out_of_order'
   /** A compliance change is still requested / submitted after the configured time. */
   | 'compliance_pending'
+  /**
+   * A FAILED compliance change is the newest decision for its account and flag (no newer decision
+   * was applied): the registry does not hold what the bridge last decided. Repeats until resolved.
+   */
+  | 'compliance_unapplied'
   /** A reconciliation run could not compare (a read failed, the index is behind, bad input). */
   | 'reconciliation_unknown'
   /** Reconciliation: the ledger settled an operation the chain shows no event for. */

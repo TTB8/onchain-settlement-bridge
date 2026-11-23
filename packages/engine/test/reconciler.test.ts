@@ -505,6 +505,84 @@ describe('review M-1: the latest CONFIRMED decision (by decision_seq) is the exp
   });
 });
 
+describe('review GO items: unapplied newest decisions, same-block inversions', () => {
+  const ask = (rig: Rig, kind: 'allow' | 'freeze' | 'unfreeze', u: TestUser) =>
+    rig.engine.compliance.request(kind, {
+      address: u.wallet,
+      reason: `${kind} decision`,
+      idempotencyKey: randomUUID(),
+      requestedBy: 'ops',
+    });
+  const cancel = (rig: Rig, id: string) =>
+    db.prisma.$transaction((tx) =>
+      moveComplianceChange(tx, {
+        changeId: id,
+        from: 'requested',
+        version: 0,
+        move: { event: 'FAIL', reason: 'rejected' },
+        at: rig.clock.now(),
+        note: 'operator cancelled',
+      }),
+    );
+
+  it('a FAILED newest freeze nobody retried: the run is clean, so compliance_unapplied pages it (freezes first) on a cadence until a newer decision is applied', async () => {
+    const rig = await rigFor({ complianceUnappliedAlarmSeconds: 3_600 });
+    const u = await funded(rig, 10n);
+    const other = await insertUser(db.prisma);
+    const d1 = (await ask(rig, 'unfreeze', u)).change;
+    await tickUntil(rig.engine, async () => (await changeRow(d1.id)).status === 'confirmed');
+    const allowFailed = (await ask(rig, 'allow', other)).change; // decided first...
+    await cancel(rig, allowFailed.id);
+    const d2 = (await ask(rig, 'freeze', u)).change; // ...the freeze still pages first
+    await cancel(rig, d2.id);
+    expect((await reconcile(rig)).status).toBe('ok'); // the registry matches D1: no mismatch
+    const unapplied = () =>
+      rig.alarms.ofKind('compliance_unapplied').map((a) => a.complianceChangeId);
+    await rig.engine.tick();
+    expect(unapplied()).toEqual([d2.id, allowFailed.id]);
+    expect(rig.alarms.ofKind('compliance_unapplied')[0]?.detail).toMatch(/FREEZE: page first/);
+    await rig.engine.tick();
+    expect(unapplied()).toHaveLength(2); // not before the cadence
+    rig.clock.advance(3_601_000);
+    await rig.engine.tick();
+    expect(unapplied()).toEqual([d2.id, allowFailed.id, d2.id, allowFailed.id]);
+
+    const d3 = (await ask(rig, 'freeze', u)).change; // a person re-decides: applied
+    await tickUntil(rig.engine, async () => (await changeRow(d3.id)).status === 'confirmed');
+    rig.clock.advance(3_601_000);
+    await rig.engine.tick();
+    expect(unapplied().filter((id) => id === d2.id)).toHaveLength(2); // resolved: no new page
+    expect(unapplied().filter((id) => id === allowFailed.id)).toHaveLength(3);
+  });
+
+  it('an inversion INSIDE one block (older decision at a higher log index) raises compliance_out_of_order', async () => {
+    const rig = await rigFor({ maxResubmits: 2 }, { automine: false });
+    const u = await insertUser(db.prisma);
+    rig.chain.mine();
+    const u1 = (await ask(rig, 'unfreeze', u)).change;
+    await rig.engine.tick(); // U1 pooled with nonce n
+    const [a1] = await db.prisma.chainAttempt.findMany({
+      where: { outbox: { complianceChangeId: u1.id } },
+    });
+    rig.chain.dropTransaction(a1?.hash as `0x${string}`);
+    await setOnChain(rig.chain, `0x${'0e'.repeat(20)}`, { verified: true }); // takes nonce n
+    rig.clock.advance(1_000);
+    const f2 = (await ask(rig, 'freeze', u)).change;
+    await rig.engine.dispatcher.runOnce(); // F2: nonce n+1, pooled
+    await rig.engine.tick(); // U1 replaced for good: a NEW nonce n+2, pooled behind F2
+    rig.chain.mine(); // ONE block: F2 then U1
+    await rig.engine.tick();
+    const [e1] = await db.prisma.chainEvent.findMany({ where: { ref: u1.ref } });
+    const [e2] = await db.prisma.chainEvent.findMany({ where: { ref: f2.ref } });
+    expect(e1?.blockNumber).toBe(e2?.blockNumber);
+    expect((e1?.logIndex ?? 0) > (e2?.logIndex ?? 0)).toBe(true);
+    expect((await changeRow(u1.id)).status).toBe('confirmed');
+    expect((await changeRow(f2.id)).status).toBe('confirmed');
+    expect(rig.alarms.ofKind('compliance_out_of_order')).not.toHaveLength(0);
+    expect(rig.chain.complianceOf(wallet(u)).frozen).toBe(false);
+  });
+});
+
 describe('the run itself: multi-deployment users, a failing alarm sink', () => {
   it('a ledger user with operations on another deployment: unknown multi_deployment_user', async () => {
     const rig = await rigFor();

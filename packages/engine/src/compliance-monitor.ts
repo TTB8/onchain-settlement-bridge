@@ -35,10 +35,15 @@
  *    (its row died before anything was signed) is FAILed (`rejected`), so the deployment can be
  *    retired and the operator sees it.
  * 7. Review piece C:
- *    - a CONFIRM (or CONFIRM_LATE) whose event block is out of DECISION order with another
- *      confirmed change for the same account and flag (an older decision landing after a newer
- *      one, or the reverse) raises `compliance_out_of_order`: the registry now holds the older
- *      decision's value, which the reconciler reports as `compliance_mismatch` (M-1);
+ *    - a CONFIRM (or CONFIRM_LATE) whose event position (block, then log index) is out of
+ *      DECISION order with another confirmed change for the same account and flag (an older
+ *      decision landing after a newer one, or the reverse, in the same block included) raises
+ *      `compliance_out_of_order`: the registry now holds the older decision's value, which the
+ *      reconciler reports as `compliance_mismatch` (M-1);
+ *    - a FAILED change that no confirmed change with a higher `decision_seq` supersedes raises
+ *      `compliance_unapplied`, freezes first, every `unappliedAlarmEverySeconds` until a newer
+ *      decision is applied: the bridge's newest decision for that flag never reached the chain,
+ *      and the reconciler cannot see it (the registry still matches the older applied decision);
  *    - a change still `requested` / `submitted` after `pendingAlarmAfterSeconds` raises
  *      `compliance_pending`, freezes first (a freeze that has not landed is the one that lets a
  *      sanctioned account keep moving funds; page those first) (L-2);
@@ -127,7 +132,19 @@ export interface ComplianceMonitorOptions {
    * event. Default `DEFAULT_COMPLIANCE_FAILED_LOOKBACK_SECONDS`.
    */
   readonly failedLookbackSeconds?: number;
+  /**
+   * Seconds between two `compliance_unapplied` alarms for one failed, unsuperseded change.
+   * Default `DEFAULT_COMPLIANCE_UNAPPLIED_ALARM_SECONDS`.
+   */
+  readonly unappliedAlarmEverySeconds?: number;
 }
+
+/**
+ * Default cadence of `compliance_unapplied`: 3600 s. WHY: a failed newest decision (above all a
+ * freeze) stays wrong until a person re-requests it; once an hour keeps it on the page without
+ * flooding it, and the first alarm fires on the first pass after the failure.
+ */
+export const DEFAULT_COMPLIANCE_UNAPPLIED_ALARM_SECONDS = 3600;
 
 /**
  * Default seconds before `compliance_pending`: 900 (15 min). WHY: a registry call is one small
@@ -252,6 +269,9 @@ export class ComplianceMonitor {
   private readonly skips = new Map<string, number>();
   private readonly pendingAlarmAfterSeconds: number;
   private readonly failedLookbackSeconds: number;
+  private readonly unappliedAlarmEverySeconds: number;
+  /** When `compliance_unapplied` last fired per change (in memory: a restart alarms at once). */
+  private readonly unappliedAlarmedAt = new Map<string, number>();
 
   /** @param options Database, gateway, inspector, clock, policy and alarm sink. */
   constructor(options: ComplianceMonitorOptions) {
@@ -263,9 +283,12 @@ export class ComplianceMonitor {
       options.pendingAlarmAfterSeconds ?? DEFAULT_COMPLIANCE_PENDING_ALARM_SECONDS;
     this.failedLookbackSeconds =
       options.failedLookbackSeconds ?? DEFAULT_COMPLIANCE_FAILED_LOOKBACK_SECONDS;
+    this.unappliedAlarmEverySeconds =
+      options.unappliedAlarmEverySeconds ?? DEFAULT_COMPLIANCE_UNAPPLIED_ALARM_SECONDS;
     for (const [name, v] of [
       ['pendingAlarmAfterSeconds', this.pendingAlarmAfterSeconds],
       ['failedLookbackSeconds', this.failedLookbackSeconds],
+      ['unappliedAlarmEverySeconds', this.unappliedAlarmEverySeconds],
     ] as const) {
       if (!Number.isSafeInteger(v) || v < 0)
         throw new RangeError(`${name} must be an integer >= 0`);
@@ -333,6 +356,7 @@ export class ComplianceMonitor {
       }
     }
     await this.alarmPending(deployment);
+    await this.alarmUnapplied(deployment);
     try {
       counts.failed += await this.sweepOrphans(deployment);
     } catch (err) {
@@ -392,10 +416,65 @@ export class ComplianceMonitor {
   }
 
   /**
-   * Step 7 (M-1): after a change is confirmed at `block`, any other CONFIRMED change for the same
-   * account and flag whose block is out of decision order raises `compliance_out_of_order`.
+   * Step 7: every FAILED change of the deployment that no CONFIRMED change for the same account
+   * and flag with a higher `decision_seq` supersedes is the bridge's newest decision for that flag
+   * and never reached the chain. Not limited by the failed look-back: it stays on the page, at
+   * most every `unappliedAlarmEverySeconds` per change, freezes first, until a newer decision is
+   * applied.
    */
-  private async checkDecisionOrder(change: ChangeWithWallet, block: bigint): Promise<void> {
+  private async alarmUnapplied(d: Deployment): Promise<void> {
+    const failed = await this.prisma.complianceChange.findMany({
+      where: { deploymentId: d.id, status: 'failed' },
+      orderBy: [{ decisionSeq: 'asc' }],
+    });
+    if (failed.length === 0) return;
+    const confirmed = await this.prisma.complianceChange.findMany({
+      where: {
+        deploymentId: d.id,
+        status: 'confirmed',
+        userId: { in: failed.map((f) => f.userId) },
+      },
+      select: { userId: true, action: true, decisionSeq: true },
+    });
+    const flagOf = (a: ComplianceChange['action']) => flagChangeFor(a).flag;
+    const unapplied = failed.filter(
+      (f) =>
+        !confirmed.some(
+          (c) =>
+            c.userId === f.userId &&
+            flagOf(c.action) === flagOf(f.action) &&
+            c.decisionSeq > f.decisionSeq,
+        ),
+    );
+    const rank = (a: string): number => (a === 'freeze' ? 0 : 1);
+    unapplied.sort((a, b) => rank(a.action) - rank(b.action));
+    const now = this.clock.now().getTime();
+    for (const f of unapplied) {
+      const last = this.unappliedAlarmedAt.get(f.id);
+      if (last !== undefined && now - last < this.unappliedAlarmEverySeconds * 1000) continue;
+      this.unappliedAlarmedAt.set(f.id, now);
+      this.alarm(
+        'compliance_unapplied',
+        `${f.action} failed (${String(f.failureReason)}) and no newer decision was applied: the ` +
+          `registry does not hold the bridge's newest ${flagOf(f.action)} decision` +
+          (f.action === 'freeze' ? ' (FREEZE: page first)' : ''),
+        f.id,
+      );
+    }
+  }
+
+  /**
+   * Step 7 (M-1): after a change is confirmed at (`block`, `logIndex`), any other CONFIRMED change
+   * for the same account and flag whose event position is out of decision order raises
+   * `compliance_out_of_order`. Positions compare block, then log index, so an inversion inside one
+   * block counts too. The other change's log index comes from its indexed event; when the index
+   * no longer holds it (rolled back), only the block is compared.
+   */
+  private async checkDecisionOrder(
+    change: ChangeWithWallet,
+    block: bigint,
+    logIndex: number,
+  ): Promise<void> {
     const flag = flagChangeFor(change.action).flag;
     const same: ComplianceChange['action'][] =
       flag === 'frozen' ? ['freeze', 'unfreeze'] : ['verify', 'unverify'];
@@ -407,19 +486,30 @@ export class ComplianceMonitor {
         status: 'confirmed',
         id: { not: change.id },
       },
-      select: { id: true, decisionSeq: true, confirmedBlock: true },
+      select: { id: true, ref: true, decisionSeq: true, confirmedBlock: true },
     });
     for (const o of others) {
       if (o.confirmedBlock === null) continue;
+      const event = await this.prisma.chainEvent.findFirst({
+        where: { deploymentId: change.deploymentId, ref: o.ref, blockNumber: o.confirmedBlock },
+        select: { logIndex: true },
+      });
+      // -1 when unknown: compares as "before" within the block, i.e. block-only for that pair.
+      const otherLog = event?.logIndex ?? -1;
+      const otherIsLater =
+        o.confirmedBlock > block || (o.confirmedBlock === block && otherLog > logIndex);
+      const otherIsEarlier =
+        o.confirmedBlock < block ||
+        (o.confirmedBlock === block && otherLog >= 0 && otherLog < logIndex);
       const inverted =
-        (o.decisionSeq > change.decisionSeq && o.confirmedBlock < block) ||
-        (o.decisionSeq < change.decisionSeq && o.confirmedBlock > block);
+        (o.decisionSeq > change.decisionSeq && otherIsEarlier) ||
+        (o.decisionSeq < change.decisionSeq && otherIsLater);
       if (inverted) {
         this.alarm(
           'compliance_out_of_order',
-          `${change.action} (decision ${change.decisionSeq}) landed in block ${block}, out of ` +
-            `decision order with change ${o.id} (decision ${o.decisionSeq}, block ${o.confirmedBlock}): ` +
-            `the registry holds the older decision's ${flag} value`,
+          `${change.action} (decision ${change.decisionSeq}) landed at block ${block} log ${logIndex}, ` +
+            `out of decision order with change ${o.id} (decision ${o.decisionSeq}, block ` +
+            `${o.confirmedBlock}): the registry holds the older decision's ${flag} value`,
           change.id,
         );
       }
@@ -530,7 +620,7 @@ export class ComplianceMonitor {
           `registry event final in block ${found.like.blockNumber}`,
           found.row.txHash,
         );
-        await this.checkDecisionOrder(change, found.like.blockNumber);
+        await this.checkDecisionOrder(change, found.like.blockNumber, found.row.logIndex);
         return change.status === 'failed' ? 'lateConfirmed' : 'confirmed';
       }
       if (change.status === 'submitted') {
