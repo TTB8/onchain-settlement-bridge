@@ -8,3 +8,4 @@
 
 export * from './errors';
 export * from './primitives';
+export * from './money';
