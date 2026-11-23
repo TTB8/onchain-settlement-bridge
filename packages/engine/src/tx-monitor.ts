@@ -34,6 +34,13 @@
  *    = ANY indexed event carrying the reference (any kind, any block: more evidence can only block
  *    a reversal), `referenceConsumedOnChain` = `readReferenceUsed('token', ref, finalBlock)`.
  *
+ * Observation only (step 4): in the transaction of a CONFIRM / CONFIRM_LATE move, the attempt whose
+ * hash is the confirming event's transaction hash is marked `mined` with the event's block number
+ * and hash (`recordConfirmingAttempt`), so the API can show which transaction settled the
+ * operation. No decision reads an attempt's `status`, `block_number` or `block_hash`: every
+ * verdict comes from the node (receipts, nonces) and the indexed events. Other attempts of the
+ * operation (replaced bumps, rebroadcasts) keep what they had.
+ *
  * The monitor never reads the wall clock: `now` comes from the injected clock.
  */
 
@@ -44,6 +51,7 @@ import {
   type Deployment,
   lockRows,
   type Operation,
+  type Prisma,
   type PrismaClient,
 } from '@bridge/db';
 import {
@@ -514,6 +522,7 @@ export class TxMonitor {
           move,
           `settling event final in block ${settling.blockNumber}`,
           eventRow.txHash,
+          confirmingAttempt(ev.attempts, eventRow),
         );
         return op.status === 'failed' ? 'lateConfirmed' : 'confirmed';
       }
@@ -867,11 +876,12 @@ export class TxMonitor {
     move: OperationMove,
     note: string,
     txHash?: string,
+    mined?: ConfirmingAttempt,
   ): Promise<void> {
     await runTransaction(
       this.prisma,
-      (tx) =>
-        moveOperation(tx, {
+      async (tx) => {
+        await moveOperation(tx, {
           operationId: op.id,
           from: op.status,
           version: op.version,
@@ -879,7 +889,10 @@ export class TxMonitor {
           at: this.clock.now(),
           note,
           ...(txHash !== undefined ? { txHash: txHash as `0x${string}` } : {}),
-        }),
+        });
+        // After the move, in its transaction: recorded only if the confirmation commits.
+        if (mined !== undefined) await recordConfirmingAttempt(tx, mined);
+      },
       this.transactions,
     );
   }
@@ -1073,4 +1086,59 @@ export class TxMonitor {
 
 function max(a: bigint, b: bigint): bigint {
   return a > b ? a : b;
+}
+
+/** The attempt that carried a confirming event, and where that event is (block number + hash). */
+export interface ConfirmingAttempt {
+  /** The attempt row. */
+  readonly attemptId: string;
+  /** Its transaction hash (also the update's fence). */
+  readonly hash: string;
+  /** The confirming event's block. */
+  readonly blockNumber: bigint;
+  /** That block's hash (canonical: the event was judged on it). */
+  readonly blockHash: string;
+}
+
+/**
+ * The operation's attempt whose transaction hash is the confirming event's, or undefined when none
+ * is (the settling transaction is not one we recorded: nothing is marked). Matched on the hash
+ * only, never on nonce or order: a replaced bump has the same nonce and must keep its status.
+ *
+ * @param attempts The operation's attempts.
+ * @param event The canonical, final settling event the confirmation is decided on.
+ */
+export function confirmingAttempt(
+  attempts: readonly { readonly id: string; readonly hash: string }[],
+  event: { readonly txHash: string; readonly blockNumber: bigint; readonly blockHash: string },
+): ConfirmingAttempt | undefined {
+  const hash = event.txHash.toLowerCase();
+  const a = attempts.find((x) => x.hash.toLowerCase() === hash);
+  if (a === undefined) return undefined;
+  return {
+    attemptId: a.id,
+    hash: a.hash,
+    blockNumber: event.blockNumber,
+    blockHash: event.blockHash.toLowerCase(),
+  };
+}
+
+/**
+ * Marks the confirming attempt `mined` at its block, inside the confirmation's transaction.
+ * OBSERVATION ONLY: nothing in the engine decides on an attempt's status or block; this is for
+ * readers (the API's `transactions`). Only the observation columns change (the database's
+ * `chain_attempt_immutable` guard keeps the identity), number and hash together
+ * (`chain_attempt_block_seen_together`), fenced on the id AND the hash.
+ *
+ * @param tx The confirmation's transaction.
+ * @param mined The attempt and the event's block.
+ */
+export async function recordConfirmingAttempt(
+  tx: Prisma.TransactionClient,
+  mined: ConfirmingAttempt,
+): Promise<void> {
+  await tx.chainAttempt.updateMany({
+    where: { id: mined.attemptId, hash: mined.hash },
+    data: { status: 'mined', blockNumber: mined.blockNumber, blockHash: mined.blockHash },
+  });
 }
