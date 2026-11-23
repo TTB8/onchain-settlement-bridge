@@ -13,8 +13,8 @@ This repo runs a **standard** harness (guides, in-session checks (guard, Stop ho
   - `node-ts`: `packages/domain`, `packages/chain`, `packages/db`, `packages/engine`
   - `nestjs-prisma`: `apps/api`, `apps/worker`
 - **Risk zones:** changes here get stricter checks.
-  - **onchain**: `contracts/src/**`, `contracts/script/**` (requires: zone-tests, reviewer-label)
-  - **money**: `packages/domain/src/**`, `packages/engine/src/**`, `apps/api/src/operations/**`, `apps/api/src/balances/**` (requires: zone-tests, reviewer-label)
+  - **onchain**: `contracts/src/**`, `contracts/script/**`, `packages/chain/src/**` (requires: zone-tests, reviewer-label)
+  - **money**: `packages/domain/src/**`, `packages/engine/src/**`, `apps/api/src/operations/**`, `apps/api/src/balances/**`, `packages/db/prisma/**`, `packages/db/src/**` (requires: zone-tests, reviewer-label)
 - **Auditor:** `patrick` via `/audit`, lenses: cyfrin-audit-methodology. Required on: onchain, money, release. Run it on the code; its domain knowledge is for the review, not for everyday sessions.
 - **Secrets:** never read credential files or write live keys anywhere. The guard blocks both.
 - **Team:** for `/team`, route with `python3 scripts/harness/team.py plan <paths>` (level, agent, model floor, reviewer). A worker that edited files can't hand back "done" while the fast checks fail.

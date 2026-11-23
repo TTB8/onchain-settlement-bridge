@@ -35,7 +35,8 @@
       "risk": "onchain",
       "paths": [
         "contracts/src/**",
-        "contracts/script/**"
+        "contracts/script/**",
+        "packages/chain/src/**"
       ],
       "requires": [
         "zone-tests",
@@ -48,7 +49,9 @@
         "packages/domain/src/**",
         "packages/engine/src/**",
         "apps/api/src/operations/**",
-        "apps/api/src/balances/**"
+        "apps/api/src/balances/**",
+        "packages/db/prisma/**",
+        "packages/db/src/**"
       ],
       "requires": [
         "zone-tests",
