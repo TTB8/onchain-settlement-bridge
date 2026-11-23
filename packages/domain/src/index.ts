@@ -11,6 +11,7 @@ export * from './primitives';
 export * from './money';
 export * from './accounts';
 export * from './ledger';
+export * from './chainstate';
 export * from './operation';
 export * from './reference';
 export * from './compliance';

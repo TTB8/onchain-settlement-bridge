@@ -21,29 +21,21 @@ function canonicalOf(blocks: StoredBlock[]): Map<bigint, Hex> {
 
 describe('detectReorg', () => {
   const window = chain(100, 105);
+  const none = { reorged: false, nodeBehind: false, rollback: [], beyondWindow: false };
 
   it('reports nothing for an empty window', () => {
-    expect(detectReorg([], new Map())).toEqual({
-      reorged: false,
-      forkPoint: null,
-      rollback: [],
-      beyondWindow: false,
-    });
+    expect(detectReorg([], new Map())).toEqual({ ...none, forkPoint: null });
   });
 
   it('reports no reorg when the newest block still matches', () => {
-    expect(detectReorg(window, canonicalOf(window))).toEqual({
-      reorged: false,
-      forkPoint: 105n,
-      rollback: [],
-      beyondWindow: false,
-    });
+    expect(detectReorg(window, canonicalOf(window))).toEqual({ ...none, forkPoint: 105n });
   });
 
   it('detects a 1-block reorg', () => {
     const canonical = canonicalOf([...chain(100, 104), ...chain(105, 105, 'b')]);
     expect(detectReorg(window, canonical)).toEqual({
       reorged: true,
+      nodeBehind: false,
       forkPoint: 104n,
       rollback: [105n],
       beyondWindow: false,
@@ -54,6 +46,7 @@ describe('detectReorg', () => {
     const canonical = canonicalOf([...chain(100, 101), ...chain(102, 108, 'b')]);
     expect(detectReorg(window, canonical)).toEqual({
       reorged: true,
+      nodeBehind: false,
       forkPoint: 101n,
       rollback: [105n, 104n, 103n, 102n],
       beyondWindow: false,
@@ -64,24 +57,85 @@ describe('detectReorg', () => {
     const canonical = canonicalOf(chain(90, 110, 'b'));
     expect(detectReorg(window, canonical)).toEqual({
       reorged: true,
+      nodeBehind: false,
       forkPoint: null,
       rollback: [105n, 104n, 103n, 102n, 101n, 100n],
       beyondWindow: true,
     });
   });
 
-  it('rolls back heights the chain no longer has (chain shorter than before)', () => {
-    const canonical = canonicalOf(chain(100, 103));
-    expect(detectReorg(window, canonical)).toEqual({
-      reorged: true,
-      forkPoint: 103n,
-      rollback: [105n, 104n],
-      beyondWindow: false,
+  describe('a node with no block at some heights (review L-4)', () => {
+    it('lagging node: the top heights are missing, the rest match -> nodeBehind, NO rollback', () => {
+      expect(detectReorg(window, canonicalOf(chain(100, 103)))).toEqual({
+        reorged: false,
+        nodeBehind: true,
+        forkPoint: 103n,
+        rollback: [],
+        beyondWindow: false,
+      });
+    });
+
+    it('a node that has none of the window -> nodeBehind, no rollback, not beyondWindow', () => {
+      expect(detectReorg(window, new Map())).toEqual({
+        reorged: false,
+        nodeBehind: true,
+        forkPoint: null,
+        rollback: [],
+        beyondWindow: false,
+      });
+    });
+
+    it('genesis window: a node with no block 0 yet is behind, not reorged', () => {
+      const genesis = chain(0, 2);
+      expect(detectReorg(genesis, () => null)).toMatchObject({
+        reorged: false,
+        nodeBehind: true,
+        rollback: [],
+      });
+      expect(detectReorg(genesis, canonicalOf(chain(0, 0)))).toMatchObject({
+        reorged: false,
+        nodeBehind: true,
+        forkPoint: 0n,
+        rollback: [],
+      });
+    });
+
+    it('missing heights above a DIFFERENT hash are rolled back with it (they descend from it)', () => {
+      // Node has 100..103 on our branch, a different 104, and nothing at 105 yet.
+      const canonical = canonicalOf([...chain(100, 103), ...chain(104, 104, 'b')]);
+      expect(detectReorg(window, canonical)).toEqual({
+        reorged: true,
+        nodeBehind: true,
+        forkPoint: 103n,
+        rollback: [105n, 104n],
+        beyondWindow: false,
+      });
+    });
+
+    it('window edge: only the lowest stored block differs, the rest missing -> beyondWindow', () => {
+      const canonical = canonicalOf(chain(100, 100, 'b'));
+      expect(detectReorg(window, canonical)).toEqual({
+        reorged: true,
+        nodeBehind: true,
+        forkPoint: null,
+        rollback: [105n, 104n, 103n, 102n, 101n, 100n],
+        beyondWindow: true,
+      });
+    });
+
+    it('window edge: only the lowest stored block exists and matches -> behind, fork at the edge', () => {
+      expect(detectReorg(window, canonicalOf(chain(100, 100)))).toEqual({
+        reorged: false,
+        nodeBehind: true,
+        forkPoint: 100n,
+        rollback: [],
+        beyondWindow: false,
+      });
     });
   });
 
   it('accepts a lookup function as well as a map', () => {
-    const canonical = canonicalOf(chain(100, 104));
+    const canonical = canonicalOf([...chain(100, 104), ...chain(105, 105, 'b')]);
     const r = detectReorg(window, (n) => canonical.get(n) ?? null);
     expect(r).toMatchObject({ reorged: true, forkPoint: 104n, rollback: [105n] });
   });

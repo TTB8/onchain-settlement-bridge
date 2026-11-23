@@ -9,6 +9,16 @@
  * head, clock) and this function returns exactly one verdict. Keeping it pure means every awkward
  * case (a receipt that vanishes in a reorg, a nonce consumed by another transaction) is a table row
  * in a unit test instead of a timing-dependent integration test.
+ *
+ * Engine obligations (the classifier is only as sound as its inputs):
+ * - Keep an attempt record for EVERY transaction that was signed, from the moment it is signed until
+ *   its nonce use is final. A submission whose outcome is unknown (a timeout, a transport error) is
+ *   NOT a rejection: the node may have accepted it, so it stays an attempt that can still land.
+ * - `finalNonce` is the signer's transaction count at the block `head - depth + 1` (the newest block
+ *   with `depth` confirmations), read with the chain package's `getNonce(signer, blockNumber)`. The
+ *   head's count alone is not final: a one-block reorg can un-consume a nonce.
+ * - `ReversalEvidence.anAttemptCanStillMine` must be computed with `attemptCanStillMine` over every
+ *   attempt of the operation.
  */
 
 import { FeeCapExceededError, InvalidInputError } from './errors';
@@ -34,6 +44,19 @@ export function confirmationsOf(txBlock: bigint | null, head: bigint): bigint {
 /** Whether a transaction mined in `txBlock` has at least `depth` (>= 1) confirmations at `head`. */
 export function isConfirmed(txBlock: bigint | null, head: bigint, depth: number): boolean {
   return confirmationsOf(txBlock, head) >= assertDepth(depth);
+}
+
+/** The chain position against which "final" is judged: the head and the confirmations required. */
+export interface Finality {
+  /** The newest block number. */
+  readonly head: bigint;
+  /** Confirmations required before something counts (>= 1). */
+  readonly depth: number;
+}
+
+/** Whether something in block `blockNumber` is final under `finality`. */
+export function isFinal(blockNumber: bigint, finality: Finality): boolean {
+  return isConfirmed(blockNumber, finality.head, finality.depth);
 }
 
 /** The fields of a receipt the classifier reads. Structurally compatible with the chain's `Receipt`. */
@@ -69,8 +92,13 @@ export interface AttemptObservation {
   readonly receipt: ObservedReceipt | null;
   /** Whether the node still knows the transaction (in its pool or mined). */
   readonly nodeKnowsTx: boolean;
-  /** The signer's CONFIRMED transaction count: every nonce below it has been used by a mined tx. */
+  /** The signer's transaction count at the HEAD: every nonce below it is used by a mined tx. */
   readonly confirmedNonce: number;
+  /**
+   * The signer's transaction count at the newest FINAL block (`head - depth + 1`). Never above
+   * `confirmedNonce`. Only a nonce below this count is used for good.
+   */
+  readonly finalNonce: number;
   /** The newest block number. */
   readonly head: bigint;
 }
@@ -96,7 +124,10 @@ export interface AttemptPolicy {
 
 /** The single verdict for one attempt. */
 export type AttemptVerdict =
-  /** Known to the node, not mined, not yet stuck. Check again later. */
+  /**
+   * Check again later: known to the node, not mined, not yet stuck; or the nonce was used by a
+   * transaction mined at the head but that use is not final yet (a reorg could undo it).
+   */
   | { readonly verdict: 'wait' }
   /** Mined but not deep enough to trust; a reorg could still remove it. */
   | {
@@ -117,9 +148,9 @@ export type AttemptVerdict =
   /** The node forgot it and its nonce is still free: resubmit it (same nonce, same reference). */
   | { readonly verdict: 'dropped' }
   /**
-   * The signer's nonce was consumed but not by this attempt. Another attempt of ours (check those
-   * first) or a foreign transaction took it. Look for the operation's reference on chain before
-   * deciding anything: it may have settled through another attempt.
+   * The signer's nonce was consumed, FINALLY, but not by this attempt. Another attempt of ours
+   * (check those first) or a foreign transaction took it. Look for the operation's reference on
+   * chain before deciding anything: it may have settled through another attempt.
    */
   | { readonly verdict: 'replaced_or_lost' }
   /**
@@ -136,6 +167,15 @@ function assertNonNegativeInt(n: number, label: string): void {
   }
 }
 
+function assertNonce(observation: AttemptObservation): void {
+  assertNonNegativeInt(observation.confirmedNonce, 'observation.confirmedNonce');
+  assertNonNegativeInt(observation.finalNonce, 'observation.finalNonce');
+  if (observation.finalNonce > observation.confirmedNonce) {
+    // An older block cannot have used more nonces than the head: the reads are inconsistent.
+    throw new InvalidInputError('observation.finalNonce cannot exceed observation.confirmedNonce');
+  }
+}
+
 function assertValidDate(d: Date, label: string): void {
   if (!(d instanceof Date) || Number.isNaN(d.getTime())) {
     throw new InvalidInputError(`${label} must be a valid Date`);
@@ -146,9 +186,10 @@ function assertValidDate(d: Date, label: string): void {
  * Classifies one submission attempt. The checks run in an order that matters:
  *
  * 1. A receipt wins over everything, but only counts once it is `confirmations` deep.
- * 2. No receipt and the signer's confirmed nonce is past ours: a different transaction used it.
- *    (Checked before "dropped", because a node that forgot a replaced transaction would otherwise
- *    look like a drop, and resubmitting would just fail with "nonce too low".)
+ * 2. No receipt and the signer's FINAL nonce is past ours: a different transaction used it for good.
+ *    If only the head's nonce is past ours, the use is not final yet: `wait`. (Both checked before
+ *    "dropped", because a node that forgot a replaced transaction would otherwise look like a drop,
+ *    and resubmitting would just fail with "nonce too low".)
  * 3. No receipt and the node does not know it: dropped, resubmit, or give up once
  *    `resubmitsSoFar` has reached `maxResubmits`.
  * 4. Known and pending: wait, or bump once it has been pending for `stuckAfterSeconds`, or give up.
@@ -172,7 +213,7 @@ export function assessAttempt(
   const depth = assertDepth(policy.confirmations);
   assertNonNegativeInt(attempt.nonce, 'attempt.nonce');
   assertNonNegativeInt(attempt.bumpsSoFar, 'attempt.bumpsSoFar');
-  assertNonNegativeInt(observation.confirmedNonce, 'observation.confirmedNonce');
+  assertNonce(observation);
   assertNonNegativeInt(attempt.resubmitsSoFar, 'attempt.resubmitsSoFar');
   assertNonNegativeInt(policy.maxBumps, 'policy.maxBumps');
   assertNonNegativeInt(policy.maxResubmits, 'policy.maxResubmits');
@@ -193,8 +234,12 @@ export function assessAttempt(
       : { verdict: 'reverted', blockNumber: receipt.blockNumber, reason: receipt.revertReason };
   }
 
-  if (observation.confirmedNonce > attempt.nonce) {
+  if (observation.finalNonce > attempt.nonce) {
     return { verdict: 'replaced_or_lost' };
+  }
+  if (observation.confirmedNonce > attempt.nonce) {
+    // Used at the head, not yet final: a reorg could bring this attempt (or the other one) back.
+    return { verdict: 'wait' };
   }
 
   if (!observation.nodeKnowsTx) {
@@ -220,4 +265,32 @@ export function assessAttempt(
     }
     throw err;
   }
+}
+
+/**
+ * Whether this attempt could still be mined (and so settle its operation). False only when that is
+ * settled for good: the attempt has a receipt at least `depth` deep (it landed, success or revert),
+ * or the signer's nonce use at the final block is past the attempt's nonce (something else took it).
+ * Everything else, including a nonce used only at the head, means it can still land.
+ *
+ * `ReversalEvidence.anAttemptCanStillMine` must be the OR of this over every attempt the engine
+ * holds for the operation.
+ *
+ * @param attempt The attempt as recorded.
+ * @param observation What the node reports now (receipt, nonces, head).
+ * @param depth Confirmations required for finality (>= 1).
+ */
+export function attemptCanStillMine(
+  attempt: Pick<AttemptRecord, 'nonce'>,
+  observation: AttemptObservation,
+  depth: number,
+): boolean {
+  const required = assertDepth(depth);
+  assertNonNegativeInt(attempt.nonce, 'attempt.nonce');
+  assertNonce(observation);
+  const { receipt } = observation;
+  if (receipt !== null && confirmationsOf(receipt.blockNumber, observation.head) >= required) {
+    return false;
+  }
+  return observation.finalNonce <= attempt.nonce;
 }

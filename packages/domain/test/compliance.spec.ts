@@ -3,6 +3,10 @@ import {
   applyComplianceAction,
   assertCanStart,
   canTransact,
+  type ComplianceChangeContent,
+  complianceEventContent,
+  complianceEventMatches,
+  type ComplianceEventLike,
   type ComplianceAction,
   type ComplianceChangeEvent,
   type ComplianceChangeStatus,
@@ -14,6 +18,7 @@ import {
   inFlightComplianceCheck,
   InvalidInputError,
   InvalidTransitionError,
+  judgeComplianceEvent,
   transitionComplianceChange,
 } from '../src';
 import { addr } from './support/fixtures';
@@ -196,6 +201,8 @@ describe('compliance change state machine', () => {
     'submitted:SUBMIT': 'submitted',
     'submitted:CONFIRM': 'confirmed',
     'submitted:FAIL': 'failed',
+    'requested:FAIL': 'failed',
+    'failed:CONFIRM': 'confirmed',
   };
 
   it('allows exactly the specified edges', () => {
@@ -213,5 +220,65 @@ describe('compliance change state machine', () => {
 
   it('names the machine in the error', () => {
     expect(() => transitionComplianceChange('confirmed', 'SUBMIT')).toThrow(/compliance_change/);
+  });
+});
+
+describe('compliance events against changes (review M-2)', () => {
+  const change: ComplianceChangeContent = { account: alice, flag: 'frozen', value: true };
+  const frozenSet = (
+    account: Address,
+    frozen: boolean,
+    blockNumber = 98n,
+  ): ComplianceEventLike => ({
+    kind: 'FrozenSet',
+    account,
+    frozen,
+    blockNumber,
+  });
+  const fin = { head: 100n, depth: 3 };
+
+  it('reads the change an event records', () => {
+    expect(complianceEventContent(frozenSet(alice, true))).toEqual(change);
+    expect(
+      complianceEventContent({
+        kind: 'VerificationSet',
+        account: bob,
+        verified: false,
+        blockNumber: 1n,
+      }),
+    ).toEqual({ account: bob, flag: 'verified', value: false });
+  });
+
+  it('matches only on the same flag, account and value', () => {
+    expect(complianceEventMatches(change, frozenSet(alice, true))).toBe(true);
+    expect(complianceEventMatches(change, frozenSet(bob, true))).toBe(false); // front-run account
+    expect(complianceEventMatches(change, frozenSet(alice, false))).toBe(false);
+    expect(
+      complianceEventMatches(change, {
+        kind: 'VerificationSet',
+        account: alice,
+        verified: true,
+        blockNumber: 98n,
+      }),
+    ).toBe(false);
+  });
+
+  it('judges: wait until final, then confirm on a match or conflict otherwise', () => {
+    expect(judgeComplianceEvent(change, frozenSet(alice, true, 99n), fin)).toEqual({
+      verdict: 'wait',
+    });
+    expect(judgeComplianceEvent(change, frozenSet(alice, true, 98n), fin)).toEqual({
+      verdict: 'confirm',
+      event: 'CONFIRM',
+    });
+    expect(judgeComplianceEvent(change, frozenSet(bob, true, 98n), fin)).toEqual({
+      verdict: 'conflict',
+    });
+  });
+
+  it('a change refused before sending can fail, and a failed one can confirm late', () => {
+    expect(transitionComplianceChange('requested', 'FAIL')).toBe('failed');
+    expect(transitionComplianceChange('failed', 'CONFIRM')).toBe('confirmed');
+    expect(() => transitionComplianceChange('confirmed', 'FAIL')).toThrow(InvalidTransitionError);
   });
 });

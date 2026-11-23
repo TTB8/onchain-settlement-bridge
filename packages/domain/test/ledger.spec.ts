@@ -8,6 +8,8 @@ import {
   FIAT_CLEARING,
   heldOf,
   incomingOf,
+  journalKindFor,
+  transition,
   InsufficientFundsError,
   InvalidAmountError,
   InvalidInputError,
@@ -218,6 +220,38 @@ describe('deriveBalances', () => {
       { account: incomingOf('u1'), side: 'credit', amount: 11n },
     ]);
     expect(() => deriveBalances([buildEntry(dep, 'reserve'), bad])).toThrow(UnbalancedEntryError);
+  });
+});
+
+describe('a failed operation settling late (review M-2)', () => {
+  it('the ordinary settle entry after FAIL (no reverse) conserves funds', () => {
+    // RESERVE writes the reserve entry; FAIL writes nothing; a late CONFIRM writes the settle entry.
+    expect(journalKindFor('FAIL')).toBeNull();
+    let status = transition('requested', 'RESERVE');
+    const entries = [
+      buildEntry(dep, 'reserve'),
+      buildEntry(dep, 'settle'),
+      buildEntry(tr, 'reserve'),
+    ];
+    status = transition(transition(status, 'SUBMIT'), 'FAIL');
+    expect(status).toBe('failed');
+    // While failed, the transfer's funds are still held.
+    expect(balanceOf(deriveBalances(entries), heldOf('u1'))).toBe(25n);
+    status = transition(status, 'CONFIRM');
+    expect(status).toBe('confirmed');
+    entries.push(buildEntry(tr, journalKindFor('CONFIRM') as 'settle'));
+    const b = deriveBalances(entries);
+    expect(balanceOf(b, heldOf('u1'))).toBe(0n);
+    expect(balanceOf(b, availableOf('u1'))).toBe(75n);
+    expect(balanceOf(b, availableOf('u2'))).toBe(25n);
+    // fiat_clearing still equals every liability; chain view (available+held) totals the minted 100.
+    const liabilities =
+      balanceOf(b, availableOf('u1')) +
+      balanceOf(b, heldOf('u1')) +
+      balanceOf(b, incomingOf('u1')) +
+      balanceOf(b, availableOf('u2'));
+    expect(balanceOf(b, FIAT_CLEARING)).toBe(liabilities);
+    expect(liabilities).toBe(100n);
   });
 });
 

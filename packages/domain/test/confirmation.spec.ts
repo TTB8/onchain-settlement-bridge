@@ -1,5 +1,8 @@
 import {
   assessAttempt,
+  attemptCanStillMine,
+  isFinal,
+  mayReverse,
   type AttemptObservation,
   type AttemptPolicy,
   type AttemptRecord,
@@ -56,6 +59,7 @@ describe('assessAttempt', () => {
     receipt: null,
     nodeKnowsTx: true,
     confirmedNonce: 5,
+    finalNonce: 5,
     head: 200n,
   };
 
@@ -159,15 +163,35 @@ describe('assessAttempt', () => {
       ).toEqual({ verdict: 'dropped' });
     });
 
-    it('after the reorg, the nonce consumed by another tx: replaced_or_lost', () => {
+    it('after the reorg, the nonce consumed FINALLY by another tx: replaced_or_lost', () => {
       expect(
         assessAttempt(
           attempt,
-          { ...pending, nodeKnowsTx: false, confirmedNonce: 6 },
+          { ...pending, nodeKnowsTx: false, confirmedNonce: 6, finalNonce: 6 },
           at(30),
           policy,
         ),
       ).toEqual({ verdict: 'replaced_or_lost' });
+    });
+
+    it('the nonce consumed only at the head (not final): wait, never replaced_or_lost', () => {
+      expect(
+        assessAttempt(
+          attempt,
+          { ...pending, nodeKnowsTx: false, confirmedNonce: 6, finalNonce: 5 },
+          at(30),
+          policy,
+        ),
+      ).toEqual({ verdict: 'wait' });
+      // Not even after the stuck timeout or past the resubmit limit: nothing is sent, nothing given up.
+      expect(
+        assessAttempt(
+          { ...attempt, bumpsSoFar: 99, resubmitsSoFar: 99 },
+          { ...pending, nodeKnowsTx: false, confirmedNonce: 6, finalNonce: 5 },
+          at(9_999),
+          policy,
+        ),
+      ).toEqual({ verdict: 'wait' });
     });
   });
 
@@ -202,7 +226,7 @@ describe('assessAttempt', () => {
       expect(
         assessAttempt(
           exhausted,
-          { ...pending, nodeKnowsTx: false, confirmedNonce: 6 },
+          { ...pending, nodeKnowsTx: false, confirmedNonce: 6, finalNonce: 6 },
           at(5),
           policy,
         ),
@@ -219,7 +243,7 @@ describe('assessAttempt', () => {
       expect(
         assessAttempt(
           attempt,
-          { ...pending, nodeKnowsTx: true, confirmedNonce: 9 },
+          { ...pending, nodeKnowsTx: true, confirmedNonce: 9, finalNonce: 9 },
           at(500),
           policy,
         ),
@@ -276,6 +300,15 @@ describe('assessAttempt', () => {
         () => assessAttempt(attempt, { ...pending, confirmedNonce: -1 }, at(1), policy),
       ],
       [
+        'negative final nonce',
+        () => assessAttempt(attempt, { ...pending, finalNonce: -1 }, at(1), policy),
+      ],
+      [
+        'final nonce above the head nonce',
+        () =>
+          assessAttempt(attempt, { ...pending, confirmedNonce: 5, finalNonce: 6 }, at(1), policy),
+      ],
+      [
         'negative resubmitsSoFar',
         () => assessAttempt({ ...attempt, resubmitsSoFar: -1 }, pending, at(1), policy),
       ],
@@ -316,5 +349,72 @@ describe('assessAttempt', () => {
     ])('rejects %s', (_label, fn) => {
       expect(fn).toThrow(InvalidInputError);
     });
+  });
+});
+
+describe('attemptCanStillMine (review M-1)', () => {
+  const depth = 3;
+  const base: AttemptObservation = {
+    receipt: null,
+    nodeKnowsTx: true,
+    confirmedNonce: 5,
+    finalNonce: 5,
+    head: 100n,
+  };
+
+  it('review scenario: a replacement mined with 1 of 3 confirmations must not allow reversal', () => {
+    // Our attempt (nonce 5) was replaced by another tx mined at the head (block 100): the head nonce
+    // is 6, but the final block (98) still shows 5. A 1-block reorg could bring ours back.
+    const obs = { ...base, nodeKnowsTx: false, confirmedNonce: 6, finalNonce: 5 };
+    expect(attemptCanStillMine({ nonce: 5 }, obs, depth)).toBe(true);
+    expect(
+      mayReverse({
+        failureReason: 'reverted',
+        anAttemptCanStillMine: attemptCanStillMine({ nonce: 5 }, obs, depth),
+        chainHasEventForRef: false,
+        referenceConsumedOnChain: false,
+      }),
+    ).toBe(false);
+  });
+
+  it('is false once the nonce use is final', () => {
+    expect(
+      attemptCanStillMine({ nonce: 5 }, { ...base, confirmedNonce: 6, finalNonce: 6 }, depth),
+    ).toBe(false);
+    expect(attemptCanStillMine({ nonce: 4 }, base, depth)).toBe(false);
+  });
+
+  it('is true for a pending attempt and for one whose node forgot it', () => {
+    expect(attemptCanStillMine({ nonce: 5 }, base, depth)).toBe(true);
+    expect(attemptCanStillMine({ nonce: 5 }, { ...base, nodeKnowsTx: false }, depth)).toBe(true);
+  });
+
+  it('a receipt counts only once final: exactly depth deep is final, one less is not', () => {
+    const shallow = { ...base, receipt: { status: 'reverted' as const, blockNumber: 99n } };
+    const exact = { ...base, receipt: { status: 'reverted' as const, blockNumber: 98n } };
+    expect(attemptCanStillMine({ nonce: 5 }, shallow, depth)).toBe(true);
+    expect(attemptCanStillMine({ nonce: 5 }, exact, depth)).toBe(false);
+    expect(
+      attemptCanStillMine(
+        { nonce: 5 },
+        { ...base, receipt: { status: 'success', blockNumber: 1n } },
+        depth,
+      ),
+    ).toBe(false);
+  });
+
+  it('validates its inputs', () => {
+    expect(() => attemptCanStillMine({ nonce: 5 }, base, 0)).toThrow(InvalidInputError);
+    expect(() => attemptCanStillMine({ nonce: -1 }, base, depth)).toThrow(InvalidInputError);
+    expect(() => attemptCanStillMine({ nonce: 5 }, { ...base, finalNonce: 6 }, depth)).toThrow(
+      InvalidInputError,
+    );
+  });
+});
+
+describe('isFinal', () => {
+  it('is final at exactly depth confirmations', () => {
+    expect(isFinal(98n, { head: 100n, depth: 3 })).toBe(true);
+    expect(isFinal(99n, { head: 100n, depth: 3 })).toBe(false);
   });
 });

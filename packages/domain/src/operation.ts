@@ -7,11 +7,27 @@
  * is easy to review line by line, and everything not listed is refused with a typed error.
  *
  *   requested --RESERVE--> ledger_reserved --SUBMIT--> submitted --CONFIRM--> confirmed (terminal)
- *                               |                        |  ^
- *                               |                        +--+ SUBMIT (gas bump / resubmission)
- *                               +--------FAIL------------+--FAIL--> failed --REVERSE--> reversed (terminal)
+ *                               |                        |  ^                     ^
+ *                               |                        +--+ SUBMIT              | CONFIRM (late,
+ *                               |                          (gas bump / resubmit)  |  gated)
+ *                               +--------FAIL------------+--FAIL--> failed -------+
+ *                                                                     |
+ *                                                                     +--REVERSE--> reversed (terminal)
+ *
+ * `failed` is not terminal: an attempt the engine gave up on can still land, and then the
+ * operation must settle late (`failed:CONFIRM`). That edge is GATED: the engine may apply it only
+ * on a `confirm` verdict from `lateConfirmation` (a final event that matches exactly). Funds stay
+ * held while an operation is failed and not reversed, so the ordinary settle entry is still valid.
+ * Nothing leaves `confirmed` or `reversed`.
+ *
+ * Escalations: a failure with reason `duplicate_reference` or `reference_conflict` means the
+ * reference may already have settled on chain. Such an operation stays `failed` until a person
+ * decides; it is NEVER reversed automatically (`mayReverse` refuses both reasons). REVERSE is the
+ * only step that can pay a user twice, so it needs final evidence (see `ReversalEvidence`), never
+ * an absence of evidence.
  */
 
+import { type Finality, isFinal } from './confirmation';
 import { InvalidInputError, InvalidTransitionError } from './errors';
 import type { Address } from './primitives';
 
@@ -33,7 +49,10 @@ export type JournalKind = 'reserve' | 'settle' | 'reverse';
  * - `reverted`: mined and reverted for a reason other than the ones below.
  * - `dropped`: the node forgot the transaction and it could not be resubmitted.
  * - `compliance_rejected`: a party was not allowed (caught before sending or by the chain).
- * - `duplicate_reference`: the chain says the reference is used, but shows no event for it.
+ * - `duplicate_reference`: the chain says the reference is used, but our index shows no event for
+ *   it. On the token only a successful settlement consumes a reference, and it always emits an
+ *   event, so this means our index is incomplete and the money most likely already moved.
+ *   Decision: an escalation to a person, never reversed automatically (`mayReverse` refuses).
  * - `reference_conflict`: the chain shows a settling event for the reference that does NOT match
  *   the operation (kind, party or amount). Decision: the engine FAILs the operation with this
  *   reason so it is visible, and never reverses it (`mayReverse` refuses): a person decides.
@@ -72,6 +91,8 @@ export const OPERATION_TRANSITIONS: ReadonlyMap<string, OperationStatus> = new M
   ['ledger_reserved:FAIL', 'failed'],
   ['submitted:FAIL', 'failed'],
   ['failed:REVERSE', 'reversed'],
+  // Late settlement of a failed operation. Gated: apply only on lateConfirmation(...) === confirm.
+  ['failed:CONFIRM', 'confirmed'],
 ]);
 
 /** Whether `event` is legal from `status`. */
@@ -123,10 +144,11 @@ export const SETTLING_EVENT: Readonly<Record<OperationType, SettlingEventKind>> 
 export type SettlingEventKind = 'Minted' | 'Burned' | 'SettledTransfer';
 
 /**
- * The fields of a settling event that are compared with an operation. Structurally a subset of the
- * chain package's `Minted` / `Burned` / `SettledTransfer` events, so those can be passed as they are.
+ * The fields of a settling event that are compared with an operation, plus the block it is in (so
+ * its finality can be judged). Structurally a subset of the chain package's `Minted` / `Burned` /
+ * `SettledTransfer` events, so those can be passed as they are.
  */
-export type SettlingEventLike =
+export type SettlingEventLike = { readonly blockNumber: bigint } & (
   | { readonly kind: 'Minted'; readonly to: Address; readonly amount: bigint }
   | { readonly kind: 'Burned'; readonly from: Address; readonly amount: bigint }
   | {
@@ -134,7 +156,8 @@ export type SettlingEventLike =
       readonly from: Address;
       readonly to: Address;
       readonly amount: bigint;
-    };
+    }
+);
 
 /** The parts of an operation that its settling event must reproduce exactly. */
 export interface SettlementExpectation {
@@ -202,9 +225,17 @@ export function settlementDifferences(
 
 /** What a reverted attempt means for its operation. Exactly one verdict. */
 export type RevertResolution =
-  /** The chain shows this operation's exact settlement: apply CONFIRM. */
+  /** The chain shows this operation's exact settlement, final: apply CONFIRM. */
   | { readonly verdict: 'confirm'; readonly event: 'CONFIRM' }
-  /** A real failure: apply FAIL with `reason`. Reversal is still gated by `mayReverse`. */
+  /**
+   * An event for the reference exists but is not final yet. Do nothing and look again: a matching
+   * event can still vanish in a reorg, and so can a conflicting one.
+   */
+  | { readonly verdict: 'wait' }
+  /**
+   * A failure: apply FAIL with `reason`. Reversal is still gated by `mayReverse`; for
+   * `duplicate_reference` it is never automatic (escalate: the money most likely moved).
+   */
   | { readonly verdict: 'failed'; readonly event: 'FAIL'; readonly reason: FailureReason }
   /**
    * The reference was consumed by an event that is NOT this operation's settlement. Never CONFIRM.
@@ -216,6 +247,49 @@ export type RevertResolution =
       readonly reason: 'reference_conflict';
       readonly differences: readonly SettlementDifference[];
     };
+
+/** The verdict on an observed settling event for an operation: final and exact, not final, or wrong. */
+export type SettlementJudgement = Exclude<RevertResolution, { verdict: 'failed' }>;
+
+/**
+ * Judges an observed settling event against its operation: `wait` until it is final, then
+ * `confirm` if `settlementDifferences` is empty, else `reference_conflict`. The one place that
+ * decides whether an event settles an operation, shared by `resolveRevert` and `lateConfirmation`.
+ */
+function judgeSettlementEvent(
+  op: SettlementExpectation,
+  event: SettlingEventLike,
+  finality: Finality,
+): SettlementJudgement {
+  const differences = settlementDifferences(op, event);
+  if (!isFinal(event.blockNumber, finality)) {
+    return { verdict: 'wait' };
+  }
+  if (differences.length === 0) {
+    return { verdict: 'confirm', event: 'CONFIRM' };
+  }
+  return { verdict: 'reference_conflict', reason: 'reference_conflict', differences };
+}
+
+/**
+ * Whether a FAILED (not reversed) operation may settle late on the strength of `event`: `confirm`
+ * only when the event is final and matches the operation exactly, `wait` while it is not final,
+ * `reference_conflict` when it is final but differs. This is the only evidence on which the engine
+ * may apply the gated `failed:CONFIRM` edge, so a failed operation is never confirmed on weaker
+ * evidence than a submitted one.
+ *
+ * @param op The failed operation.
+ * @param event The settling-kind event on chain carrying the operation's reference.
+ * @param finality The current head and the confirmations required.
+ */
+export function lateConfirmation(
+  op: SettlementExpectation,
+  event: SettlingEventLike,
+  finality: Finality,
+): SettlementJudgement {
+  assertConsistentExpectation(op);
+  return judgeSettlementEvent(op, event, finality);
+}
 
 /** The contract error the token raises when a reference was already consumed. */
 export const REFERENCE_ALREADY_USED = 'ReferenceAlreadyUsed';
@@ -243,24 +317,25 @@ export const NOT_ALLOWED = 'NotAllowed';
  * - no event: a real failure, classified by the revert reason (`ReferenceAlreadyUsed` without an
  *   event is `duplicate_reference`, `NotAllowed` is `compliance_rejected`, anything else `reverted`).
  *
+ * Any observed event is judged only once it is final (`finality.depth` confirmations); before
+ * that the verdict is `wait`, for a matching and a conflicting event alike.
+ *
  * Throws `InvalidInputError` when `op.type` and `op.parties.type` disagree, whichever branch runs.
  *
  * @param op The operation the attempt was for.
  * @param reason The decoded contract error name, or undefined when it could not be decoded.
  * @param observedEvent The settling-kind event on chain carrying this operation's reference, or null.
+ * @param finality The current head and the confirmations required.
  */
 export function resolveRevert(
   op: SettlementExpectation,
   reason: string | undefined,
   observedEvent: SettlingEventLike | null,
+  finality: Finality,
 ): RevertResolution {
   assertConsistentExpectation(op);
   if (observedEvent !== null) {
-    const differences = settlementDifferences(op, observedEvent);
-    if (differences.length === 0) {
-      return { verdict: 'confirm', event: 'CONFIRM' };
-    }
-    return { verdict: 'reference_conflict', reason: 'reference_conflict', differences };
+    return judgeSettlementEvent(op, observedEvent, finality);
   }
   if (reason === REFERENCE_ALREADY_USED) {
     // The reference is consumed but by nothing we can see: never treat that as settled.
@@ -272,29 +347,53 @@ export function resolveRevert(
   return { verdict: 'failed', event: 'FAIL', reason: 'reverted' };
 }
 
-/** Evidence needed before a failed operation may be reversed (its funds released). */
+/** Failure reasons that are escalations to a person and are never reversed automatically. */
+export const ESCALATION_REASONS: ReadonlySet<FailureReason> = new Set<FailureReason>([
+  'duplicate_reference',
+  'reference_conflict',
+]);
+
+/**
+ * Evidence needed before a failed operation may be reversed (its funds released). Each field is an
+ * obligation on the engine, which must gather it from FINAL chain state, not from the head.
+ */
 export interface ReversalEvidence {
-  /** Why the operation failed. A `reference_conflict` is never reversed automatically. */
+  /** Why the operation failed. Escalation reasons (see `ESCALATION_REASONS`) are never reversed. */
   readonly failureReason: FailureReason;
   /**
-   * Whether any attempt for this operation could still be mined: an attempt whose nonce the signer
-   * has not yet consumed. A transaction sitting in some node's pool can land at any time.
+   * Whether any attempt for this operation could still be mined. The engine must compute it as
+   * `attempts.some(a => attemptCanStillMine(a, observation, depth))` over EVERY signed attempt it
+   * holds for the operation (see `confirmation.ts`). A transaction in some node's pool, or one whose
+   * nonce use is not yet final, can still land.
    */
   readonly anAttemptCanStillMine: boolean;
-  /** Whether the chain shows any settling event carrying the operation's reference. */
+  /** Whether the bridge's index shows any settling event carrying the operation's reference. */
   readonly chainHasEventForRef: boolean;
+  /**
+   * The contract's own `referenceUsed(ref)` flag, read at a FINAL block (`head - depth + 1`). This
+   * is authoritative where the index may be incomplete: if it is true, something settled with this
+   * reference, whatever the index shows.
+   */
+  readonly referenceConsumedOnChain: boolean;
 }
 
 /**
  * Whether REVERSE is safe. Reversing releases held funds back to the user; if the chain later (or
- * already) settles the same operation, the user is paid twice. So reversal requires proof that no
- * attempt can still land, that no event uses the reference, and that the failure is not a conflict
- * waiting for a person.
+ * already) settles the same operation, the user is paid twice. So reversal requires ALL of:
+ *
+ * - the failure is not an escalation (`duplicate_reference`, `reference_conflict`): those mean the
+ *   reference may already have settled, and a person must decide;
+ * - no attempt can still land (each attempt's nonce use is final, or it has a final receipt);
+ * - the index shows no settling event for the reference;
+ * - the contract says, at a final block, that the reference was NOT consumed. Only a successful
+ *   settlement consumes a reference, so a consumed one means the money moved even if the index
+ *   missed the event.
  */
 export function mayReverse(evidence: ReversalEvidence): boolean {
   return (
-    evidence.failureReason !== 'reference_conflict' &&
+    !ESCALATION_REASONS.has(evidence.failureReason) &&
     !evidence.anAttemptCanStillMine &&
-    !evidence.chainHasEventForRef
+    !evidence.chainHasEventForRef &&
+    !evidence.referenceConsumedOnChain
   );
 }

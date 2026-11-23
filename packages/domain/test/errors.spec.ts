@@ -7,6 +7,7 @@ import {
   InvalidInputError,
   InvalidReferenceError,
   InvalidTransitionError,
+  JournalIntegrityError,
   SelfTransferError,
   UnbalancedEntryError,
 } from '../src';
@@ -23,6 +24,7 @@ describe('DomainError hierarchy', () => {
       [new InvalidReferenceError('x'), 'InvalidReferenceError', 'INVALID_REFERENCE'],
       [new ComplianceRejectedError([]), 'ComplianceRejectedError', 'COMPLIANCE_REJECTED'],
       [new FeeCapExceededError(2n, 1n), 'FeeCapExceededError', 'FEE_CAP_EXCEEDED'],
+      [new JournalIntegrityError(null, 'x'), 'JournalIntegrityError', 'JOURNAL_INTEGRITY'],
     ];
     for (const [err, name, code] of cases) {
       expect(err).toBeInstanceOf(DomainError);
