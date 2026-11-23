@@ -21,6 +21,8 @@ const REGISTRY = '0x00000000000000000000000000000000000000aa';
 const TOKEN = '0x00000000000000000000000000000000000000bb';
 
 let server: Server;
+/** What the stub answers to eth_sendRawTransaction; tests switch it. */
+let sendRawAnswer = (): string => `nonce too high at ${hostPort}/v2/${KEY}`; // allowlisted, scheme-less
 let rpcUrl: string;
 let hostPort: string;
 
@@ -34,7 +36,7 @@ function leakFor(method: string): string {
     case 'eth_getTransactionCount':
       return `bad gateway for ${encodeURIComponent(rpcUrl)}`; // percent-encoded
     case 'eth_sendRawTransaction':
-      return `nonce too high at ${hostPort}/v2/${KEY}`; // allowlisted rejection, scheme-less
+      return sendRawAnswer();
     case 'eth_getBlockByNumber':
       return `quota exceeded for apikey=${QKEY}`; // query value alone
     default:
@@ -165,5 +167,96 @@ describe('the gateway never throws its RPC URL, in any form (review N-6)', () =>
     const text = `${inspect(gw, { depth: 10, showHidden: true })} ${JSON.stringify(gw)}`;
     expect(text).not.toContain(KEY);
     expect(text).not.toContain(QKEY);
+  });
+});
+
+describe('sendRaw errors never carry the RPC URL either', () => {
+  const answers: [string, () => string, typeof ChainError][] = [
+    [
+      'an allowlisted refusal quoting the URL without a scheme',
+      () => `nonce too high at ${hostPort}/v2/${KEY}`,
+      ChainError,
+    ],
+    [
+      'an unknown answer quoting it JSON-escaped',
+      () => `proxy {"to":"${rpcUrl.replace(/\//g, '\\/')}"} gave up`,
+      ChainError,
+    ],
+    [
+      'nonce too low, then a lookup by hash that fails with the URL in a 502 body',
+      () => 'nonce too low',
+      ChainError,
+    ],
+  ];
+
+  afterEach(() => {
+    sendRawAnswer = () => `nonce too high at ${hostPort}/v2/${KEY}`;
+  });
+
+  it.each(answers)(
+    'the raw viem error for %s does contain the secrets (not vacuous)',
+    async (_name, answer) => {
+      sendRawAnswer = answer;
+      const raw = createPublicClient({ transport: http(rpcUrl, { retryCount: 0 }) });
+      const sendError = await raw
+        .request({ method: 'eth_sendRawTransaction', params: ['0x00'] } as never)
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      const lookupError = await raw
+        .request({ method: 'eth_getTransactionByHash', params: [`0x${'ab'.repeat(32)}`] } as never)
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      const text = `${everything(sendError)}\n${everything(lookupError)}`;
+      expect(text.includes(KEY) || text.includes(QKEY)).toBe(true);
+    },
+  );
+
+  it.each(answers)('sendRaw after %s throws a ChainError without them', async (_name, answer) => {
+    sendRawAnswer = answer;
+    const gw = gateway();
+    const { raw } = await gw.signTransaction({
+      signer: 'settlement',
+      call: { kind: 'mint', to: TOKEN, amount: 1n, ref: ref(1) },
+      nonce: 0,
+      fees: { maxFeePerGas: 10n, maxPriorityFeePerGas: 1n },
+    });
+    const error = await gw.sendRaw(raw).then(
+      () => new Error('unexpected success'),
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(ChainError);
+    const text = everything(error);
+    expect(text).not.toContain(KEY);
+    expect(text).not.toContain(QKEY);
+    expect(text).not.toContain(hostPort);
+  });
+
+  it('the three answers map to: this node refused / unknown / unknown (lookup failed)', async () => {
+    const gw = gateway();
+    const { raw } = await gw.signTransaction({
+      signer: 'settlement',
+      call: { kind: 'mint', to: TOKEN, amount: 1n, ref: ref(2) },
+      nonce: 0,
+      fees: { maxFeePerGas: 10n, maxPriorityFeePerGas: 1n },
+    });
+    const names: string[] = [];
+    for (const [, answer] of answers) {
+      sendRawAnswer = answer;
+      names.push(
+        await gw.sendRaw(raw).then(
+          () => 'ok',
+          (e: unknown) => (e as Error).constructor.name,
+        ),
+      );
+    }
+    expect(names).toEqual([
+      'SubmissionRejectedError',
+      'ChainUnavailableError',
+      'ChainUnavailableError',
+    ]);
   });
 });
