@@ -9,18 +9,30 @@
  * - `amount_mismatch` / `address_mismatch`: the event exists but moved a different amount, or
  *   between different addresses, than the ledger says.
  * - `unexpected_onchain_event`: a reference event the ledger cannot explain (unknown reference,
- *   an operation that failed or was reversed, a second event for one reference, the wrong kind).
+ *   an operation that failed or was reversed, a second event for one reference, the wrong kind),
+ *   or any event from a block that is no longer canonical (`stale_block`: the index is stale).
  * - `unexplained_transfer`: tokens moved without one of our reference events in the same
  *   transaction. The contract should make this impossible; seeing one means a key or the contract
  *   is compromised.
  * - `balance_mismatch` / `supply_mismatch`: the totals disagree, whatever the cause.
- * - `compliance_mismatch`: the registry's flags differ from what the bridge believes.
+ * - `compliance_event_mismatch`: a registry event the bridge did not make (unknown reference) or
+ *   that writes something other than the change its reference names (e.g. a front-run).
+ * - `compliance_mismatch`: the registry's flags differ from what the bridge believes, or an
+ *   address that needs an expectation (a holder, an account a registry event touched) has none.
+ *
+ * Compliance checking is not optional: a compromised compliance key can do as much harm as a
+ * compromised minter, so every registry event and every holder's flags are always checked.
  *
  * The function is pure and its output order is fixed (independent of input order), so two runs on
  * the same data produce byte-identical reports that can be diffed and stored.
  */
 
-import type { ComplianceState } from './compliance';
+import {
+  type ComplianceChangeContent,
+  complianceEventContent,
+  complianceEventMatches,
+  type ComplianceState,
+} from './compliance';
 import { InvalidInputError } from './errors';
 import {
   type OperationParties,
@@ -30,7 +42,7 @@ import {
   SETTLING_EVENT,
   settlementDifferences,
 } from './operation';
-import { type Address, type Bytes32, type TxHash, ZERO_ADDRESS } from './primitives';
+import { type Address, type Bytes32, type Hex, type TxHash, ZERO_ADDRESS } from './primitives';
 
 /** Where an observed event was emitted. Structurally identical to the chain's `EventPosition`. */
 export interface ObservedEventPosition {
@@ -122,19 +134,28 @@ export interface ReconciliationInput {
   readonly observedBalances: ReadonlyMap<Address, bigint>;
   /** Total supply read from the chain at `atBlock`. */
   readonly observedSupply: bigint;
-  /** Balances the ledger implies from settled operations. */
+  /** Balances the ledger implies at `atBlock` (see `expectedChainState`). */
   readonly expectedBalances: ReadonlyMap<Address, bigint>;
-  /** Supply the ledger implies from settled operations. */
+  /** Supply the ledger implies at `atBlock`. Must equal the sum of `expectedBalances`. */
   readonly expectedSupply: bigint;
-  /** Flags the bridge believes each address has, when compliance is being checked. */
-  readonly expectedCompliance?: ReadonlyMap<Address, ComplianceState>;
-  /** Flags read from the registry at `atBlock`, for the addresses in `expectedCompliance`. */
-  readonly observedCompliance?: ReadonlyMap<Address, ComplianceState>;
+  /** Flags the bridge believes each address has at `atBlock`. */
+  readonly expectedCompliance: ReadonlyMap<Address, ComplianceState>;
   /**
-   * References of compliance changes the bridge sent. When given, a VerificationSet or FrozenSet
-   * whose reference is not in it is reported as unexpected (a change the bridge did not make).
+   * Flags read from the registry at `atBlock`. Engine obligation: read them for every address in
+   * `expectedCompliance`, in any compliance event, and with a non-zero observed balance.
    */
-  readonly knownComplianceRefs?: ReadonlySet<Bytes32>;
+  readonly observedCompliance: ReadonlyMap<Address, ComplianceState>;
+  /**
+   * Every compliance change the bridge made or is making, by its reference: what it writes. Every
+   * `VerificationSet` / `FrozenSet` event must match its entry exactly.
+   */
+  readonly knownComplianceChanges: ReadonlyMap<Bytes32, ComplianceChangeContent>;
+  /**
+   * The canonical hash of every block that holds an event in `events`, from the node at the time of
+   * the run. Engine obligation: read it from the chain, not from the indexer's own records; an
+   * event whose block hash is missing here or differs is from an orphaned block (stale index).
+   */
+  readonly canonicalBlockHashes: ReadonlyMap<bigint, Hex>;
 }
 
 /** One disagreement between the ledger and the chain. */
@@ -169,9 +190,11 @@ export type Mismatch =
     }
   | {
       readonly kind: 'unexpected_onchain_event';
-      readonly why: 'unknown_reference' | 'operation_not_live' | 'duplicate' | 'wrong_kind';
+      readonly why:
+        'unknown_reference' | 'operation_not_live' | 'duplicate' | 'wrong_kind' | 'stale_block';
       readonly event: ObservedEvent['kind'];
-      readonly ref: Bytes32;
+      /** `null` only for a stale `Transfer`, which carries no reference. */
+      readonly ref: Bytes32 | null;
       readonly operationId: string | null;
       readonly operationStatus: OperationStatus | null;
       readonly txHash: TxHash;
@@ -196,9 +219,23 @@ export type Mismatch =
     }
   | { readonly kind: 'supply_mismatch'; readonly expected: bigint; readonly observed: bigint }
   | {
+      readonly kind: 'compliance_event_mismatch';
+      /** No known change has this reference, or the event writes something else than the change. */
+      readonly why: 'unknown_reference' | 'content_mismatch';
+      readonly event: 'VerificationSet' | 'FrozenSet';
+      readonly ref: Bytes32;
+      /** The known change for the reference, or `null` when there is none. */
+      readonly expected: ComplianceChangeContent | null;
+      readonly observed: ComplianceChangeContent;
+      readonly txHash: TxHash;
+      readonly logIndex: number;
+      readonly blockNumber: bigint;
+    }
+  | {
       readonly kind: 'compliance_mismatch';
       readonly address: Address;
-      readonly expected: ComplianceState;
+      /** `null` when the bridge has no expectation for an address that needs one. */
+      readonly expected: ComplianceState | null;
       /** `null` when the registry flags were not read. */
       readonly observed: ComplianceState | null;
     };
@@ -234,6 +271,7 @@ const KIND_ORDER: readonly Mismatch['kind'][] = [
   'unexplained_transfer',
   'balance_mismatch',
   'supply_mismatch',
+  'compliance_event_mismatch',
   'compliance_mismatch',
 ];
 
@@ -272,6 +310,8 @@ function sortKey(m: Mismatch): [number, string, bigint, number, string] {
     case 'address_mismatch':
       return [rank, m.operationId, m.blockNumber, m.logIndex, m.field];
     case 'unexpected_onchain_event':
+      return [rank, m.ref ?? '', m.blockNumber, m.logIndex, m.why];
+    case 'compliance_event_mismatch':
       return [rank, m.ref, m.blockNumber, m.logIndex, m.why];
     case 'unexplained_transfer':
       return [rank, '', m.blockNumber, m.logIndex, m.txHash];
@@ -335,7 +375,7 @@ function differenceMismatches(
 }
 
 function unexpected(
-  e: ObservedEvent & { ref: Bytes32 },
+  e: ObservedEvent,
   why: Extract<Mismatch, { kind: 'unexpected_onchain_event' }>['why'],
   op: LedgerOperationView | undefined,
 ): Mismatch {
@@ -343,7 +383,7 @@ function unexpected(
     kind: 'unexpected_onchain_event',
     why,
     event: e.kind,
-    ref: e.ref,
+    ref: 'ref' in e ? e.ref : null,
     operationId: op?.id ?? null,
     operationStatus: op?.status ?? null,
     txHash: e.txHash,
@@ -377,13 +417,34 @@ function validateInput(input: ReconciliationInput): Map<Bytes32, LedgerOperation
     }
     byRef.set(op.ref, op);
   }
+  let sum = 0n;
+  for (const [address, amount] of input.expectedBalances) {
+    if (amount < 0n) {
+      throw new InvalidInputError(`expected balance of ${address} is negative (${amount})`);
+    }
+    sum += amount;
+  }
+  if (sum !== input.expectedSupply) {
+    // The two expectations come from one ledger; if they disagree, the ledger view is broken and
+    // any comparison with the chain would be meaningless.
+    throw new InvalidInputError(
+      `expectedSupply ${input.expectedSupply} is not the sum of expectedBalances (${sum})`,
+    );
+  }
   return byRef;
 }
 
 /**
  * Compares the ledger with the chain at `input.atBlock`. Returns every mismatch in a fixed order;
  * `ok` is true exactly when there are none. Throws `InvalidInputError` when the ledger view is
- * itself inconsistent (two operations with one reference, a type that contradicts its parties).
+ * itself inconsistent (two operations with one reference, a type that contradicts its parties,
+ * an `expectedSupply` that is not the sum of `expectedBalances`, a negative expected balance).
+ *
+ * Events from a block whose hash is not the canonical one (or is unknown) are reported as
+ * `stale_block` and otherwise ignored: they never satisfy a `missing_onchain`, never explain a
+ * Transfer and are never checked as compliance changes. Every registry event must match a known
+ * change exactly. Compliance flags are checked for every address that is expected, appears in a
+ * (canonical) compliance event, or holds a non-zero observed balance.
  *
  * Operations still in flight (`ledger_reserved`, `submitted`) and confirmed after `atBlock` are
  * never reported missing: the chain is not expected to show them yet. A confirmed operation with no
@@ -399,14 +460,37 @@ function validateInput(input: ReconciliationInput): Map<Bytes32, LedgerOperation
 export function reconcile(input: ReconciliationInput): ReconciliationReport {
   const byRef = validateInput(input);
   const mismatches: Mismatch[] = [];
-  const events = input.events.filter((e) => e.blockNumber <= input.atBlock).sort(compareChainOrder);
+  // 0. Only events at or before atBlock, and only from canonical blocks.
+  const events: ObservedEvent[] = [];
+  for (const e of input.events) {
+    if (e.blockNumber > input.atBlock) continue;
+    if (input.canonicalBlockHashes.get(e.blockNumber) !== e.blockHash) {
+      mismatches.push(unexpected(e, 'stale_block', 'ref' in e ? byRef.get(e.ref) : undefined));
+      continue;
+    }
+    events.push(e);
+  }
+  events.sort(compareChainOrder);
 
-  // 1. Reference events against the operations they name.
+  // 1. Reference events against the operations (or compliance changes) they name.
   const settledByRef = new Map<Bytes32, SettlementEvent>();
+  const complianceAccounts = new Set<Address>();
   for (const e of events) {
     if (e.kind === 'VerificationSet' || e.kind === 'FrozenSet') {
-      if (input.knownComplianceRefs !== undefined && !input.knownComplianceRefs.has(e.ref)) {
-        mismatches.push(unexpected(e, 'unknown_reference', undefined));
+      complianceAccounts.add(e.account);
+      const known = input.knownComplianceChanges.get(e.ref);
+      if (known === undefined || !complianceEventMatches(known, e)) {
+        mismatches.push({
+          kind: 'compliance_event_mismatch',
+          why: known === undefined ? 'unknown_reference' : 'content_mismatch',
+          event: e.kind,
+          ref: e.ref,
+          expected: known ?? null,
+          observed: complianceEventContent(e),
+          txHash: e.txHash,
+          logIndex: e.logIndex,
+          blockNumber: e.blockNumber,
+        });
       }
       continue;
     }
@@ -509,21 +593,25 @@ export function reconcile(input: ReconciliationInput): ReconciliationReport {
     });
   }
 
-  // 6. Compliance flags, when the caller supplies expectations.
-  for (const [address, expected] of input.expectedCompliance ??
-    new Map<Address, ComplianceState>()) {
-    const observed = input.observedCompliance?.get(address);
+  // 6. Compliance flags for every address that needs them: expected ones, those a compliance
+  //    event touched, and every holder. A holder the bridge has no expectation for is a finding.
+  const flagAddresses = new Set<Address>([
+    ...input.expectedCompliance.keys(),
+    ...complianceAccounts,
+  ]);
+  for (const [address, amount] of input.observedBalances) {
+    if (amount !== 0n) flagAddresses.add(address);
+  }
+  for (const address of flagAddresses) {
+    const expected = input.expectedCompliance.get(address) ?? null;
+    const observed = input.observedCompliance.get(address) ?? null;
     if (
-      observed === undefined ||
+      expected === null ||
+      observed === null ||
       observed.verified !== expected.verified ||
       observed.frozen !== expected.frozen
     ) {
-      mismatches.push({
-        kind: 'compliance_mismatch',
-        address,
-        expected,
-        observed: observed ?? null,
-      });
+      mismatches.push({ kind: 'compliance_mismatch', address, expected, observed });
     }
   }
 
