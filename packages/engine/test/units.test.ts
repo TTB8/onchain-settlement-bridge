@@ -163,6 +163,23 @@ describe('sanitizeText: forms that leaked before (review L-C)', () => {
     expect(sanitizeText(`api key ${KEY} rejected`)).toContain(KEY);
   });
 
+  it('a secret is caught in every escaped and encoded spelling, not only as written', () => {
+    const secret = 'Zx9/Qw+Lm=Pk7'; // changes under escaping and encoding
+    const forms = [
+      secret.replace(/\//g, '\\/'),
+      JSON.stringify(JSON.stringify(secret.replace(/\//g, '\\/'))),
+      encodeURIComponent(secret),
+      encodeURIComponent(encodeURIComponent(secret)),
+    ];
+    for (const form of forms) {
+      expect(form).not.toContain(secret); // the raw spelling alone would not catch it
+      const raw = `token ${form} refused`;
+      const out = sanitizeText(raw, { secrets: [secret] });
+      expect(out).not.toContain(form);
+      expect(out).toContain('<redacted>');
+    }
+  });
+
   it('ignores secret pieces too short to be secrets and non-URL secrets work as literals', () => {
     expect(sanitizeText('a b c', { secrets: ['a', 'b'] })).toBe('a b c');
     expect(sanitizeText(`token ${KEY} bad`, { secrets: [KEY] })).toBe('token <redacted> bad');
