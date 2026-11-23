@@ -53,5 +53,11 @@ export class InsufficientFundsError extends ChainError {}
  */
 export class ChainUnavailableError extends ChainError {}
 
-/** The node refused the transaction for a reason that retrying will not fix. */
+/**
+ * THIS node refused THIS submission, for a reason that resending the same bytes to it will not
+ * fix. It does not prove the transaction can never be mined: another node (for example behind
+ * the same load balancer) may already hold the same signed bytes. So an attempt that got this
+ * error STILL counts in the engine's `attemptCanStillMine` check and must be kept until its nonce
+ * is final.
+ */
 export class SubmissionRejectedError extends ChainError {}

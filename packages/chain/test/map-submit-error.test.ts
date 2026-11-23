@@ -19,9 +19,11 @@ import {
   NonceTooLowError,
   ReplacementUnderpricedError,
   SubmissionRejectedError,
+  makeRedactor,
   mapSubmitError,
   redactUrls,
   safeCause,
+  sanitizeError,
 } from '../src';
 
 const HASH = `0x${'cd'.repeat(32)}` as const;
@@ -123,7 +125,7 @@ describe('mapSubmitError: anything else is an UNKNOWN outcome', () => {
 
   it('includes the node reason in the message', () => {
     expect(mapSubmitError(rpcError('intrinsic gas too low')).message).toBe(
-      'submit: rejected by the node: intrinsic gas too low',
+      'submit: this node refused the submission: intrinsic gas too low',
     );
     expect(mapSubmitError(new Error('x')).message).toBe(
       'submit: unrecognised node error, the outcome is unknown',
@@ -183,5 +185,123 @@ describe('URL scrubbing', () => {
     expect(redactUrls('a ws://x.y/z?k=1 b http://h:1/p c')).toBe(
       'a <redacted-url> b <redacted-url> c',
     );
+  });
+});
+
+describe('configured-URL redaction (review N-6)', () => {
+  const KEY = 'KEYsecret12345';
+  const QKEY = 'QUERYsecret678';
+  const RPC = `https://rpc.example.invalid:8545/v2/${KEY}?apikey=${QKEY}&x=1`;
+  const redact = makeRedactor(RPC);
+  const everything = (value: unknown): string => {
+    const parts: string[] = [];
+    let current: unknown = value;
+    for (let depth = 0; current && depth < 12; depth += 1) {
+      parts.push(String(current), inspect(current, { depth: 8, showHidden: true }));
+      if (current instanceof Error) parts.push(current.stack ?? '', JSON.stringify(current));
+      current = (current as { cause?: unknown }).cause;
+    }
+    return parts.join('\n');
+  };
+  const forms: [string, string][] = [
+    ['scheme-less host:port and path', `nonce too high at rpc.example.invalid:8545/v2/${KEY}`],
+    ['scheme-less host and path', `nonce too high at rpc.example.invalid/v2/${KEY}`],
+    [
+      'JSON-escaped',
+      `nonce too high: {"url":"https:\\/\\/rpc.example.invalid:8545\\/v2\\/${KEY}"}`,
+    ],
+    ['percent-encoded', `nonce too high, upstream=${encodeURIComponent(RPC)}`],
+    ['query value alone', `nonce too high (apikey=${QKEY})`],
+    ['path segment alone', `nonce too high for key ${KEY.toLowerCase()}`],
+  ];
+
+  it.each(forms)('the raw viem error leaks the %s form (not vacuous)', (_name, message) => {
+    const raw = everything(rpcError(message));
+    expect(
+      raw.includes(KEY) || raw.includes(QKEY) || raw.toLowerCase().includes(KEY.toLowerCase()),
+    ).toBe(true);
+  });
+
+  it('without the configured redactor, the scheme-less form leaks into the message', () => {
+    const generic = mapSubmitError(rpcError(forms[0]![1]));
+    expect(generic.message).toContain(KEY);
+  });
+
+  it.each(forms)(
+    'no %s form survives in message, stack, cause chain, inspect or JSON',
+    (_name, message) => {
+      const mapped = mapSubmitError(rpcError(message), HASH, redact);
+      expect(mapped).toBeInstanceOf(SubmissionRejectedError); // "nonce too high" is allowlisted
+      expect(mapped.message).toMatch(/^submit: this node refused the submission: nonce too high/);
+      const text = everything(mapped).toLowerCase();
+      expect(text).not.toContain(KEY.toLowerCase());
+      expect(text).not.toContain(QKEY.toLowerCase());
+      expect(text).not.toContain('rpc.example.invalid');
+    },
+  );
+
+  it('also scrubs unknown-outcome and transport errors, and ChainErrors passed through', () => {
+    const unknown = mapSubmitError(
+      rpcError(`header not found at rpc.example.invalid/v2/${KEY}`, -32603),
+      HASH,
+      redact,
+    );
+    expect(unknown).toBeInstanceOf(ChainUnavailableError);
+    const transport = mapSubmitError(
+      new HttpRequestError({ url: RPC, details: `upstream rpc.example.invalid/v2/${KEY} down` }),
+      HASH,
+      redact,
+    );
+    const own = mapSubmitError(new NonceTooLowError(`ours mentions ${KEY}`), HASH, redact);
+    for (const error of [unknown, transport, own]) {
+      expect(everything(error)).not.toContain(KEY);
+    }
+  });
+
+  it('the generic pattern catches escaped and percent-encoded URLs it was not configured with', () => {
+    expect(redactUrls('x https:\\/\\/other.example\\/k\\/SECRETZ y')).toBe('x <redacted-url> y');
+    expect(redactUrls(`x ${encodeURIComponent('https://other.example/k/SECRETZ')} y`)).toBe(
+      'x <redacted-url> y',
+    );
+    expect(redactUrls('x HTTPS%3a%2f%2fother.example%2fSECRETZ y')).toBe('x <redacted-url> y');
+  });
+
+  it('a base64 key with + / = is removed in its JSON-escaped and percent-encoded forms', () => {
+    // The key as configured is percent-encoded in the URL; nodes may echo it decoded, decoded and
+    // JSON-escaped, or encoded. Only the escaped and encoded variants catch the last two.
+    const b64 = 'Zm9vYmFy+YmF6/cXV4==';
+    const redactB64 = makeRedactor(`https://h.example/v2?token=${encodeURIComponent(b64)}`);
+    for (const echoed of [b64, b64.replace(/\//g, '\\/'), encodeURIComponent(b64)]) {
+      const out = redactB64(`nonce too high (${echoed})`);
+      expect(out).not.toContain('Zm9vYmFy');
+      expect(out).not.toContain('cXV4');
+    }
+  });
+
+  it('a stack read before sanitising (as a logger would) is still redacted', () => {
+    const own = new NonceTooLowError(`ours mentions ${KEY}`);
+    expect(own.stack).toContain(KEY); // reading it fixes the header line with the raw message
+    const mapped = mapSubmitError(own, HASH, redact);
+    expect(mapped.stack).not.toContain(KEY);
+    expect(mapped.message).not.toContain(KEY);
+  });
+
+  it('makeRedactor handles an unparseable URL, no URL, and short pieces', () => {
+    expect(makeRedactor('not a url but secret-ish')('x not a url but secret-ish y')).toBe(
+      'x <redacted> y',
+    );
+    expect(makeRedactor()('nothing https://a.b/c here')).toBe('nothing <redacted-url> here');
+    // Pieces shorter than four characters ("v2", "x", "1") are left alone.
+    expect(redact('v2 x 1')).toBe('v2 x 1');
+    const creds = makeRedactor('https://user1:pa%24%24word@h.example/p');
+    expect(creds('auth user1 pa$$word')).toBe('auth <redacted> <redacted>');
+  });
+
+  it('sanitizeError rewrites message and stack along the whole cause chain', () => {
+    const inner = new Error(`inner ${KEY}`);
+    const outer = new ChainError(`outer ${KEY}`, inner);
+    sanitizeError(outer, redact);
+    expect(everything(outer)).not.toContain(KEY);
+    expect(sanitizeError('not an error', redact)).toBe('not an error');
   });
 });
