@@ -198,6 +198,9 @@ describe('compliance and reconciliation', () => {
     } finally {
       rig.chain.setUnavailable(false);
     }
+    // The readiness answer is cached for 2 s: still the failure, then fresh once it expires.
+    expect((await http().get('/ready')).status).toBe(503);
+    rig.clock.advance(2_001);
     expect((await http().get('/ready')).status).toBe(200);
 
     const list = await http().get('/v1/admin/reconciliations?limit=3').set(admin);

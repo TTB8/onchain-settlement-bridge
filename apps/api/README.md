@@ -50,7 +50,7 @@ and the worker a `DATABASE_URL` for a separate role that owns nothing and has on
 | POST   | `/v1/admin/reconciliations`             | admin    | Run a reconciliation now (200 for ok, mismatch AND unknown) |
 | GET    | `/v1/admin/reconciliations`             | admin    | The latest runs                                             |
 | GET    | `/health`                               | public   | Liveness (no dependency touched)                            |
-| GET    | `/ready`                                | public   | Database, node chain id, deployment binding                 |
+| GET    | `/ready`                                | public   | Database, node chain id, deployment binding (cached 2 s)    |
 
 ### Amounts
 

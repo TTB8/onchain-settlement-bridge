@@ -162,6 +162,24 @@ describe('401 / 403 matrix', () => {
     },
   );
 
+  it('/ready is computed at most once per 2 s, and concurrent probes share one run', async () => {
+    rig.clock.advance(10_000);
+    const spy = jest.spyOn(rig.chain, 'getChainId');
+    try {
+      const burst = await Promise.all(Array.from({ length: 20 }, () => http().get('/ready')));
+      expect(burst.every((r) => r.status === 200)).toBe(true);
+      expect(spy).toHaveBeenCalledTimes(1);
+      rig.clock.advance(1_999);
+      await http().get('/ready');
+      expect(spy).toHaveBeenCalledTimes(1);
+      rig.clock.advance(1);
+      await http().get('/ready');
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('public routes need no credential', async () => {
     expect((await http().get('/health')).status).toBe(200);
     expect((await http().get('/ready')).status).toBe(200);
