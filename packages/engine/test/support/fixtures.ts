@@ -171,7 +171,7 @@ export async function fund(
     operationId: operation.id,
     from: 'ledger_reserved',
     version: operation.version,
-    move: { event: 'SUBMIT' },
+    move: { event: 'SUBMIT', kind: 'first' },
     at: new Date(),
     note: 'test funding',
   });
@@ -179,7 +179,11 @@ export async function fund(
     operationId: operation.id,
     from: 'submitted',
     version: submitted.version,
-    move: { event: 'CONFIRM', confirmedBlock: 10n },
+    move: {
+      event: 'CONFIRM',
+      judgement: { verdict: 'confirm', event: 'CONFIRM' },
+      confirmedBlock: 10n,
+    },
     at: new Date(),
     note: 'test funding',
   });

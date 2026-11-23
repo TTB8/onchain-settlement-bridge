@@ -26,6 +26,7 @@ export type EngineErrorCode =
   | 'OPERATION_NOT_FOUND'
   | 'VERSION_CONFLICT'
   | 'ILLEGAL_TRANSITION'
+  | 'EVIDENCE_REFUSED'
   | 'RETRIES_EXHAUSTED'
   | 'LEDGER_SETUP';
 
@@ -135,6 +136,16 @@ export class VersionConflictError extends EngineError {
 /** The state machine has no such edge (checked before any database write). */
 export class IllegalTransitionError extends EngineError {
   readonly code = 'ILLEGAL_TRANSITION' as const;
+}
+
+/**
+ * The evidence handed to a money move does not allow it: a confirmation without a `confirm`
+ * judgement, a reversal `mayReverse` refuses, or reversal evidence gathered for a different
+ * failure reason than the one stored. Never retried blindly: a person or a fresh evidence pass
+ * decides.
+ */
+export class EvidenceRefusedError extends EngineError {
+  readonly code = 'EVIDENCE_REFUSED' as const;
 }
 
 /** A transaction kept failing with a serialization failure or deadlock after every retry. */

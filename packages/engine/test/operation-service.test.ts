@@ -399,7 +399,7 @@ describe('deployment binding (ADR 0011, ADR 0012 item 17)', () => {
       operationId: operation.id,
       from: 'ledger_reserved',
       version: 0,
-      move: { event: 'SUBMIT' },
+      move: { event: 'SUBMIT', kind: 'first' },
       at: new Date(),
       note: 'sent',
     });
@@ -407,7 +407,11 @@ describe('deployment binding (ADR 0011, ADR 0012 item 17)', () => {
       operationId: operation.id,
       from: 'submitted',
       version: s.version,
-      move: { event: 'CONFIRM', confirmedBlock: 5n },
+      move: {
+        event: 'CONFIRM',
+        judgement: { verdict: 'confirm', event: 'CONFIRM' },
+        confirmedBlock: 5n,
+      },
       at: new Date(),
       note: 'final',
     });
