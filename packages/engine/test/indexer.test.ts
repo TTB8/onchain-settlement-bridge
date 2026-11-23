@@ -7,7 +7,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import type { BlockRef, ChainGateway } from '@bridge/chain';
+import { type BlockRef, type ChainGateway, FakeChainGateway } from '@bridge/chain';
 
 import { AlarmLog, Indexer, type IndexerPolicy } from '../src';
 import { createTestDatabase, type TestDatabase } from './support/database';
@@ -48,7 +48,6 @@ function indexerFor(
     prisma: db.prisma,
     gateway,
     clock: rig.clock,
-    binding: { chainId: BigInt(rig.chain.chainId), tokenAddress: rig.chain.tokenAddress },
     policy,
     alarms: rig.alarms,
   });
@@ -143,13 +142,12 @@ describe('scanning', () => {
     expect(await ix.runOnce()).toEqual({ status: 'idle', lastIndexed: 0n });
   });
 
-  it('no deployment row for the binding: unknown, nothing written', async () => {
+  it('no deployment row for the gateway: unknown, nothing written', async () => {
     const rig = await makeRig(db.prisma);
     const ix = new Indexer({
       prisma: db.prisma,
-      gateway: rig.chain,
+      gateway: new FakeChainGateway({ chainId: 77 }),
       clock: rig.clock,
-      binding: { chainId: 1n, tokenAddress: rig.chain.tokenAddress },
       policy: { confirmationDepth: 1, maxBatch: 5, reorgWindow: 4 },
       alarms: new AlarmLog(),
     });

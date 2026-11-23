@@ -1,93 +1,114 @@
 /**
- * Piece B test rig: a `FakeChainGateway`, a deployment row bound to it (with its signer rows),
- * users whose wallets are verified ON the fake chain, a deterministic signer for the fake, and a
- * `BridgeEngine` wired to all of it. Helpers read back the ledger and the chain.
+ * Piece B test rig: a spying `FakeChainGateway`, a deployment row bound to it (with its signer
+ * rows), users whose wallets are verified ON the fake chain, an inspector for the fake's signed
+ * encoding, and a `BridgeEngine` wired to all of it. Helpers read back the ledger and the chain.
  *
- * The fake's transaction hash is a function of (chain id, signer, nonce, call, fees); `fakeSign`
- * reproduces it so the engine can record the hash before broadcasting. `ResigningSigner` checks
- * on every broadcast that the fake reports the same hash, so a drift here fails loudly.
+ * The fake's raw bytes are its own canonical encoding (`fake-eip1559-tx:` + sorted JSON with
+ * bigints as `"<n>n"`), not real EIP-1559 bytes. `FakeTransactionInspector` decodes exactly that
+ * documented encoding. It cannot check `to` independently (the fake's bytes carry no target; the
+ * contract is implied by the call kind), so `to` is only checked for real by the viem inspector in
+ * the Anvil suite; every other field is checked here.
  */
 
 import { randomBytes } from 'node:crypto';
 
 import {
   type Address,
+  type ContractCall,
   FakeChainGateway,
   type FakeChainOptions,
+  type Hex,
+  SIGNER_FOR_CALL,
+  type SignedTransaction,
+  type SignerName,
   type SubmitRequest,
 } from '@bridge/chain';
 import type { ChainAttempt, Operation, PrismaClient } from '@bridge/db';
-import { keccak256, stringToHex } from 'viem';
+import { hexToString, keccak256 } from 'viem';
 
 import {
   AlarmLog,
   BridgeEngine,
   type BridgeEngineConfig,
-  ResigningSigner,
-  type SignedTransaction,
-  type TransactionSigner,
+  type DecodedTransaction,
+  type RawTransactionInspector,
 } from '../../src';
 import { balanceOf, FakeClock, RecordingIds, type TestUser } from './fixtures';
-
-function stableJson(value: unknown): string {
-  return JSON.stringify(value, (_key, v: unknown) => (typeof v === 'bigint' ? `${v}n` : v));
-}
-
-/** The fake's own hash for a request, and its JSON as the "raw" bytes. */
-export function fakeSign(chainId: number) {
-  return async (request: SubmitRequest): Promise<SignedTransaction> => {
-    const payload = {
-      signer: request.signer,
-      nonce: request.nonce,
-      call: request.call,
-      fees: {
-        maxFeePerGas: request.fees.maxFeePerGas,
-        maxPriorityFeePerGas: request.fees.maxPriorityFeePerGas,
-      },
-    };
-    return {
-      hash: keccak256(stringToHex(stableJson({ chainId, payload }))),
-      raw: stringToHex(stableJson(payload)),
-    };
-  };
-}
 
 /** A random non-zero bytes32. */
 export const ref32 = (): `0x${string}` => `0x${randomBytes(32).toString('hex')}`;
 
-/** A signer that records every broadcast and can be told to misbehave once. */
-export class SpySigner implements TransactionSigner {
+const RAW_PREFIX = 'fake-eip1559-tx:';
+
+/** Decodes the fake gateway's documented signed encoding. */
+export class FakeTransactionInspector implements RawTransactionInspector {
+  /** @param chain The fake whose deployment gives the target contract of each call kind. */
+  constructor(private readonly chain: FakeChainGateway) {}
+
+  async decode(raw: Hex): Promise<DecodedTransaction> {
+    const text = hexToString(raw);
+    if (!text.startsWith(RAW_PREFIX)) throw new TypeError('not a fake signed transaction');
+    const d = JSON.parse(text.slice(RAW_PREFIX.length), (_k, v: unknown) =>
+      typeof v === 'string' && /^\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v,
+    ) as {
+      chainId: number;
+      from: Address;
+      signer: SignerName;
+      nonce: number;
+      call: ContractCall;
+      fees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
+    };
+    const dep = this.chain.deployment();
+    return {
+      type: 'eip1559',
+      chainId: d.chainId,
+      nonce: d.nonce,
+      to: SIGNER_FOR_CALL[d.call.kind] === 'settlement' ? dep.token : dep.registry,
+      call: d.call,
+      maxFeePerGas: d.fees.maxFeePerGas,
+      maxPriorityFeePerGas: d.fees.maxPriorityFeePerGas,
+      from: d.from,
+    };
+  }
+}
+
+/** The fake, recording every broadcast and able to misbehave once. */
+export class SpyChain extends FakeChainGateway {
+  /** The hash of every byte string handed to `sendRaw`, in order. */
   readonly broadcasts: string[] = [];
-  /** Called inside `sign` (inside the attempt transaction), once, then cleared. */
+  /** Called inside `signTransaction`, once, then cleared. */
   onSign: (() => Promise<void>) | undefined;
-  /** Thrown by the next broadcast INSTEAD of sending (a crash before the wire). */
+  /** Thrown by the next `sendRaw` INSTEAD of sending (a crash before the wire). */
   crashNextBroadcast: Error | undefined;
+  /** Rewrites what `signTransaction` returns (a misbehaving signer), until cleared. */
+  tamper:
+    ((signed: SignedTransaction, request: SubmitRequest) => Promise<SignedTransaction>) | undefined;
 
-  constructor(private readonly inner: TransactionSigner) {}
-
-  async sign(request: SubmitRequest): Promise<SignedTransaction> {
+  override async signTransaction(request: SubmitRequest): Promise<SignedTransaction> {
     const hook = this.onSign;
     this.onSign = undefined;
     if (hook !== undefined) await hook();
-    return this.inner.sign(request);
+    const signed = await super.signTransaction(request);
+    return this.tamper === undefined ? signed : this.tamper(signed, request);
   }
 
-  async broadcast(signed: SignedTransaction, request: SubmitRequest): Promise<`0x${string}`> {
+  override async sendRaw(raw: Hex): Promise<`0x${string}`> {
     const crash = this.crashNextBroadcast;
     if (crash !== undefined) {
       this.crashNextBroadcast = undefined;
       throw crash;
     }
-    this.broadcasts.push(signed.hash);
-    return this.inner.broadcast(signed, request);
+    this.broadcasts.push(keccak256(raw));
+    return super.sendRaw(raw);
   }
 }
 
 /** Everything a piece B scenario needs. */
 export interface Rig {
   prisma: PrismaClient;
-  chain: FakeChainGateway;
-  signer: SpySigner;
+  chain: SpyChain;
+  /** The same spy (kept as `signer` so tests read as "what the signer did"). */
+  signer: SpyChain;
   clock: FakeClock;
   alarms: AlarmLog;
   engine: BridgeEngine;
@@ -128,7 +149,7 @@ export async function makeRig(
   chainOptions: FakeChainOptions = {},
 ): Promise<Rig> {
   chainCounter += 1;
-  const chain = new FakeChainGateway({
+  const chain = new SpyChain({
     chainId: 900_000 + chainCounter + Math.floor(Math.random() * 1_000_000),
     ...chainOptions,
   });
@@ -148,12 +169,13 @@ export async function makeRig(
       { deploymentId: d.id, signer: 'compliance', address: chain.signerAddress('compliance') },
     ],
   });
-  const signer = new SpySigner(new ResigningSigner(chain, fakeSign(chain.chainId)));
+  const signer = chain;
+  const inspector = new FakeTransactionInspector(chain);
   const clock = new FakeClock();
   const alarms = new AlarmLog();
   const makeEngine = (more: Partial<BridgeEngineConfig> = {}) =>
     new BridgeEngine(
-      { prisma, gateway: chain, signer, clock, ids: new RecordingIds(), alarms },
+      { prisma, gateway: chain, inspector, clock, ids: new RecordingIds(), alarms },
       configFor(chain, { ...extra, ...more }),
     );
   return {

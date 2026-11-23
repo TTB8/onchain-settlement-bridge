@@ -6,17 +6,14 @@
  *
  * DEV ONLY: the only keys are Anvil's public development accounts, derived at runtime from the
  * public test mnemonic by the chain package's test support (never written down, worthless on any
- * real network). The signer below re-creates exactly the transaction the gateway sends (same
- * encoding, gas limit, chain id and fields), so the engine can record its hash before broadcasting;
- * `ResigningSigner` proves on every send that the gateway reported that same hash.
+ * real network). The gateway signs locally (`signTransaction`) and the engine checks the REAL
+ * EIP-1559 bytes with `ViemTransactionInspector` (decoded, sender recovered) before storing them,
+ * then broadcasts exactly those bytes (`sendRaw`).
  */
 
 import { randomUUID } from 'node:crypto';
 
-import { type SubmitRequest, settlementTokenAbi } from '@bridge/chain';
-import { encodeFunctionData, keccak256 } from 'viem';
-
-import { AlarmLog, BridgeEngine, ResigningSigner, type SignedTransaction } from '../src';
+import { AlarmLog, BridgeEngine, ViemTransactionInspector } from '../src';
 import {
   type AnvilNode,
   deployBridge,
@@ -24,59 +21,16 @@ import {
   gatewayFor,
   startAnvil,
 } from '../../chain/test/support/anvil';
-import { DEV_ROLES, devAccount, devAddress } from '../../chain/test/support/dev-accounts';
+import { devAddress } from '../../chain/test/support/dev-accounts';
 import { createTestDatabase, type TestDatabase } from './support/database';
 import { FakeClock, RecordingIds, type TestUser } from './support/fixtures';
 import { ledgerHolding, ref32 } from './support/bridge';
 
 const CHAIN_ID = 31337;
-const GAS_LIMIT = 300_000n; // the gateway's default
 
 let db: TestDatabase;
 let node: AnvilNode;
 let bridge: Deployment;
-
-/** DEV ONLY: signs with Anvil's settlement dev account, exactly as ViemChainGateway does. */
-function devSigner(token: `0x${string}`) {
-  const account = devAccount(DEV_ROLES.settlement);
-  return async (request: SubmitRequest): Promise<SignedTransaction> => {
-    const { call } = request;
-    let data: `0x${string}`;
-    if (call.kind === 'mint') {
-      data = encodeFunctionData({
-        abi: settlementTokenAbi,
-        functionName: 'mint',
-        args: [call.to, call.amount, call.ref],
-      });
-    } else if (call.kind === 'burn') {
-      data = encodeFunctionData({
-        abi: settlementTokenAbi,
-        functionName: 'burn',
-        args: [call.from, call.amount, call.ref],
-      });
-    } else if (call.kind === 'settleTransfer') {
-      data = encodeFunctionData({
-        abi: settlementTokenAbi,
-        functionName: 'settleTransfer',
-        args: [call.from, call.to, call.amount, call.ref],
-      });
-    } else {
-      throw new Error(`the dev signer only signs settlement calls, not ${call.kind}`);
-    }
-    const raw = await account.signTransaction({
-      type: 'eip1559',
-      chainId: CHAIN_ID,
-      nonce: request.nonce,
-      to: token,
-      data,
-      value: 0n,
-      gas: GAS_LIMIT,
-      maxFeePerGas: request.fees.maxFeePerGas,
-      maxPriorityFeePerGas: request.fees.maxPriorityFeePerGas,
-    });
-    return { hash: keccak256(raw), raw: raw.toLowerCase() as `0x${string}` };
-  };
-}
 
 beforeAll(async () => {
   db = await createTestDatabase();
@@ -137,7 +91,7 @@ it('deposit -> transfer -> withdrawal through tick() on Anvil: every user balanc
     {
       prisma: db.prisma,
       gateway,
-      signer: new ResigningSigner(gateway, devSigner(bridge.token)),
+      inspector: new ViemTransactionInspector(),
       clock: new FakeClock(),
       ids: new RecordingIds(),
       alarms,

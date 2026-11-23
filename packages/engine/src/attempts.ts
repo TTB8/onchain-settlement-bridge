@@ -21,6 +21,9 @@
 
 import {
   AlreadyKnownError,
+  type ChainGateway,
+  type Hex,
+  type SignedTransaction,
   type ContractCall,
   type Fees,
   InsufficientFundsError as ChainInsufficientFunds,
@@ -40,11 +43,16 @@ import {
 } from '@bridge/db';
 import { type AttemptRecord, auditEntryFor, type AuditEntity, nextNonce } from '@bridge/domain';
 
-import { InvalidRequestError, LeaseLostError } from './errors';
+import {
+  InvalidRequestError,
+  LeaseLostError,
+  RetriesExhaustedError,
+  SignedTransactionMismatchError,
+} from './errors';
 import { writeAudit } from './ledger-writes';
 import { describeError, type SanitizeOptions } from './redact';
-import type { SignedTransaction, TransactionSigner } from './signing';
-import type { Tx } from './transaction';
+import { type RawTransactionInspector, signAndVerify, type SigningExpectation } from './signing';
+import { runTransaction, type TransactionOptions, type Tx } from './transaction';
 
 const ADDRESS = /^0x[0-9a-f]{40}$/;
 const BYTES32 = /^0x[0-9a-f]{64}$/;
@@ -144,11 +152,6 @@ export function requestOf(attempt: ChainAttempt, call: ContractCall): SubmitRequ
   return { signer: attempt.signer, call, nonce: attempt.nonce, fees: feesOf(attempt) };
 }
 
-/** The signed transaction a recorded attempt holds. */
-export function signedOf(attempt: ChainAttempt): SignedTransaction {
-  return { hash: attempt.hash as TxHash, raw: attempt.rawTransaction as `0x${string}` };
-}
-
 /**
  * The domain's view of an attempt, for `assessAttempt` / `attemptCanStillMine`.
  *
@@ -224,6 +227,90 @@ export async function allocateNonce(tx: Tx, input: NonceAllocation): Promise<num
     distinct: ['nonce'],
   });
   return nextNonce({ chainPending: input.chainPending, reservedLocally: held.map((h) => h.nonce) });
+}
+
+/**
+ * The nonce `allocateNonce` would hand out now, read WITHOUT the lock. Used to sign before taking
+ * the lock (a remote signer may be slow, and `signer_state FOR UPDATE` serialises every sender of
+ * the signer); the locked allocation must then return the same nonce or the signature is thrown
+ * away and the whole step repeated (`commitWithFreshNonce`).
+ *
+ * @param prisma The database.
+ * @param input Deployment, signer and the node's pending count.
+ */
+export async function predictNonce(
+  prisma: PrismaClient,
+  input: Omit<NonceAllocation, 'signerAddress'>,
+): Promise<number> {
+  const held = await prisma.chainAttempt.findMany({
+    where: {
+      deploymentId: input.deploymentId,
+      signer: input.signer,
+      nonce: { gte: input.chainPending },
+    },
+    select: { nonce: true },
+    distinct: ['nonce'],
+  });
+  return nextNonce({ chainPending: input.chainPending, reservedLocally: held.map((h) => h.nonce) });
+}
+
+/** The locked allocation gave another nonce than the one signed for: sign again. */
+class NonceMovedError extends Error {}
+
+/** What `commitWithFreshNonce` needs. */
+export interface FreshNonceCommit<T> {
+  /** The database. */
+  readonly prisma: PrismaClient;
+  /** Signs (nothing sent). */
+  readonly gateway: ChainGateway;
+  /** Decodes the signed bytes for the check. */
+  readonly inspector: RawTransactionInspector;
+  /** The deployment's chain, contracts and recorded signer address. */
+  readonly expected: SigningExpectation;
+  /** Deployment, signer, signer address and the node's pending count. */
+  readonly allocation: NonceAllocation;
+  /** The request for a nonce. */
+  readonly build: (nonce: number) => SubmitRequest;
+  /** Runs first in the transaction (the outbox lease fence), before the signer lock. */
+  readonly fence?: (tx: Tx) => Promise<void>;
+  /** Inserts the attempt and applies its SUBMIT move, in the same transaction. */
+  readonly commit: (tx: Tx, request: SubmitRequest, signed: SignedTransaction) => Promise<T>;
+  /** Transaction settings. */
+  readonly transactions?: TransactionOptions;
+}
+
+/**
+ * Signs for the predicted next nonce OUTSIDE any lock (verified with `signAndVerify`), then in ONE
+ * transaction: `fence`, lock `signer_state` and allocate; if the allocation is the signed nonce,
+ * `commit`; otherwise roll back and start over (up to 3 times, then `RetriesExhaustedError`).
+ * Nothing is ever stored for a signature whose nonce was not allocated under the lock.
+ *
+ * @param args See `FreshNonceCommit`.
+ */
+export async function commitWithFreshNonce<T>(args: FreshNonceCommit<T>): Promise<T> {
+  let last: unknown;
+  for (let i = 1; i <= 3; i += 1) {
+    const predicted = await predictNonce(args.prisma, args.allocation);
+    const request = args.build(predicted);
+    const signed = await signAndVerify(args.gateway, args.inspector, request, args.expected);
+    try {
+      const { value } = await runTransaction(
+        args.prisma,
+        async (tx) => {
+          if (args.fence !== undefined) await args.fence(tx);
+          const nonce = await allocateNonce(tx, args.allocation);
+          if (nonce !== predicted) throw new NonceMovedError();
+          return args.commit(tx, request, signed);
+        },
+        args.transactions,
+      );
+      return value;
+    } catch (err) {
+      if (!(err instanceof NonceMovedError)) throw err;
+      last = err;
+    }
+  }
+  throw new RetriesExhaustedError(3, last);
 }
 
 /** What `insertAttempt` records. */
@@ -303,19 +390,27 @@ export function classifyBroadcastError(err: unknown): BroadcastResult {
 }
 
 /**
- * Broadcasts a recorded attempt and classifies the outcome. Never throws for a chain answer.
+ * Broadcasts a recorded attempt's EXACT bytes (`sendRaw`, idempotent for known bytes) and
+ * classifies the outcome. Never throws for a chain answer. A reported hash other than the
+ * recorded one is an unknown outcome (the bytes on the wire are not the ones stored).
  *
- * @param signer The transaction signer.
+ * @param gateway The chain.
  * @param attempt The recorded attempt.
- * @param call The decoded call of its outbox row.
  */
 export async function broadcastAttempt(
-  signer: TransactionSigner,
+  gateway: ChainGateway,
   attempt: ChainAttempt,
-  call: ContractCall,
 ): Promise<BroadcastResult> {
   try {
-    await signer.broadcast(signedOf(attempt), requestOf(attempt, call));
+    const hash = await gateway.sendRaw(attempt.rawTransaction as Hex);
+    if (hash.toLowerCase() !== attempt.hash) {
+      return {
+        kind: 'unknown',
+        error: new SignedTransactionMismatchError(
+          `sendRaw reported ${hash.toLowerCase()}, the attempt recorded ${attempt.hash}`,
+        ),
+      };
+    }
     return { kind: 'sent' };
   } catch (err) {
     return classifyBroadcastError(err);

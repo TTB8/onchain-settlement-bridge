@@ -24,39 +24,32 @@
  */
 
 import type { ChainGateway, ContractCall } from '@bridge/chain';
-import type { ChainAttempt, Deployment, Operation, OutboxMessage, PrismaClient } from '@bridge/db';
+import type { ChainAttempt, Operation, OutboxMessage, PrismaClient } from '@bridge/db';
 import { FeeCapExceededError, initialFees } from '@bridge/domain';
 
 import {
-  allocateNonce,
   broadcastAttempt,
+  commitWithFreshNonce,
   contractCallFromJson,
   fenceOutboxLease,
   insertAttempt,
   recordBroadcast,
 } from './attempts';
 import type { AlarmSink } from './alarms';
-import {
-  DeploymentMismatchError,
-  InvalidRequestError,
-  LeaseLostError,
-  SignerMismatchError,
-} from './errors';
+import { InvalidRequestError, LeaseLostError, SignerMismatchError } from './errors';
 import { moveOperation } from './move-operation';
 import type { HandlerContext, OutboxHandler, OutboxOutcome } from './outbox-dispatcher';
 import type { Clock } from './ports';
 import { describeError, type SanitizeOptions } from './redact';
-import { assertSignerBound } from './signer-binding';
-import type { TransactionSigner } from './signing';
-import { runTransaction, type TransactionOptions } from './transaction';
-
-/** The deployment an engine's gateway talks to. */
-export interface DeploymentBinding {
-  /** The chain id. */
-  readonly chainId: bigint;
-  /** The token address (lowercase hex). */
-  readonly tokenAddress: string;
-}
+import {
+  assertBound,
+  assertSignerBound,
+  bindingOf,
+  type DeploymentBinding,
+  signingExpectationFor,
+} from './signer-binding';
+import type { RawTransactionInspector } from './signing';
+import type { TransactionOptions } from './transaction';
 
 /** Fee settings for a first attempt. */
 export interface InitialFeePolicy {
@@ -72,14 +65,13 @@ export interface InitialFeePolicy {
 export interface SettlementSubmitterOptions {
   /** The database. */
   readonly prisma: PrismaClient;
-  /** The chain (reads, and the signer address). */
+  /** The chain: reads, signs (`signTransaction`), sends exact bytes (`sendRaw`). Its own
+   * `deployment()` is the binding. */
   readonly gateway: ChainGateway;
-  /** Signs before sending; sends exactly what was signed. */
-  readonly signer: TransactionSigner;
+  /** Decodes signed bytes so they are checked before they are stored. */
+  readonly inspector: RawTransactionInspector;
   /** The time source. */
   readonly clock: Clock;
-  /** The deployment the gateway talks to. */
-  readonly binding: DeploymentBinding;
   /** First-attempt fees. */
   readonly fees: InitialFeePolicy;
   /** Transaction settings. */
@@ -90,21 +82,11 @@ export interface SettlementSubmitterOptions {
   readonly alarms?: AlarmSink;
 }
 
-/** Throws `DeploymentMismatchError` unless `d` is the bound deployment. */
-export function assertBound(d: Deployment, binding: DeploymentBinding): void {
-  if (d.chainId !== binding.chainId || d.tokenAddress !== binding.tokenAddress) {
-    throw new DeploymentMismatchError(
-      `operation is bound to ${d.tokenAddress} on chain ${d.chainId}, ` +
-        `but this engine sends to ${binding.tokenAddress} on chain ${binding.chainId}`,
-    );
-  }
-}
-
 /** Sends `settlement` outbox rows. See the file comment. */
 export class SettlementSubmitter implements OutboxHandler {
   private readonly prisma: PrismaClient;
   private readonly gateway: ChainGateway;
-  private readonly signer: TransactionSigner;
+  private readonly inspector: RawTransactionInspector;
   private readonly clock: Clock;
   private readonly binding: DeploymentBinding;
   private readonly fees: InitialFeePolicy;
@@ -116,9 +98,9 @@ export class SettlementSubmitter implements OutboxHandler {
   constructor(options: SettlementSubmitterOptions) {
     this.prisma = options.prisma;
     this.gateway = options.gateway;
-    this.signer = options.signer;
+    this.inspector = options.inspector;
     this.clock = options.clock;
-    this.binding = options.binding;
+    this.binding = bindingOf(options.gateway);
     this.fees = options.fees;
     this.transactions = options.transactions ?? {};
     this.redaction = { secrets: [...(options.secrets ?? [])] };
@@ -190,19 +172,24 @@ export class SettlementSubmitter implements OutboxHandler {
       throw err;
     }
 
-    const { value: attempt } = await runTransaction(
-      this.prisma,
-      async (tx) => {
+    const expected = await signingExpectationFor(this.prisma, op.deployment, 'settlement');
+    // Signed and verified OUTSIDE the lock, for the predicted nonce; committed only if the
+    // locked allocation agrees (commitWithFreshNonce).
+    const attempt = await commitWithFreshNonce({
+      prisma: this.prisma,
+      gateway: this.gateway,
+      inspector: this.inspector,
+      expected,
+      allocation: {
+        deploymentId: op.deploymentId,
+        signer: 'settlement',
+        signerAddress,
+        chainPending: pending,
+      },
+      build: (nonce) => ({ signer: 'settlement', call, nonce, fees }),
+      fence: (tx) => fenceOutboxLease(tx, row, this.clock.now()),
+      commit: async (tx, request, signed) => {
         const at = this.clock.now();
-        await fenceOutboxLease(tx, row, at);
-        const nonce = await allocateNonce(tx, {
-          deploymentId: op.deploymentId,
-          signer: 'settlement',
-          signerAddress,
-          chainPending: pending,
-        });
-        const request = { signer: 'settlement' as const, call, nonce, fees };
-        const signed = await this.signer.sign(request);
         const inserted = await insertAttempt(tx, {
           deploymentId: op.deploymentId,
           outboxId: row.id,
@@ -219,12 +206,12 @@ export class SettlementSubmitter implements OutboxHandler {
           move: { event: 'SUBMIT', kind: 'first' },
           at,
           txHash: signed.hash,
-          note: `first attempt signed with nonce ${nonce} and recorded before broadcast`,
+          note: `first attempt signed with nonce ${request.nonce} and recorded before broadcast`,
         });
         return inserted;
       },
-      this.transactions,
-    );
+      transactions: this.transactions,
+    });
     return this.send(op, attempt, call, context);
   }
 
@@ -240,7 +227,7 @@ export class SettlementSubmitter implements OutboxHandler {
       throw new LeaseLostError('lease lost before broadcast');
     }
     if (context.signal.aborted) throw new LeaseLostError('handler time limit reached');
-    const result = await broadcastAttempt(this.signer, attempt, call);
+    const result = await broadcastAttempt(this.gateway, attempt);
     await recordBroadcast(
       this.prisma,
       attempt,

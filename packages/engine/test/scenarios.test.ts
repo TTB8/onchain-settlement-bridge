@@ -8,17 +8,27 @@ import { randomUUID } from 'node:crypto';
 
 import { ChainUnavailableError, SubmissionRejectedError } from '@bridge/chain';
 
-import { DeploymentMismatchError, LeaseLostError, moveOperation } from '../src';
+import {
+  AlarmLog,
+  BridgeEngine,
+  DeploymentMismatchError,
+  InvalidRequestError,
+  LeaseLostError,
+  moveOperation,
+} from '../src';
 import { createTestDatabase, type TestDatabase } from './support/database';
-import { balanceOf, insertUser, type TestUser } from './support/fixtures';
+import { balanceOf, FakeClock, insertUser, RecordingIds, type TestUser } from './support/fixtures';
 import {
   attemptsOf,
+  configFor,
+  FakeTransactionInspector,
   ledgerHolding,
   makeRig,
   opRow,
   ref32,
   type Rig,
   setOnChain,
+  SpyChain,
   tickUntil,
 } from './support/bridge';
 
@@ -1091,5 +1101,130 @@ describe('review L-1, L-2: stalls and isolation', () => {
     await rig.engine.tick();
     expect(await statusOf(dep.id)).toBe('confirmed');
     expect(await statusOf(dep2.id)).toBe('confirmed');
+  });
+});
+
+describe('review M-3: signed bytes are verified before they are stored', () => {
+  it('a signer returning bytes for another nonce: refused, nothing stored, nothing sent', async () => {
+    const rig = await makeRig(db.prisma);
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 5n);
+    rig.chain.tamper = async (_signed, request) =>
+      new SpyChain({ chainId: rig.chain.chainId }).signTransaction({
+        ...request,
+        nonce: request.nonce + 7,
+      });
+    const r = await rig.engine.dispatcher.runOnce();
+    expect(r.retried).toBe(1);
+    const row = await db.prisma.outboxMessage.findFirstOrThrow({ where: { operationId: dep.id } });
+    expect(row.lastError).toContain('SignedTransactionMismatchError');
+    expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(0);
+    expect(await statusOf(dep.id)).toBe('ledger_reserved');
+    expect(rig.signer.broadcasts).toHaveLength(0);
+    rig.chain.tamper = undefined;
+    rig.clock.advance(60_000);
+    await rig.engine.tick();
+    expect(await statusOf(dep.id)).toBe('confirmed');
+  });
+
+  it('a nonce taken while signing outside the lock: the signature is discarded and the next nonce signed', async () => {
+    const rig = await makeRig(db.prisma);
+    const other = rig.makeEngine({ workerId: 'second-worker' });
+    const alice = await verifiedUser(rig);
+    const a = await deposit(rig, alice, 1n);
+    rig.clock.advance(1);
+    const b = await deposit(rig, alice, 2n);
+    // While A is being signed (no lock held), a second worker signs and commits B.
+    rig.chain.onSign = async () => {
+      await other.dispatcher.runOnce();
+    };
+    await rig.engine.dispatcher.runOnce();
+    const [ra] = await attemptsOf(db.prisma, a.id);
+    const [rb] = await attemptsOf(db.prisma, b.id);
+    expect(await attemptsOf(db.prisma, a.id)).toHaveLength(1);
+    expect(ra?.nonce).not.toBe(rb?.nonce);
+    // The stored bytes carry the stored nonce (never bytes signed for a nonce someone else took).
+    const inspector = new FakeTransactionInspector(rig.chain);
+    for (const at of [ra, rb]) {
+      const decoded = await inspector.decode(at?.rawTransaction as `0x${string}`);
+      expect(decoded.nonce).toBe(at?.nonce);
+    }
+    await rig.engine.tick();
+    expect(await statusOf(a.id)).toBe('confirmed');
+    expect(await statusOf(b.id)).toBe('confirmed');
+  });
+});
+
+describe('review M-2: the gateway deployment must be the active deployment', () => {
+  it('a gateway on another token: tick() refuses to run and raises deployment_mismatch', async () => {
+    const rig = await makeRig(db.prisma);
+    const alice = await verifiedUser(rig);
+    const dep = await deposit(rig, alice, 5n);
+    const wrong = new SpyChain({ chainId: rig.chain.chainId, tokenAddress: `0x${'4'.repeat(40)}` });
+    const alarms = new AlarmLog();
+    const engine = new BridgeEngine(
+      {
+        prisma: db.prisma,
+        gateway: wrong,
+        inspector: new FakeTransactionInspector(wrong),
+        clock: rig.clock,
+        ids: new RecordingIds(),
+        alarms,
+      },
+      configFor(wrong),
+    );
+    await expect(engine.tick()).rejects.toBeInstanceOf(DeploymentMismatchError);
+    expect(alarms.ofKind('deployment_mismatch')).toHaveLength(1);
+    expect(await attemptsOf(db.prisma, dep.id)).toHaveLength(0);
+    expect(wrong.broadcasts).toHaveLength(0);
+  });
+
+  it('a gateway with the right token but another registry: refused as well', async () => {
+    const rig = await makeRig(db.prisma);
+    const wrong = new SpyChain({
+      chainId: rig.chain.chainId,
+      tokenAddress: rig.chain.tokenAddress,
+      registryAddress: `0x${'3'.repeat(40)}`,
+    });
+    const engine = new BridgeEngine(
+      {
+        prisma: db.prisma,
+        gateway: wrong,
+        inspector: new FakeTransactionInspector(wrong),
+        clock: rig.clock,
+        ids: new RecordingIds(),
+      },
+      configFor(wrong),
+    );
+    await expect(engine.tick()).rejects.toBeInstanceOf(DeploymentMismatchError);
+    await expect(engine.monitor.runOnce()).rejects.toBeInstanceOf(DeploymentMismatchError);
+    await expect(engine.indexer.runOnce()).rejects.toBeInstanceOf(DeploymentMismatchError);
+  });
+
+  it('configured chain or token disagreeing with the gateway refuses construction; case is normalised', () => {
+    const chain = new SpyChain({ chainId: 5150 });
+    const deps = {
+      prisma: db.prisma,
+      gateway: chain,
+      inspector: new FakeTransactionInspector(chain),
+      clock: new FakeClock(),
+      ids: new RecordingIds(),
+    };
+    expect(
+      () => new BridgeEngine(deps, { ...configFor(chain), tokenAddress: `0x${'2'.repeat(40)}` }),
+    ).toThrow(DeploymentMismatchError);
+    expect(() => new BridgeEngine(deps, { ...configFor(chain), chainId: 1n })).toThrow(
+      DeploymentMismatchError,
+    );
+    expect(
+      () =>
+        new BridgeEngine(deps, {
+          ...configFor(chain),
+          tokenAddress: chain.tokenAddress.toUpperCase().replace('0X', '0x'),
+        }),
+    ).not.toThrow();
+    expect(() => new BridgeEngine(deps, { ...configFor(chain), tokenAddress: 'nope' })).toThrow(
+      InvalidRequestError,
+    );
   });
 });

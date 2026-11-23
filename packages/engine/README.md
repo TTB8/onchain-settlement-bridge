@@ -15,7 +15,8 @@ composition root (below). The reconciler, compliance sending and audit extras ar
 | `transaction.ts`       | `runTransaction`: one interactive transaction, retried a bounded number of times on 40001 / 40P01 |
 | `ledger-writes.ts`     | Shared writes: account resolution, journal entry + postings, audit row                             |
 | `redact.ts`            | `sanitizeText` / `describeError`: URL-free, single-line, bounded error text                       |
-| `signing.ts`           | `TransactionSigner` (sign first, broadcast exactly that later), `ResigningSigner`                  |
+| `signing.ts`           | `signAndVerify` (bytes checked before storage), `RawTransactionInspector`, `ViemTransactionInspector` |
+| `signer-binding.ts`    | Gateway deployment binding (`bindingOf`, `assertBound`) and the signer-address check               |
 | `attempts.ts`          | Shared attempt/nonce machinery: call codec, nonce under the signer lock, lease fence, broadcast classification |
 | `settlement-submitter.ts` | `SettlementSubmitter`: the `OutboxHandler` for `settlement` rows                               |
 | `tx-monitor.ts`        | `TxMonitor`: submitted/failed operations decided on final evidence                                 |
@@ -169,17 +170,32 @@ The guarantees above hold only if the handler keeps to these:
 
 ## Piece B: sending, watching, indexing
 
-### Sign first, then commit, then broadcast (obligation 1)
+### Sign first, check, commit, then broadcast (obligation 1, review M-3)
 
-`ChainGateway.submit` signs and sends in one call and reveals the hash only afterwards, while
-`chain_attempt` needs the hash and the raw bytes at INSERT. So the engine takes a
-`TransactionSigner`: `sign(request)` returns `{ hash, raw }` without sending, and
-`broadcast(signed, request)` sends exactly that. `ResigningSigner` adapts a gateway whose signing
-is deterministic (both are): it re-submits the same request and refuses to call it a success
-unless the gateway reports the recorded hash (`SignedHashMismatchError`, an unknown outcome). The
-tests supply the signing function (the fake's hash; viem with Anvil's dev key). **Production needs
-a sign-only + send-raw method on the chain package's gateway** (open question): until then no
-production key holder can produce the bytes before the send.
+The gateway signs without sending (`signTransaction`, local) and later sends exactly those bytes
+(`sendRaw`, idempotent for known bytes). Before anything is stored, `signAndVerify` checks in the
+engine that `keccak256(raw) === hash` and that the bytes, decoded by a `RawTransactionInspector`,
+are EIP-1559 with the request's chain id, nonce, both fee fields and exact call, aimed at the
+deployment's contract for that call, and recover to the deployment's recorded signer
+(`signer_state`). Any difference is `SignedTransactionMismatchError`: nothing stored, nothing sent.
+`ViemTransactionInspector` (viem `parseTransaction` + `recoverTransactionAddress` + the ABIs) is
+the real one; the tests' `FakeTransactionInspector` decodes the fake's canonical encoding (it
+cannot check `to` independently; the Anvil suite does).
+
+**No lock across a sign.** A first send or a new-nonce resubmit signs for the PREDICTED next nonce
+outside any lock, then in one transaction fences the lease, locks `signer_state`, allocates, and
+commits only if the allocation equals the signed nonce; otherwise the signature is discarded and
+the step repeats (at most 3 times, `commitWithFreshNonce`). A bump keeps its nonce, so it is
+signed and verified before its transaction with no lock at all.
+
+### Deployment binding (review M-2)
+
+The binding is the gateway's own `deployment()` (chain id, token, registry, lowercase). At
+construction, a configured `chainId` / `tokenAddress` (validated, case-normalised) must agree with
+it (`DeploymentMismatchError`). At the start of every `tick()`, the database's ACTIVE deployment
+of that chain must match token AND registry, or the tick raises `deployment_mismatch` and throws.
+The submitter, monitor and indexer load their deployment row from the binding and refuse a row
+whose registry differs.
 
 ### The submitter (`SettlementSubmitter.handle`)
 

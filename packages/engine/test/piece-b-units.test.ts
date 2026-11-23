@@ -1,6 +1,6 @@
 /**
  * Units for piece B without a database: the outbox call codec, the broadcast classifier (ADR
- * 0009), `ResigningSigner`'s hash check, the alarm log, constructor validation, and the
+ * 0009), `signAndVerify` on real and fake signed bytes, the alarm log, constructor validation, and the
  * `BridgeEngine` loop driven by fake timers (no timer inside the logic itself).
  */
 
@@ -13,8 +13,12 @@ import {
   ReplacementUnderpricedError,
   SubmissionRejectedError,
   type SubmitRequest,
+  type ChainGateway,
+  type SignedTransaction,
+  ViemChainGateway,
 } from '@bridge/chain';
 import type { PrismaClient } from '@bridge/db';
+import { keccak256 } from 'viem';
 
 import {
   AlarmLog,
@@ -22,12 +26,15 @@ import {
   classifyBroadcastError,
   contractCallFromJson,
   InvalidRequestError,
-  ResigningSigner,
-  SignedHashMismatchError,
+  callFromCalldata,
+  SignedTransactionMismatchError,
+  signAndVerify,
+  ViemTransactionInspector,
   type TickSummary,
   TxMonitor,
 } from '../src';
-import { configFor, fakeSign } from './support/bridge';
+import { configFor, FakeTransactionInspector, SpyChain } from './support/bridge';
+import { devAccount } from '../../chain/test/support/dev-accounts';
 import { FakeClock, RecordingIds } from './support/fixtures';
 
 const A: `0x${string}` = `0x${'a'.repeat(40)}`;
@@ -82,7 +89,7 @@ describe('classifyBroadcastError (ADR 0009: only definite answers are not unknow
     [new ReplacementUnderpricedError('under'), 'rejected'],
     [new InsufficientFundsError('gas'), 'rejected'],
     [new ChainUnavailableError('timeout'), 'unknown'],
-    [new SignedHashMismatchError('drift'), 'unknown'],
+    [new SignedTransactionMismatchError('drift'), 'unknown'],
     [new Error('anything else'), 'unknown'],
     ['a string', 'unknown'],
   ])('%p is %s', (err, kind) => {
@@ -90,37 +97,143 @@ describe('classifyBroadcastError (ADR 0009: only definite answers are not unknow
   });
 });
 
-describe('ResigningSigner', () => {
-  const chain = new FakeChainGateway({ automine: false });
-  const signer = new ResigningSigner(chain, fakeSign(chain.chainId));
-  const request = (nonce: number): SubmitRequest => ({
+describe('signAndVerify (review M-3): the signed bytes are checked before anything is stored', () => {
+  // DEV ONLY: Anvil's public development accounts, derived at runtime from the public mnemonic.
+  const TOKEN: `0x${string}` = `0x${'7'.repeat(40)}`;
+  const REGISTRY: `0x${string}` = `0x${'6'.repeat(40)}`;
+  const viemGateway = (over: { chainId?: number; token?: `0x${string}`; key?: number } = {}) =>
+    new ViemChainGateway({
+      rpcUrl: 'http://127.0.0.1:9', // never contacted: signing is local
+      chainId: over.chainId ?? 31337,
+      registryAddress: REGISTRY,
+      tokenAddress: over.token ?? TOKEN,
+      signers: { settlement: devAccount(over.key ?? 1), compliance: devAccount(2) },
+    });
+  const settlementAddress = devAccount(1).address.toLowerCase() as `0x${string}`;
+  const expected = {
+    chainId: 31337,
+    token: TOKEN,
+    registry: REGISTRY,
+    signerAddress: settlementAddress,
+  };
+  const request = (over: Partial<SubmitRequest> = {}): SubmitRequest => ({
     signer: 'settlement',
-    call: { kind: 'mint', to: A, amount: 1n, ref: REF },
-    nonce,
+    call: { kind: 'mint', to: A, amount: 5n, ref: REF },
+    nonce: 3,
     fees: { maxFeePerGas: 10n ** 10n, maxPriorityFeePerGas: 10n ** 9n },
+    ...over,
+  });
+  const inspector = new ViemTransactionInspector();
+  /** A gateway whose signTransaction returns what `other` signs instead. */
+  const lying = (other: () => Promise<SignedTransaction>): ChainGateway =>
+    new Proxy(viemGateway(), {
+      get(target, prop, receiver) {
+        if (prop === 'signTransaction') return other;
+        const v: unknown = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+
+  it('accepts real EIP-1559 bytes that are exactly the request (all five call kinds decode)', async () => {
+    const g = viemGateway();
+    const signed = await signAndVerify(g, inspector, request(), expected);
+    expect(signed.hash).toMatch(/^0x[0-9a-f]{64}$/);
+    for (const call of [
+      { kind: 'burn', from: A, amount: 2n, ref: REF },
+      { kind: 'settleTransfer', from: A, to: B, amount: 2n, ref: REF },
+    ] as const) {
+      await expect(signAndVerify(g, inspector, request({ call }), expected)).resolves.toBeDefined();
+    }
+    for (const call of [
+      { kind: 'setVerified', account: A, verified: true, ref: REF },
+      { kind: 'setFrozen', account: A, frozen: false, ref: REF },
+    ] as const) {
+      const req: SubmitRequest = { ...request({ call }), signer: 'compliance' };
+      const comp = {
+        ...expected,
+        signerAddress: devAccount(2).address.toLowerCase() as `0x${string}`,
+      };
+      await expect(signAndVerify(g, inspector, req, comp)).resolves.toBeDefined();
+    }
   });
 
-  it('broadcasts and returns the recorded hash; "already known" for it is a send', async () => {
-    const signed = await signer.sign(request(0));
-    expect(await signer.broadcast(signed, request(0))).toBe(signed.hash);
-    expect(await signer.broadcast(signed, request(0))).toBe(signed.hash);
-    chain.failNextSubmit(new AlreadyKnownError('known'));
-    expect(await signer.broadcast(signed, request(0))).toBe(signed.hash);
+  it.each([
+    [
+      'a hash that is not the bytes hash',
+      async () => ({
+        ...(await viemGateway().signTransaction(request())),
+        hash: `0x${'9'.repeat(64)}` as `0x${string}`,
+      }),
+      /hash/,
+    ],
+    ['another nonce', () => viemGateway().signTransaction(request({ nonce: 4 })), /nonce/],
+    [
+      'another key (wrong signer in the raw bytes)',
+      () => viemGateway({ key: 5 }).signTransaction(request()),
+      /from/,
+    ],
+    [
+      'another token (wrong to)',
+      () => viemGateway({ token: `0x${'8'.repeat(40)}` }).signTransaction(request()),
+      /to/,
+    ],
+    ['another chain id', () => viemGateway({ chainId: 1 }).signTransaction(request()), /chainId/],
+    [
+      'another amount (wrong data)',
+      () =>
+        viemGateway().signTransaction(
+          request({ call: { kind: 'mint', to: A, amount: 6n, ref: REF } }),
+        ),
+      /data/,
+    ],
+    [
+      'other fees',
+      () =>
+        viemGateway().signTransaction(
+          request({ fees: { maxFeePerGas: 10n ** 11n, maxPriorityFeePerGas: 10n ** 9n } }),
+        ),
+      /maxFeePerGas/,
+    ],
+    [
+      'other tip',
+      () =>
+        viemGateway().signTransaction(
+          request({ fees: { maxFeePerGas: 10n ** 10n, maxPriorityFeePerGas: 1n } }),
+        ),
+      /maxPriorityFeePerGas/,
+    ],
+    [
+      'undecodable bytes',
+      async () => ({ raw: '0xdeadbeef' as `0x${string}`, hash: keccak256('0xdeadbeef') }),
+      /decoded/,
+    ],
+  ])('refuses %s', async (_label, other, why) => {
+    await expect(signAndVerify(lying(other), inspector, request(), expected)).rejects.toThrow(
+      SignedTransactionMismatchError,
+    );
+    await expect(signAndVerify(lying(other), inspector, request(), expected)).rejects.toThrow(why);
   });
 
-  it('refuses to call a different hash a success', async () => {
-    const signed = await signer.sign(request(1));
-    await expect(
-      signer.broadcast({ ...signed, hash: `0x${'9'.repeat(64)}` }, request(1)),
-    ).rejects.toBeInstanceOf(SignedHashMismatchError);
-    chain.failNextSubmit(new AlreadyKnownError('known', `0x${'8'.repeat(64)}`));
-    await expect(signer.broadcast(signed, request(1))).rejects.toBeInstanceOf(
-      SignedHashMismatchError,
-    );
-    chain.failNextSubmit(new ChainUnavailableError('down'));
-    await expect(signer.broadcast(signed, request(1))).rejects.toBeInstanceOf(
-      ChainUnavailableError,
-    );
+  it('the fake inspector checks the fake encoding the same way', async () => {
+    const chain = new SpyChain({ chainId: 4242 });
+    const dep = chain.deployment();
+    const exp = {
+      chainId: 4242,
+      token: dep.token,
+      registry: dep.registry,
+      signerAddress: chain.signerAddress('settlement'),
+    };
+    const fake = new FakeTransactionInspector(chain);
+    await expect(signAndVerify(chain, fake, request(), exp)).resolves.toBeDefined();
+    chain.tamper = async (_s, r) => {
+      const other = new SpyChain({ chainId: 4242 });
+      return other.signTransaction({ ...r, nonce: r.nonce + 1 });
+    };
+    await expect(signAndVerify(chain, fake, request(), exp)).rejects.toThrow(/nonce/);
+  });
+
+  it('callFromCalldata refuses calldata that is not a bridge call', () => {
+    expect(() => callFromCalldata('0x12345678')).toThrow(TypeError);
   });
 });
 
@@ -145,7 +258,7 @@ function engineFor(extra: Parameters<typeof configFor>[1] = {}): BridgeEngine {
     {
       prisma: prismaStub,
       gateway: chain,
-      signer: new ResigningSigner(chain, fakeSign(chain.chainId)),
+      inspector: new FakeTransactionInspector(chain),
       clock: new FakeClock(),
       ids: new RecordingIds(),
     },
@@ -164,7 +277,7 @@ describe('BridgeEngine construction and loop', () => {
     const base = {
       prisma: prismaStub,
       gateway: chain,
-      signer: new ResigningSigner(chain, fakeSign(chain.chainId)),
+      inspector: new FakeTransactionInspector(chain),
       clock: new FakeClock(),
       binding: { chainId: 1n, tokenAddress: chain.tokenAddress },
       alarms: new AlarmLog(),
@@ -228,7 +341,7 @@ describe('BridgeEngine construction and loop', () => {
         {
           prisma: prismaStub,
           gateway: chain,
-          signer: new ResigningSigner(chain, fakeSign(chain.chainId)),
+          inspector: new FakeTransactionInspector(chain),
           clock: new FakeClock(),
           ids: new RecordingIds(),
           alarms,

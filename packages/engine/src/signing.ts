@@ -1,105 +1,258 @@
 /**
- * @file Signing a transaction BEFORE it is sent, so the engine can store its hash and bytes first
- * (ADR 0012 item 1), and broadcasting exactly those bytes afterwards.
+ * @file Signing a transaction BEFORE it is sent, and proving the bytes are what was asked for,
+ * before anything is stored (ADR 0012 item 1, review M-3).
  *
- * Why a separate port: `ChainGateway.submit` signs and sends in one call and only reveals the hash
- * afterwards. A crash, a timeout or an unknown answer between "signed" and "recorded" would then
- * leave a transaction on the wire that the database has never heard of, and the reversal check
- * (`anAttemptCanStillMine`) would miss it. The `chain_attempt` row also needs the hash and the raw
- * bytes at INSERT (both are immutable and NOT NULL). So the engine asks a `TransactionSigner` for
- * the signed transaction first, commits it, and only then broadcasts.
+ * The gateway signs (`signTransaction`, local, no node) and later broadcasts exactly those bytes
+ * (`sendRaw`, idempotent for known bytes). Between the two the engine stores `{ hash, raw }` in
+ * `chain_attempt`, where they are immutable and rebroadcast after any crash. So the bytes must be
+ * checked FIRST: a gateway bug, a misconfigured key or a compromised signer that returns other
+ * bytes (another nonce, another recipient, another contract, another key, a hash that is not the
+ * bytes' hash) would otherwise be persisted as "our" transaction, and every later decision
+ * (`attemptCanStillMine`, receipts by hash, rebroadcasts) would be about the wrong transaction.
  *
- * Production wiring needs the chain package to expose sign-only and send-raw on its gateway (see
- * the engine README, open question). Until then `ResigningSigner` adapts any gateway whose signing
- * is deterministic (both gateways are: RFC 6979 signatures in viem, hash-of-request in the fake):
- * `sign` comes from the caller, `broadcast` re-submits the same request through the gateway and
- * refuses to call it a success unless the gateway reports the very hash that was recorded.
+ * `signAndVerify` therefore checks, in the engine, before returning:
+ * - `keccak256(raw) === hash`;
+ * - the decoded transaction (through a `RawTransactionInspector`) is EIP-1559 with the request's
+ *   chain id, nonce, both fee fields, the exact call (kind, every argument), sent to the
+ *   deployment's contract for that call, and recovers to the deployment's signer address.
+ * Any difference is `SignedTransactionMismatchError`: nothing is stored, nothing is sent.
+ *
+ * The inspector is a port because the fake gateway's bytes are its own canonical encoding, not
+ * real EIP-1559 bytes. `ViemTransactionInspector` is the real one (viem `parseTransaction`,
+ * `recoverTransactionAddress`, and the contracts' ABIs).
  */
 
 import {
-  AlreadyKnownError,
+  type Address,
   type ChainGateway,
+  complianceRegistryAbi,
+  type ContractCall,
   type Hex,
+  SIGNER_FOR_CALL,
+  type SignedTransaction,
+  settlementTokenAbi,
   type SubmitRequest,
-  type TxHash,
 } from '@bridge/chain';
+import { decodeFunctionData, keccak256, parseTransaction, recoverTransactionAddress } from 'viem';
 
-import { SignedHashMismatchError } from './errors';
+import { SignedTransactionMismatchError } from './errors';
 
-/** A signed, not yet sent, transaction. */
-export interface SignedTransaction {
-  /** Its hash, lowercase. */
-  readonly hash: TxHash;
-  /** The exact bytes to send, lowercase `0x` hex. */
-  readonly raw: Hex;
+/** What a signed transaction says, decoded from its raw bytes. */
+export interface DecodedTransaction {
+  /** Only EIP-1559 transactions are ever signed by the bridge. */
+  readonly type: 'eip1559';
+  /** The chain id the signature commits to. */
+  readonly chainId: number;
+  /** The nonce. */
+  readonly nonce: number;
+  /** The contract called (lowercase). */
+  readonly to: Address;
+  /** The call, decoded from the calldata against the contract's ABI. */
+  readonly call: ContractCall;
+  /** The fee cap. */
+  readonly maxFeePerGas: bigint;
+  /** The tip. */
+  readonly maxPriorityFeePerGas: bigint;
+  /** The address the signature recovers to (lowercase). */
+  readonly from: Address;
 }
 
-/** Signs without sending, and sends exactly what was signed. */
-export interface TransactionSigner {
+/** Decodes signed bytes (and recovers their sender). */
+export interface RawTransactionInspector {
   /**
-   * Signs `request` without sending it. Must be deterministic: the same request gives the same
-   * bytes and hash, so a rebroadcast after a crash is the same transaction.
+   * Decodes `raw`. Throws when the bytes cannot be decoded (they are then refused).
    *
-   * @param request Signer, call, nonce and fees.
+   * @param raw The signed bytes.
    */
-  sign(request: SubmitRequest): Promise<SignedTransaction>;
-
-  /**
-   * Sends `signed` (whose request is `request`). Throws the same typed errors as
-   * `ChainGateway.submit`; `SignedHashMismatchError` when what was sent is not what was recorded.
-   * Returns the hash, which equals `signed.hash`.
-   *
-   * @param signed The recorded transaction.
-   * @param request The request it was signed from.
-   */
-  broadcast(signed: SignedTransaction, request: SubmitRequest): Promise<TxHash>;
+  decode(raw: Hex): Promise<DecodedTransaction>;
 }
 
-/** Signs a request without sending it (supplied by whoever holds the key). */
-export type SignFunction = (request: SubmitRequest) => Promise<SignedTransaction>;
+/** What the signed bytes must say besides the request itself. */
+export interface SigningExpectation {
+  /** The deployment's chain id. */
+  readonly chainId: number;
+  /** The deployment's token (target of settlement calls). */
+  readonly token: Address;
+  /** The deployment's registry (target of compliance calls). */
+  readonly registry: Address;
+  /** The deployment's recorded address for the request's signer (`signer_state`). */
+  readonly signerAddress: Address;
+}
+
+const lower = (a: string): Address => a.toLowerCase() as Address;
+
+function sameCall(a: ContractCall, b: ContractCall): boolean {
+  const norm = (c: ContractCall): string =>
+    JSON.stringify(
+      Object.entries(c)
+        .map(([k, v]) => [k, typeof v === 'string' ? v.toLowerCase() : String(v)] as const)
+        .sort(([x], [y]) => (x < y ? -1 : 1)),
+    );
+  return norm(a) === norm(b);
+}
 
 /**
- * A `TransactionSigner` for a gateway that signs deterministically: `sign` is the supplied
- * function, `broadcast` re-submits the same request and checks the gateway reports the recorded
- * hash. `AlreadyKnownError` for the recorded hash (or with no hash) counts as sent.
+ * Every field in which `decoded` differs from what `request` and `expected` require. Empty means
+ * the bytes are exactly the requested transaction. Pure.
+ *
+ * @param request What was asked for.
+ * @param expected The deployment's chain, contracts and signer.
+ * @param decoded What the bytes say.
  */
-export class ResigningSigner implements TransactionSigner {
-  /**
-   * @param gateway The gateway that sends.
-   * @param signFn Produces the same bytes the gateway will send for a request.
-   */
-  constructor(
-    private readonly gateway: ChainGateway,
-    private readonly signFn: SignFunction,
-  ) {}
-
-  /** @inheritdoc */
-  sign(request: SubmitRequest): Promise<SignedTransaction> {
-    return this.signFn(request);
+export function signedTransactionDifferences(
+  request: SubmitRequest,
+  expected: SigningExpectation,
+  decoded: DecodedTransaction,
+): string[] {
+  const out: string[] = [];
+  const contract =
+    SIGNER_FOR_CALL[request.call.kind] === 'settlement' ? expected.token : expected.registry;
+  if (decoded.type !== 'eip1559') out.push('type');
+  if (decoded.chainId !== expected.chainId) out.push('chainId');
+  if (decoded.nonce !== request.nonce) out.push('nonce');
+  if (lower(decoded.to) !== lower(contract)) out.push('to');
+  if (!sameCall(decoded.call, request.call)) out.push('data');
+  if (decoded.maxFeePerGas !== request.fees.maxFeePerGas) out.push('maxFeePerGas');
+  if (decoded.maxPriorityFeePerGas !== request.fees.maxPriorityFeePerGas) {
+    out.push('maxPriorityFeePerGas');
   }
+  if (lower(decoded.from) !== lower(expected.signerAddress)) out.push('from');
+  return out;
+}
 
-  /** @inheritdoc */
-  async broadcast(signed: SignedTransaction, request: SubmitRequest): Promise<TxHash> {
-    let hash: TxHash;
+/**
+ * Signs `request` with the gateway (nothing sent) and returns the signed transaction only if the
+ * bytes hash to the reported hash and decode to exactly the request (see the file comment).
+ * Throws `SignedTransactionMismatchError` otherwise, and whatever `signTransaction` throws.
+ *
+ * @param gateway Signs.
+ * @param inspector Decodes the bytes.
+ * @param request What to sign.
+ * @param expected The deployment's chain, contracts and signer.
+ */
+export async function signAndVerify(
+  gateway: ChainGateway,
+  inspector: RawTransactionInspector,
+  request: SubmitRequest,
+  expected: SigningExpectation,
+): Promise<SignedTransaction> {
+  const signed = await gateway.signTransaction(request);
+  const raw = signed.raw.toLowerCase() as Hex;
+  const hash = signed.hash.toLowerCase() as Hex;
+  if (keccak256(raw) !== hash) {
+    throw new SignedTransactionMismatchError('the signed bytes do not hash to the reported hash');
+  }
+  let decoded: DecodedTransaction;
+  try {
+    decoded = await inspector.decode(raw);
+  } catch {
+    throw new SignedTransactionMismatchError('the signed bytes cannot be decoded');
+  }
+  const differences = signedTransactionDifferences(request, expected, decoded);
+  if (differences.length > 0) {
+    throw new SignedTransactionMismatchError(
+      `the signed bytes differ from the request in: ${differences.join(', ')}`,
+    );
+  }
+  return { hash, raw };
+}
+
+/** The bridge's ABIs, by the contract that carries each call. */
+const ABIS = [settlementTokenAbi, complianceRegistryAbi] as const;
+
+function asAddress(v: unknown): Address {
+  if (typeof v !== 'string') throw new TypeError('expected an address');
+  return lower(v);
+}
+
+function asBigint(v: unknown): bigint {
+  if (typeof v !== 'bigint') throw new TypeError('expected a uint256');
+  return v;
+}
+
+function asBool(v: unknown): boolean {
+  if (typeof v !== 'boolean') throw new TypeError('expected a bool');
+  return v;
+}
+
+function asRef(v: unknown): `0x${string}` {
+  if (typeof v !== 'string') throw new TypeError('expected bytes32');
+  return v.toLowerCase() as `0x${string}`;
+}
+
+/** Decodes bridge calldata into a `ContractCall`. Throws for anything else. */
+export function callFromCalldata(data: Hex): ContractCall {
+  for (const abi of ABIS) {
+    let decoded: { functionName: string; args: readonly unknown[] | undefined };
     try {
-      hash = await this.gateway.submit(request);
-    } catch (err) {
-      if (err instanceof AlreadyKnownError) {
-        // The node already holds a transaction with these bytes: it is the one we recorded,
-        // unless the node names a different hash.
-        if (err.txHash === undefined || err.txHash.toLowerCase() === signed.hash) {
-          return signed.hash;
-        }
-        throw new SignedHashMismatchError(
-          `the node already holds ${err.txHash.toLowerCase()}, not the recorded ${signed.hash}`,
-        );
-      }
-      throw err;
+      decoded = decodeFunctionData({ abi, data }) as typeof decoded;
+    } catch {
+      continue;
     }
-    const sent = hash.toLowerCase() as TxHash;
-    if (sent !== signed.hash) {
-      throw new SignedHashMismatchError(`sent ${sent}, but the attempt recorded ${signed.hash}`);
+    const a = decoded.args ?? [];
+    switch (decoded.functionName) {
+      case 'mint':
+        return { kind: 'mint', to: asAddress(a[0]), amount: asBigint(a[1]), ref: asRef(a[2]) };
+      case 'burn':
+        return { kind: 'burn', from: asAddress(a[0]), amount: asBigint(a[1]), ref: asRef(a[2]) };
+      case 'settleTransfer':
+        return {
+          kind: 'settleTransfer',
+          from: asAddress(a[0]),
+          to: asAddress(a[1]),
+          amount: asBigint(a[2]),
+          ref: asRef(a[3]),
+        };
+      case 'setVerified':
+        return {
+          kind: 'setVerified',
+          account: asAddress(a[0]),
+          verified: asBool(a[1]),
+          ref: asRef(a[2]),
+        };
+      case 'setFrozen':
+        return {
+          kind: 'setFrozen',
+          account: asAddress(a[0]),
+          frozen: asBool(a[1]),
+          ref: asRef(a[2]),
+        };
     }
-    return sent;
+  }
+  throw new TypeError('calldata is not a bridge call');
+}
+
+/** The real inspector: EIP-1559 bytes, decoded and sender-recovered with viem. */
+export class ViemTransactionInspector implements RawTransactionInspector {
+  /** @inheritdoc */
+  async decode(raw: Hex): Promise<DecodedTransaction> {
+    const tx = parseTransaction(raw);
+    if (tx.type !== 'eip1559') throw new TypeError(`not an EIP-1559 transaction: ${tx.type}`);
+    if (
+      tx.chainId === undefined ||
+      tx.nonce === undefined ||
+      tx.to === undefined ||
+      tx.to === null ||
+      tx.data === undefined ||
+      tx.maxFeePerGas === undefined ||
+      tx.maxPriorityFeePerGas === undefined
+    ) {
+      throw new TypeError('the transaction is missing a field');
+    }
+    const from = await recoverTransactionAddress({
+      serializedTransaction: raw as Parameters<
+        typeof recoverTransactionAddress
+      >[0]['serializedTransaction'],
+    });
+    return {
+      type: 'eip1559',
+      chainId: tx.chainId,
+      nonce: tx.nonce,
+      to: lower(tx.to),
+      call: callFromCalldata(tx.data),
+      maxFeePerGas: tx.maxFeePerGas,
+      maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+      from: lower(from),
+    };
   }
 }

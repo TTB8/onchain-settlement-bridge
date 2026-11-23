@@ -48,7 +48,7 @@ import { auditEntryFor, detectReorg, nextScanRange, type StoredBlock } from '@br
 import type { AlarmSink } from './alarms';
 import { writeAudit } from './ledger-writes';
 import type { Clock } from './ports';
-import type { DeploymentBinding } from './settlement-submitter';
+import { bindingOf, type DeploymentBinding, loadBoundDeployment } from './signer-binding';
 import { runTransaction, type TransactionOptions, type Tx } from './transaction';
 
 /** Indexer limits. */
@@ -71,8 +71,6 @@ export interface IndexerOptions {
   readonly gateway: ChainGateway;
   /** The time source (audit rows, alarms). */
   readonly clock: Clock;
-  /** The deployment the gateway reads. */
-  readonly binding: DeploymentBinding;
   /** Limits. */
   readonly policy: IndexerPolicy;
   /** Where alarms go. */
@@ -176,7 +174,7 @@ export class Indexer {
     this.prisma = options.prisma;
     this.gateway = options.gateway;
     this.clock = options.clock;
-    this.binding = options.binding;
+    this.binding = bindingOf(options.gateway);
     this.policy = p;
     this.alarms = options.alarms;
     this.transactions = options.transactions ?? {};
@@ -204,14 +202,7 @@ export class Indexer {
 
   /** One pass, without the stall bookkeeping. */
   private async pass(): Promise<IndexerResult> {
-    const d = await this.prisma.deployment.findUnique({
-      where: {
-        chainId_tokenAddress: {
-          chainId: this.binding.chainId,
-          tokenAddress: this.binding.tokenAddress,
-        },
-      },
-    });
+    const d = await loadBoundDeployment(this.prisma, this.binding);
     if (d === null) return { status: 'unknown' };
     const state = await this.prisma.indexerState.findUnique({ where: { deploymentId: d.id } });
     const lastIndexed = state?.lastIndexedBlock ?? d.deploymentBlock - 1n;

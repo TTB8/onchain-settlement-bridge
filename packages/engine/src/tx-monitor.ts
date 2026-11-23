@@ -69,7 +69,7 @@ import {
 
 import type { AlarmKind, AlarmSink } from './alarms';
 import {
-  allocateNonce,
+  commitWithFreshNonce,
   attemptRecordOf,
   broadcastAttempt,
   contractCallFromJson,
@@ -82,9 +82,14 @@ import { writeAudit } from './ledger-writes';
 import { moveOperation, type OperationMove } from './move-operation';
 import type { Clock } from './ports';
 import { describeError, type SanitizeOptions } from './redact';
-import type { DeploymentBinding } from './settlement-submitter';
-import { assertSignerBound } from './signer-binding';
-import type { TransactionSigner } from './signing';
+import {
+  assertSignerBound,
+  bindingOf,
+  type DeploymentBinding,
+  loadBoundDeployment,
+  signingExpectationFor,
+} from './signer-binding';
+import { type RawTransactionInspector, signAndVerify } from './signing';
 import { runTransaction, type TransactionOptions } from './transaction';
 
 /** The monitor's patience and limits. */
@@ -131,14 +136,12 @@ export interface MonitorPolicy {
 export interface TxMonitorOptions {
   /** The database. */
   readonly prisma: PrismaClient;
-  /** The chain. */
+  /** The chain; its own `deployment()` is the binding (review M-2). */
   readonly gateway: ChainGateway;
-  /** Signs bumps and resubmissions before they are recorded. */
-  readonly signer: TransactionSigner;
+  /** Decodes signed bytes so bumps and resubmissions are checked before they are stored. */
+  readonly inspector: RawTransactionInspector;
   /** The time source. */
   readonly clock: Clock;
-  /** The deployment the gateway talks to. */
-  readonly binding: DeploymentBinding;
   /** Patience and limits. */
   readonly policy: MonitorPolicy;
   /** Where alarms go. */
@@ -235,7 +238,7 @@ function giveUpReason(why: 'max_bumps' | 'fee_cap' | 'max_resubmits'): FailureRe
 export class TxMonitor {
   private readonly prisma: PrismaClient;
   private readonly gateway: ChainGateway;
-  private readonly signer: TransactionSigner;
+  private readonly inspector: RawTransactionInspector;
   private readonly clock: Clock;
   private readonly binding: DeploymentBinding;
   private readonly policy: MonitorPolicy;
@@ -257,9 +260,9 @@ export class TxMonitor {
     }
     this.prisma = options.prisma;
     this.gateway = options.gateway;
-    this.signer = options.signer;
+    this.inspector = options.inspector;
     this.clock = options.clock;
-    this.binding = options.binding;
+    this.binding = bindingOf(options.gateway);
     this.policy = p;
     this.alarms = options.alarms;
     this.transactions = options.transactions ?? {};
@@ -278,14 +281,7 @@ export class TxMonitor {
       released: 0,
     };
     const idle = { ran: false, head: null, examined: 0, skipped: 0, ...counts };
-    const deployment = await this.prisma.deployment.findUnique({
-      where: {
-        chainId_tokenAddress: {
-          chainId: this.binding.chainId,
-          tokenAddress: this.binding.tokenAddress,
-        },
-      },
-    });
+    const deployment = await loadBoundDeployment(this.prisma, this.binding);
     if (deployment === null) return idle;
 
     let view: ChainView;
@@ -896,11 +892,13 @@ export class TxMonitor {
   ): Promise<void> {
     const call = contractCallFromJson(latest.outbox.call);
     const request = { signer: latest.signer, call, nonce: latest.nonce, fees };
+    // Same nonce, no allocation: signed and verified before (and outside) the transaction.
+    const expected = await signingExpectationFor(this.prisma, d, latest.signer);
+    const signed = await signAndVerify(this.gateway, this.inspector, request, expected);
     const { value: attempt } = await runTransaction(
       this.prisma,
       async (tx) => {
         const at = this.clock.now();
-        const signed = await this.signer.sign(request);
         await moveOperation(tx, {
           operationId: op.id,
           from: 'submitted',
@@ -922,19 +920,18 @@ export class TxMonitor {
       },
       this.transactions,
     );
-    await this.broadcast(op, attempt, call);
+    await this.broadcast(op, attempt);
   }
 
   /** The node forgot it: rebroadcast the same signed bytes (SUBMIT `resubmit`, no new attempt). */
   private async resubmitSame(op: Operation, latest: AttemptWithCall): Promise<void> {
-    const call = contractCallFromJson(latest.outbox.call);
     await this.move(
       op,
       { event: 'SUBMIT', kind: 'resubmit', resubmitsSoFar: op.resubmitsSoFar },
       `rebroadcast of nonce ${latest.nonce} after a drop`,
       latest.hash,
     );
-    await this.broadcast(op, latest, call);
+    await this.broadcast(op, latest);
   }
 
   /** Every nonce we used is finally taken by something else: sign with a NEW nonce. */
@@ -948,18 +945,20 @@ export class TxMonitor {
       marginBps: this.policy.initialFeeMarginBps,
       cap: this.policy.feeCap,
     });
-    const { value: attempt } = await runTransaction(
-      this.prisma,
-      async (tx) => {
+    const attempt = await commitWithFreshNonce({
+      prisma: this.prisma,
+      gateway: this.gateway,
+      inspector: this.inspector,
+      expected: await signingExpectationFor(this.prisma, d, 'settlement'),
+      allocation: {
+        deploymentId: d.id,
+        signer: 'settlement',
+        signerAddress,
+        chainPending: pending,
+      },
+      build: (nonce) => ({ signer: 'settlement', call, nonce, fees }),
+      commit: async (tx, request, signed) => {
         const at = this.clock.now();
-        const nonce = await allocateNonce(tx, {
-          deploymentId: d.id,
-          signer: 'settlement',
-          signerAddress,
-          chainPending: pending,
-        });
-        const request = { signer: 'settlement' as const, call, nonce, fees };
-        const signed = await this.signer.sign(request);
         await moveOperation(tx, {
           operationId: op.id,
           from: 'submitted',
@@ -967,7 +966,7 @@ export class TxMonitor {
           move: { event: 'SUBMIT', kind: 'resubmit', resubmitsSoFar: op.resubmitsSoFar },
           at,
           txHash: signed.hash,
-          note: `resubmitted with new nonce ${nonce}: the old nonce was finally used elsewhere`,
+          note: `resubmitted with new nonce ${request.nonce}: the old nonce was finally used elsewhere`,
         });
         return insertAttempt(tx, {
           deploymentId: d.id,
@@ -979,14 +978,14 @@ export class TxMonitor {
           at,
         });
       },
-      this.transactions,
-    );
-    await this.broadcast(op, attempt, call);
+      transactions: this.transactions,
+    });
+    await this.broadcast(op, attempt);
   }
 
   /** Broadcasts after the commit; the next pass judges whatever the answer was. */
-  private async broadcast(op: Operation, attempt: ChainAttempt, call: ContractCall): Promise<void> {
-    const result = await broadcastAttempt(this.signer, attempt, call);
+  private async broadcast(op: Operation, attempt: ChainAttempt): Promise<void> {
+    const result = await broadcastAttempt(this.gateway, attempt);
     await recordBroadcast(
       this.prisma,
       attempt,

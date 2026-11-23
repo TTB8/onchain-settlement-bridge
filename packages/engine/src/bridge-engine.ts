@@ -12,15 +12,18 @@
 import type { ChainGateway } from '@bridge/chain';
 import type { PrismaClient } from '@bridge/db';
 
+const ADDRESS = /^0x[0-9a-f]{40}$/;
+
 import { AlarmLog, type AlarmSink } from './alarms';
-import { InvalidRequestError } from './errors';
+import { DeploymentMismatchError, InvalidRequestError } from './errors';
 import { Indexer, type IndexerResult } from './indexer';
 import { OperationService } from './operation-service';
 import { type BackoffPolicy, type DispatchSummary, OutboxDispatcher } from './outbox-dispatcher';
 import type { Clock, IdSource } from './ports';
 import { describeError, type SanitizeOptions } from './redact';
 import { SettlementSubmitter } from './settlement-submitter';
-import type { TransactionSigner } from './signing';
+import type { RawTransactionInspector } from './signing';
+import { bindingOf, type DeploymentBinding, isBound } from './signer-binding';
 import type { TransactionOptions } from './transaction';
 import { type MonitorSummary, TxMonitor } from './tx-monitor';
 
@@ -63,10 +66,13 @@ export const DEFAULT_MAX_BUMPS = 5;
 
 /** Engine settings. */
 export interface BridgeEngineConfig {
-  /** The chain this engine settles on. */
-  readonly chainId: bigint;
-  /** The token the gateway talks to (lowercase hex). */
-  readonly tokenAddress: string;
+  /**
+   * The chain this engine settles on. Optional: the gateway's `deployment()` is the binding; when
+   * given it must agree (a guard against wiring the wrong gateway).
+   */
+  readonly chainId?: bigint;
+  /** The token, as a cross-check on `gateway.deployment()` (any case; normalised). */
+  readonly tokenAddress?: string;
   /** This worker's name, for outbox leases. */
   readonly workerId: string;
   /** Confirmations before anything counts (>= 1). */
@@ -125,8 +131,11 @@ export interface BridgeEngineDeps {
   readonly prisma: PrismaClient;
   /** The chain (one deployment). */
   readonly gateway: ChainGateway;
-  /** Signs before sending. */
-  readonly signer: TransactionSigner;
+  /**
+   * Decodes signed bytes so they are checked before they are stored: `ViemTransactionInspector`
+   * for `ViemChainGateway`.
+   */
+  readonly inspector: RawTransactionInspector;
   /** The time source. */
   readonly clock: Clock;
   /** The id source. */
@@ -192,6 +201,8 @@ export class BridgeEngine {
   private running: Promise<void> | undefined;
   private stopped = true;
   private readonly redaction: SanitizeOptions;
+  private readonly binding: DeploymentBinding;
+  private readonly prisma: PrismaClient;
 
   /**
    * @param deps Database, gateway, signer, clock, ids and alarm sink.
@@ -205,7 +216,28 @@ export class BridgeEngine {
     if (typeof config.feeCap !== 'bigint' || config.feeCap <= 0n) {
       throw new InvalidRequestError('feeCap must be a positive bigint');
     }
-    const binding = { chainId: config.chainId, tokenAddress: config.tokenAddress };
+    const binding = bindingOf(deps.gateway);
+    for (const [label, value] of [
+      ['gateway token', binding.tokenAddress],
+      ['gateway registry', binding.registryAddress],
+      ...(config.tokenAddress !== undefined ? [['configured token', config.tokenAddress]] : []),
+    ] as const) {
+      if (!ADDRESS.test(value.toLowerCase())) {
+        throw new InvalidRequestError(`${label} is not a 0x + 40 hex address`);
+      }
+    }
+    if (
+      (config.chainId !== undefined && config.chainId !== binding.chainId) ||
+      (config.tokenAddress !== undefined &&
+        config.tokenAddress.toLowerCase() !== binding.tokenAddress)
+    ) {
+      throw new DeploymentMismatchError(
+        `configured ${String(config.tokenAddress)} on chain ${String(config.chainId)}, but the ` +
+          `gateway is bound to ${binding.tokenAddress} on chain ${binding.chainId}`,
+      );
+    }
+    this.binding = binding;
+    this.prisma = deps.prisma;
     const transactions = config.transactions ?? {};
     const secrets = [...(config.secrets ?? [])];
     this.redaction = { secrets };
@@ -216,16 +248,15 @@ export class BridgeEngine {
       prisma: deps.prisma,
       clock: deps.clock,
       ids: deps.ids,
-      chainId: config.chainId,
-      tokenAddress: config.tokenAddress,
+      chainId: binding.chainId,
+      tokenAddress: binding.tokenAddress,
       transactions,
     });
     this.submitter = new SettlementSubmitter({
       prisma: deps.prisma,
       gateway: deps.gateway,
-      signer: deps.signer,
+      inspector: deps.inspector,
       clock: deps.clock,
-      binding,
       fees: {
         marginBps: config.initialFeeMarginBps ?? 2_000,
         feeCap: config.feeCap,
@@ -252,9 +283,8 @@ export class BridgeEngine {
     this.monitor = new TxMonitor({
       prisma: deps.prisma,
       gateway: deps.gateway,
-      signer: deps.signer,
+      inspector: deps.inspector,
       clock: deps.clock,
-      binding,
       policy: {
         confirmationDepth: depth,
         stuckAfterSeconds: config.stuckAfterSeconds ?? 120,
@@ -278,7 +308,6 @@ export class BridgeEngine {
       prisma: deps.prisma,
       gateway: deps.gateway,
       clock: deps.clock,
-      binding,
       policy: {
         confirmationDepth: depth,
         maxBatch: config.indexerMaxBatch ?? 500,
@@ -290,7 +319,29 @@ export class BridgeEngine {
   }
 
   /** One dispatcher pass, one indexer pass, one monitor pass, in that order. */
+  /**
+   * Review M-2: the gateway's deployment must be the database's ACTIVE deployment of its chain
+   * (chain id, token AND registry). Otherwise the engine would sign for, read evidence from, or
+   * index another contract than the one operations are bound to. Raises `deployment_mismatch`
+   * and throws `DeploymentMismatchError`; nothing runs.
+   */
+  async assertDeployment(): Promise<void> {
+    const active = await this.prisma.deployment.findFirst({
+      where: { chainId: this.binding.chainId, active: true },
+    });
+    if (active === null || !isBound(active, this.binding)) {
+      const detail =
+        active === null
+          ? `no active deployment on chain ${this.binding.chainId}`
+          : `active deployment is ${active.tokenAddress} / ${active.registryAddress}, the gateway ` +
+            `is bound to ${this.binding.tokenAddress} / ${this.binding.registryAddress}`;
+      this.alarms.raise({ kind: 'deployment_mismatch', detail, at: this.clock.now() });
+      throw new DeploymentMismatchError(detail);
+    }
+  }
+
   async tick(): Promise<TickSummary> {
+    await this.assertDeployment();
     // Each component is isolated (review L-2): an indexer that throws must not stop the monitor
     // from reversing or confirming, nor the dispatcher from sending.
     const failed: ('dispatch' | 'index' | 'monitor')[] = [];

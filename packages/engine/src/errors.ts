@@ -31,7 +31,7 @@ export type EngineErrorCode =
   | 'RETRIES_EXHAUSTED'
   | 'LEDGER_SETUP'
   | 'LEASE_LOST'
-  | 'SIGNED_HASH_MISMATCH'
+  | 'SIGNED_TX_MISMATCH'
   | 'SIGNER_MISMATCH';
 
 /** Base class of every error the engine throws on purpose. */
@@ -191,12 +191,13 @@ export class LeaseLostError extends EngineError {
 }
 
 /**
- * A broadcast reported a different transaction hash than the one recorded when the attempt was
- * signed. The bytes on the wire are not the bytes in `chain_attempt`, so the outcome is UNKNOWN
- * (ADR 0009): retried, never treated as a rejection, and worth an alarm.
+ * The bytes the gateway signed are not the requested transaction (their hash, chain id, nonce,
+ * fees, contract, calldata or sender differ), or a broadcast reported another hash than the
+ * recorded one. Refused before anything is stored (review M-3); on a broadcast it is an unknown
+ * outcome (ADR 0009) and worth an alarm.
  */
-export class SignedHashMismatchError extends EngineError {
-  readonly code = 'SIGNED_HASH_MISMATCH' as const;
+export class SignedTransactionMismatchError extends EngineError {
+  readonly code = 'SIGNED_TX_MISMATCH' as const;
 }
 
 /**
