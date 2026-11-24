@@ -14,7 +14,7 @@
     "abi:check": "node scripts/generate-abi.mjs --check"
   },
   "dependencies": {
-    "viem": "2.58.3"
+    "viem": "2.58.4"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",
