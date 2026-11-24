@@ -21,11 +21,20 @@ updates:
     # - NestJS 12 is ESM-only; this workspace is CommonJS (ts-jest, ts-node). The three packages
     #   must move together.
     # - TypeScript 6 changes compiler defaults and needs typescript-eslint and ts-jest to follow.
+    # - @types/node must follow the minimum supported runtime (Node 20), not the newest Node.
+    # - Prisma 7 changes client generation and configuration; the db package and its SQL guards
+    #   need a planned migration and a full re-run of their tests.
     # Remove an entry here when that migration is scheduled.
     ignore:
       - dependency-name: '@nestjs/*'
         update-types: ['version-update:semver-major']
       - dependency-name: typescript
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+      - dependency-name: prisma
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@prisma/client'
         update-types: ['version-update:semver-major']
 
   - package-ecosystem: github-actions
