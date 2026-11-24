@@ -21,8 +21,8 @@ importers:
         specifier: ^10.0.0
         version: 10.1.8(eslint@9.39.5(jiti@2.7.0))
       eslint-plugin-jsdoc:
-        specifier: ^65.5.0
-        version: 65.5.0(eslint@9.39.5(jiti@2.7.0))(typescript@5.9.3)
+        specifier: ^65.5.1
+        version: 65.5.1(eslint@9.39.5(jiti@2.7.0))(typescript@5.9.3)
       globals:
         specifier: ^17.14.0
         version: 17.14.0
@@ -81,8 +81,8 @@ importers:
         specifier: 4.2.0
         version: 4.2.0
       viem:
-        specifier: 2.58.3
-        version: 2.58.3(typescript@5.9.3)
+        specifier: 2.58.4
+        version: 2.58.4(typescript@5.9.3)
     devDependencies:
       '@nestjs/testing':
         specifier: 11.2.11
@@ -149,8 +149,8 @@ importers:
         specifier: ^29.4.15
         version: 29.4.15(@babel/core@7.29.13)(@jest/transform@30.5.2)(@jest/types@30.5.1)(babel-jest@30.5.2(@babel/core@7.29.13))(jest-util@30.5.1)(jest@30.5.2(@types/node@26.6.6))(typescript@5.9.3)
       viem:
-        specifier: 2.58.3
-        version: 2.58.3(typescript@5.9.3)
+        specifier: 2.58.4
+        version: 2.58.4(typescript@5.9.3)
 
   e2e:
     dependencies:
@@ -180,14 +180,14 @@ importers:
         specifier: ^29.4.15
         version: 29.4.15(@babel/core@7.29.13)(@jest/transform@30.5.2)(@jest/types@30.5.1)(babel-jest@30.5.2(@babel/core@7.29.13))(jest-util@30.5.1)(jest@30.5.2(@types/node@26.6.6))(typescript@5.9.3)
       viem:
-        specifier: 2.58.3
-        version: 2.58.3(typescript@5.9.3)
+        specifier: 2.58.4
+        version: 2.58.4(typescript@5.9.3)
 
   packages/chain:
     dependencies:
       viem:
-        specifier: 2.58.3
-        version: 2.58.3(typescript@5.9.3)
+        specifier: 2.58.4
+        version: 2.58.4(typescript@5.9.3)
     devDependencies:
       '@types/jest':
         specifier: ^30.0.0
@@ -248,8 +248,8 @@ importers:
         specifier: workspace:*
         version: link:../domain
       viem:
-        specifier: 2.58.3
-        version: 2.58.3(typescript@5.9.3)
+        specifier: 2.58.4
+        version: 2.58.4(typescript@5.9.3)
     devDependencies:
       '@types/jest':
         specifier: ^30.0.0
@@ -1620,8 +1620,8 @@ packages:
     peerDependencies:
       eslint: '>=7.0.0'
 
-  eslint-plugin-jsdoc@65.5.0:
-    resolution: {integrity: sha512-dVrpBDWYSt1hihtNbbAoCEe4NmXSvm7Ph+BaZ9w58T7omMkHybm6udqWkCQopddTuf8pCVH11A+MnPGlped0Vw==}
+  eslint-plugin-jsdoc@65.5.1:
+    resolution: {integrity: sha512-B7nUzgyazhOtiznF1fOQOmYZpTlLEdgaCsVV67V1WgtXuqWSWm0kPS4auekdHoEQBEKahS11weUC+z5nkhIu9g==}
     engines: {node: ^22.22.2 || >=24.15.0}
     peerDependencies:
       eslint: ^7.0.0 || ^8.0.0 || ^9.0.0 || ^10.0.0
@@ -2909,8 +2909,8 @@ packages:
     resolution: {integrity: sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg==}
     engines: {node: '>= 0.8'}
 
-  viem@2.58.3:
-    resolution: {integrity: sha512-PGyuOVz3mKq3nBXSHzn7LcpLjzzrtEbCfBrNaqIrFop3MBKEUlOXZHcB2q+uj9uzkLYUwHcPJwqK+nxIqSW6jg==}
+  viem@2.58.4:
+    resolution: {integrity: sha512-zeYi2PliKbmJVbIvudHZrYJLh1XMXci6GBJznQLjhhGPGl9L7Hp/LmelpXhOM9VvlXwnvfW7/2PCgpjnc2j8MQ==}
     peerDependencies:
       mppx: '>=0.17.0'
       typescript: '>=5.0.4'
@@ -4396,7 +4396,7 @@ snapshots:
     dependencies:
       eslint: 9.39.5(jiti@2.7.0)
 
-  eslint-plugin-jsdoc@65.5.0(eslint@9.39.5(jiti@2.7.0))(typescript@5.9.3):
+  eslint-plugin-jsdoc@65.5.1(eslint@9.39.5(jiti@2.7.0))(typescript@5.9.3):
     dependencies:
       '@es-joy/escodegen': 5.0.1
       '@es-joy/jsdoccomment': 1.2.0
@@ -5939,7 +5939,7 @@ snapshots:
 
   vary@1.1.2: {}
 
-  viem@2.58.3(typescript@5.9.3):
+  viem@2.58.4(typescript@5.9.3):
     dependencies:
       '@noble/curves': 1.9.1
       '@noble/hashes': 1.8.0
